@@ -1,0 +1,18 @@
+# Build output (rebuild from source; see the compile commands in NotchIsland/main.swift's header)
+/als
+/NotchIsland/NotchIsland
+*.o
+*.dSYM/
+*.app/
+
+# Tool / editor state
+.omc/
+.claude/
+.DS_Store
+.vscode/
+.idea/
+
+# Logs and scratch files
+*.log
+*.png
+*.tmp
