@@ -32,6 +32,7 @@ var demoAirpods = false
 var demoVolume = false
 var demoActsN: Int? = nil           // --demo-acts N: show N fake live activities (1...5)
 var demoKinds = Set<ActKind>()
+var demoShelf: [String]? = nil          // --demo-shelf path1,path2: start with these files in the shelf (not saved)
 var demoPick: [String]? = nil          // --demo-kinds media,timer,charging,airpods,lowBattery (any subset)
 var demoBrightness = false
 var argIt = CommandLine.arguments.dropFirst().makeIterator()
@@ -46,6 +47,7 @@ while let a = argIt.next() {
     case "--demo-airpods": demoAirpods = true
     case "--demo-volume": demoVolume = true
     case "--demo-kinds": demoPick = argIt.next()?.split(separator: ",").map(String.init); demoActsN = demoActsN ?? 0
+    case "--demo-shelf": demoShelf = argIt.next()?.split(separator: ",").map(String.init)
     case "--demo-acts": if let v = argIt.next(), let n = Int(v) { demoActsN = min(max(n, 0), 5) }
     case "--demo-brightness": demoBrightness = true
     default: break
@@ -93,7 +95,9 @@ enum Overlay {
         _ = add(cid, space, [NSNumber(value: w.windowNumber)] as CFArray, 7)
     }
 }
-func makeSticky(_ w: NSWindow) { Overlay.attach(w) }
+func makeSticky(_ w: NSWindow) { if ProcessInfo.processInfo.environment["NI_NOOVERLAY"] == nil { Overlay.attach(w) } }   // NI_NOOVERLAY: test hook
+
+func dlog(_ m: String) { if ProcessInfo.processInfo.environment["NI_DEBUG"] != nil { FileHandle.standardError.write((m + "\n").data(using: .utf8)!) } }
 
 // MARK: - Haptics
 
@@ -471,7 +475,16 @@ final class ArtView: NSView {
     }
     required init?(coder: NSCoder) { fatalError() }
     override func layout() { super.layout(); note.frame = bounds }
+    private weak var shown: NSImage?
     func setImage(_ img: NSImage?) {
+        guard img !== shown else { return }                  // called every refresh: only react when the picture changes
+        let first = shown == nil && layer?.contents == nil
+        shown = img
+        if !first {                                          // cross-fade to the new cover instead of cutting
+            let t = CATransition(); t.type = .fade; t.duration = 0.4
+            t.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            layer?.add(t, forKey: "cover")
+        }
         layer?.contents = img?.cgImage(forProposedRect: nil, context: nil, hints: nil)
         note.isHidden = img != nil
     }
@@ -708,6 +721,52 @@ final class LevelBar: NSView {
     override func mouseDragged(with event: NSEvent) { pick(event) }
 }
 
+/// The timer's icon: a ring with a small glyph inside. A stopwatch's ring fills up (one lap per minute); a countdown's ring
+/// shrinks as the time runs out.
+final class TimerRing: NSView {
+    private let track = CAShapeLayer(), prog = CAShapeLayer()
+    private let glyph = NSImageView()
+    private var glyphName = ""
+    var fraction: CGFloat = 0 {
+        didSet {
+            guard abs(fraction - oldValue) > 0.0005 else { return }
+            CATransaction.begin(); CATransaction.setDisableActions(true)       // no easing: a lap wraps around instantly
+            prog.strokeEnd = min(max(fraction, 0), 1)
+            CATransaction.commit()
+        }
+    }
+    var countdown = false {
+        didSet {
+            let name = countdown ? "hourglass" : "stopwatch"
+            guard name != glyphName else { return }
+            glyphName = name
+            glyph.image = NSImage(systemSymbolName: name, accessibilityDescription: nil)?.withSymbolConfiguration(.init(pointSize: 9, weight: .bold))
+        }
+    }
+    init() {
+        super.init(frame: .zero)
+        wantsLayer = true
+        for l in [track, prog] { l.fillColor = nil; l.lineWidth = 2.4; l.lineCap = .round; layer?.addSublayer(l) }
+        track.strokeColor = accent.withAlphaComponent(0.25).cgColor
+        prog.strokeColor = accent.cgColor
+        prog.strokeEnd = 0
+        glyph.contentTintColor = accent
+        addSubview(glyph)
+        countdown = false
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override func layout() {
+        super.layout()
+        let path = CGMutablePath()
+        path.addArc(center: CGPoint(x: bounds.midX, y: bounds.midY), radius: min(bounds.width, bounds.height) / 2 - 2.2,
+                    startAngle: .pi / 2, endAngle: .pi / 2 - 2 * .pi, clockwise: true)      // from the top, clockwise
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        for l in [track, prog] { l.frame = bounds; l.path = path }
+        CATransaction.commit()
+        glyph.frame = bounds
+    }
+}
+
 func makeLabel(_ size: CGFloat, _ weight: NSFont.Weight, _ color: NSColor, mono: Bool = false,
                align: NSTextAlignment = .left) -> NSTextField {
     let l = NSTextField(labelWithString: "")
@@ -763,11 +822,39 @@ func notchPath(_ w: CGFloat, _ h: CGFloat, earL: Bool = true, earR: Bool = true)
 
 // MARK: - Content (flipped: y grows downward from the top of the island)
 
-enum Body { case none, hud, banner, alert, media, timer }
+/// A view that can pick up a file and drag it out. The file under the pointer is decided by `fileForDrag`; once the drop
+/// has been accepted somewhere else, `onDragFinished` is told (the file then leaves the pocket).
+class FileDragView: NSView, NSDraggingSource {
+    var fileForDrag: ((NSEvent) -> URL?)?
+    var onDragBegan: (() -> Void)?
+    var onDragFinished: ((URL, Bool) -> Void)?
+    var downPoint: NSPoint?
+    private var draggingURL: URL?
+
+    override func mouseDragged(with event: NSEvent) {
+        guard draggingURL == nil, let d = downPoint, hypot(event.locationInWindow.x - d.x, event.locationInWindow.y - d.y) > 4,
+              let u = fileForDrag?(event) else { return }
+        downPoint = nil; draggingURL = u
+        onDragBegan?()
+        let item = NSDraggingItem(pasteboardWriter: u as NSURL)
+        let img = NSWorkspace.shared.icon(forFile: u.path)
+        img.size = NSSize(width: 48, height: 48)
+        let at = convert(event.locationInWindow, from: nil)
+        item.setDraggingFrame(NSRect(x: at.x - 24, y: at.y - 24, width: 48, height: 48), contents: img)
+        beginDraggingSession(with: [item], event: event, source: self)
+    }
+    func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation { .copy }
+    func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+        if let u = draggingURL { onDragFinished?(u, !operation.isEmpty) }
+        draggingURL = nil
+    }
+}
+
+enum Body { case none, hud, banner, alert, media, timer, file, drop }
 enum LevelKind { case volume, brightness }
 
 /// Everything that can be a live activity, in the order they are listed when several run at once.
-enum ActKind: Hashable { case media, timer, charging, lowBattery, airpods }
+enum ActKind: Hashable { case media, timer, charging, lowBattery, airpods, file(URL) }     // every file in the pocket is an activity
 let allKinds: [ActKind] = [.media, .timer, .charging, .airpods, .lowBattery]
 
 /// The two small views an activity can be drawn with: a 24pt icon, and a detail (time, %, equalizer, ring).
@@ -788,9 +875,42 @@ struct SpringV {
     mutating func jump(_ v: CGFloat) { cur = v; tgt = v; vel = 0 }
 }
 
+/// A soft shadow behind an island: a bigger, click-through window that draws the island's own shape with a blurred shadow.
+/// (The system window shadow draws a light hairline around the shape, which does not suit something that merges with the notch.)
+final class ShadowView: NSView {
+    static let pad: CGFloat = 36                                  // room around the island for the blur
+    var pathProvider: ((CGSize) -> CGPath)?
+    private let shape = CAShapeLayer()
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.addSublayer(shape)
+        shape.fillColor = NSColor.black.cgColor
+        shape.shadowColor = NSColor.black.cgColor
+        shape.shadowOpacity = 0.4
+        shape.shadowRadius = 12
+        shape.shadowOffset = CGSize(width: 0, height: -5)       // falls a little downwards
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override func layout() {
+        super.layout()
+        let pad = ShadowView.pad
+        let size = CGSize(width: max(bounds.width - 2 * pad, 1), height: max(bounds.height - 2 * pad, 1))
+        let path = pathProvider?(size) ?? CGPath(rect: CGRect(origin: .zero, size: size), transform: nil)
+        var move = CGAffineTransform(translationX: pad, y: pad)
+        let placed = path.copy(using: &move) ?? path
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        shape.frame = bounds
+        shape.path = placed
+        shape.shadowPath = placed
+        CATransaction.commit()
+    }
+}
+
 /// A window (the island itself, the detached icon, the pill under the notch) and the springs that move it.
 final class Piece {
     let panel: NSPanel
+    var shadow: NSPanel?
     var x = SpringV(), w = SpringV(), h = SpringV(), ty = SpringV()    // left edge, width, height, distance from the top of the screen
     var fullW: CGFloat = 1
     var active = false      // wants to be on screen
@@ -801,7 +921,7 @@ final class Piece {
 }
 
 /// The detached icon circle and the pill under the notch: black capsules holding slot views, centred.
-final class PillView: NSView {
+final class PillView: FileDragView {
     var onPress: (() -> Void)?
     var onRelease: ((Bool) -> Void)?
     var items: [SlotItem] = [] { didSet { needsLayout = true } }
@@ -847,7 +967,7 @@ final class PillView: NSView {
         return bounds.contains(convert(point, from: sv)) ? self : nil
     }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-    override func mouseDown(with event: NSEvent) { onPress?() }
+    override func mouseDown(with event: NSEvent) { downPoint = event.locationInWindow; onPress?() }
     override func mouseUp(with event: NSEvent) { onRelease?(bounds.contains(convert(event.locationInWindow, from: nil))) }
 }
 
@@ -859,6 +979,10 @@ final class Content: Flip {
     var leftView: NSView?            // slot views drawn beside the notch (managed by App)
     var rightView: NSView?
     var rightSize = CGSize(width: 24, height: 24)
+    var centerView: NSView?          // the second notch's compact icon, centred
+    var centerSize = CGSize(width: 24, height: 24)
+    var bannerSymbol = ""
+    var fileShown: URL?
     var leftSize = CGSize(width: 24, height: 24)
     private var lastAlpha: [ObjectIdentifier: CGFloat] = [:]
 
@@ -891,6 +1015,15 @@ final class Content: Flip {
     var hIconName = ""
     // alert body
     let alertL = makeLabel(15, .semibold, .white, align: .center)
+    // file body: the file's icon, name and where it lives; buttons to show it in Finder / let it go
+    let fIcon = NSImageView()
+    let fName = makeLabel(15, .semibold, .white)
+    let fSub = makeLabel(12, .regular, NSColor(white: 1, alpha: 0.55))
+    let fRevealB = makeSymbolButton("magnifyingglass", 15, .white)
+    let fRemoveB = makeSymbolButton("xmark", 14, .white)
+    // drop body: shown while a file is being dragged towards the notch
+    let dropIcon = NSImageView()
+    let dropHint = makeLabel(14, .medium, NSColor(white: 1, alpha: 0.75))
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -898,6 +1031,10 @@ final class Content: Flip {
         pauseB.layer?.backgroundColor = accent.withAlphaComponent(0.28).cgColor
         cancelB.layer?.backgroundColor = NSColor(white: 1, alpha: 0.2).cgColor
         hIcon.contentTintColor = .white
+        dropIcon.image = NSImage(systemSymbolName: "tray.and.arrow.down.fill", accessibilityDescription: nil)?.withSymbolConfiguration(.init(pointSize: 26, weight: .semibold))
+        dropIcon.contentTintColor = NSColor(red: 0.45, green: 0.72, blue: 1.0, alpha: 1)
+        dropHint.stringValue = "여기에 놓으세요"
+        fIcon.imageScaling = .scaleProportionallyUpOrDown
         for v in all { addSubview(v); v.alphaValue = 0 }
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -905,6 +1042,7 @@ final class Content: Flip {
     var all: [NSView] {
         [art, titleL, artistL, bodyEq, progress, elapsedL, remainL,
          prevB, playB, nextB, pauseB, cancelB, tLabel, tTime, alertL, bTitle, bPct, bGlyph, bAir, bRing, hIcon, hBar]
+            + [fIcon, fName, fSub, fRevealB, fRemoveB, dropIcon, dropHint]
     }
 
     /// Cover + title + artist: tapping it opens the app that is playing.
@@ -921,6 +1059,7 @@ final class Content: Flip {
         leftView?.frame = NSRect(x: leftInset, y: (bandH - leftSize.height) / 2, width: leftSize.width, height: leftSize.height)
         rightView?.frame = NSRect(x: w - rightInset - rightSize.width, y: (bandH - rightSize.height) / 2,
                                   width: rightSize.width, height: rightSize.height)
+        centerView?.frame = NSRect(x: (w - centerSize.width) / 2, y: (bandH - centerSize.height) / 2, width: centerSize.width, height: centerSize.height)
         // media
         art.frame = NSRect(x: pad, y: top, width: 48, height: 48)
         let tx = pad + 48 + 12, tw = max(0, w - tx - pad - 26)
@@ -941,15 +1080,25 @@ final class Content: Flip {
         tTime.frame = NSRect(x: w - pad - 150, y: top + 10, width: 150, height: 42)
         // banner (left/right inset 14 inside the body)
         bTitle.frame = NSRect(x: 14, y: (notchH - 20) / 2, width: 100, height: 20)
-        bAir.frame = NSRect(x: 14, y: (notchH - 26) / 2, width: 30, height: 26)
+        bAir.frame = NSRect(x: 6, y: (notchH - 26) / 2, width: 28, height: 26)
         bGlyph.frame = NSRect(x: w - 14 - 34, y: (notchH - 15) / 2, width: 34, height: 15)
         bPct.frame = NSRect(x: w - 14 - 34 - 8 - 56, y: (notchH - 20) / 2, width: 56, height: 20)
-        bRing.frame = NSRect(x: w - 14 - 26, y: (notchH - 26) / 2, width: 26, height: 26)
+        bRing.frame = NSRect(x: w - 6 - 26, y: (notchH - 26) / 2, width: 26, height: 26)
         // HUD
         hIcon.frame = NSRect(x: pad, y: top + 6, width: 24, height: 24)          // below the notch, icon on the left
         hBar.frame = NSRect(x: pad + 24 + 14, y: top + 7, width: max(0, w - pad - 24 - 14 - pad), height: 22)
         // alert
         alertL.frame = NSRect(x: pad, y: notchH + 6, width: w - 2 * pad, height: 22)
+        // file
+        fIcon.frame = NSRect(x: pad, y: top, width: 48, height: 48)
+        let fx = pad + 48 + 12, fw = max(0, w - fx - pad - 76)
+        fName.frame = NSRect(x: fx, y: top + 4, width: fw, height: 20)
+        fSub.frame = NSRect(x: fx, y: top + 25, width: fw, height: 16)
+        fRevealB.frame = NSRect(x: w - pad - 72, y: top + 8, width: 34, height: 32)
+        fRemoveB.frame = NSRect(x: w - pad - 36, y: top + 8, width: 34, height: 32)
+        // drop hint
+        dropIcon.frame = NSRect(x: pad, y: top + 6, width: 36, height: 36)
+        dropHint.frame = NSRect(x: pad + 46, y: top + 14, width: max(0, w - pad * 2 - 46), height: 20)
     }
 
     /// Cross-fade every element to what the current shape/body/wings need.
@@ -967,6 +1116,9 @@ final class Content: Flip {
             (bGlyph, expanded && b == .banner && !bannerIsAir),
             (bAir, expanded && b == .banner && bannerIsAir), (bRing, expanded && b == .banner && bannerIsAir),
             (hIcon, expanded && b == .hud), (hBar, expanded && b == .hud),
+            (fIcon, expanded && b == .file), (fName, expanded && b == .file), (fSub, expanded && b == .file),
+            (fRevealB, expanded && b == .file), (fRemoveB, expanded && b == .file),
+            (dropIcon, expanded && b == .drop), (dropHint, expanded && b == .drop),
         ]
         for (v, on) in want {
             let a: CGFloat = on ? 1 : 0
@@ -984,7 +1136,7 @@ final class Content: Flip {
 
 // MARK: - Island (black body; presses outside buttons go to the app)
 
-final class IslandView: NSView {
+final class IslandView: FileDragView {
     var onPress: (() -> Void)?
     var onRelease: ((Bool) -> Void)?       // true when the finger came up inside the island
     let content = Content(frame: .zero)
@@ -1000,6 +1152,7 @@ final class IslandView: NSView {
         content.frame = bounds
         content.autoresizingMask = []                     // laid out by hand: it sits between the ears
         addSubview(content)
+        registerForDraggedTypes([.fileURL])
     }
     required init?(coder: NSCoder) { fatalError() }
 
@@ -1016,6 +1169,27 @@ final class IslandView: NSView {
 
     var onOpenSource: (() -> Void)?
     private var sourceTapActive = false
+    var onDragEnter: (() -> Void)?
+    var onDragExit: (() -> Void)?
+    var onDrop: (([URL]) -> Void)?
+
+    // Files dragged onto the island (from Finder...) go into the shelf.
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        dlog("draggingEntered src=\(String(describing: sender.draggingSource)) frame=\(window?.frame ?? .zero)")
+        if sender.draggingSource is FileDragView { return [] }        // our own file dragged back onto the island: ignore
+        onDragEnter?(); return .copy
+    }
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation { sender.draggingSource is FileDragView ? [] : .copy }
+    override func draggingExited(_ sender: NSDraggingInfo?) { onDragExit?() }
+    override func draggingEnded(_ sender: NSDraggingInfo) { onDragExit?() }
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        dlog("performDragOperation")
+        let urls = sender.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+        onDragExit?()
+        guard !urls.isEmpty else { return false }
+        onDrop?(urls)
+        return true
+    }
 
     /// Only controls that are actually visible can take a click. (Hidden-by-alpha controls stacked on top of a
     /// visible one used to swallow its clicks.) Everything else is a press on the island itself.
@@ -1035,6 +1209,7 @@ final class IslandView: NSView {
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override func mouseDown(with event: NSEvent) {
+        downPoint = event.locationInWindow
         sourceTapActive = overSource(event)
         if !sourceTapActive { onPress?() }
     }
@@ -1061,7 +1236,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // spring-driven window size (smooth, interruptible, velocity-preserving)
     var link: CADisplayLink?
     var mainP: Piece!, sideP: Piece!, pillP: Piece!
-    var sideView: PillView!, pillView: PillView!
+    var sideView: IslandView!, pillView: PillView!
+    var cSide: Content { sideView.content }
+    var pressSide = false                  // the press that is in progress started on the second notch
     var stiffness: CGFloat = 400, damping: CGFloat = 30     // the island's own spring (changes with the shape)
     var signalSources: [DispatchSourceSignal] = []
     var simLux: Double?
@@ -1092,6 +1269,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var selected: ActKind?                     // which activity the expanded card shows
     var pressKind: ActKind?
     var airList: [AirPodsInfo] = []
+    var bannerHideAt: Date?
+    // the pocket: every file dropped on the notch is an activity of its own (paths only, nothing is copied)
+    var files: [URL] = []
+    var fileShown: URL?
+    var fileInfo: [URL: String] = [:]
+    var dragEntered = false, dragNear = false, dragActive = false, wasBtn = false, downChange = 0
+    var dropping: Bool { dragEntered || dragNear }        // a file drag is over / close to the island
     var slotItems: [ActKind: SlotItem] = [:]
     var lastPlan: Plan?
     var usedViews: [NSView] = []
@@ -1140,7 +1324,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .timer: return timer.started
         case .charging:   return demoActsN != nil ? demoKinds.contains(k) : (battery?.plugged == true && battery?.charging == true)
         case .lowBattery: return demoActsN != nil ? demoKinds.contains(k) : (battery?.plugged == false && (battery?.level ?? 100) <= 20)
-        case .airpods:    return demoActsN != nil ? demoKinds.contains(k) : !airList.isEmpty
+        case .airpods:    return demoActsN != nil && demoKinds.contains(k)       // real AirPods only show a banner when they connect
+        case .file(let u): return files.contains(u)
         }
     }
 
@@ -1150,8 +1335,30 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let on = isActive(k), has = actOrder.contains(k)
             if on && !has { actOrder.append(k) } else if !on && has { actOrder.removeAll { $0 == k } }
         }
+        for u in files where !actOrder.contains(.file(u)) { actOrder.append(.file(u)) }
+        func gone(_ k: ActKind) -> Bool { if case .file(let u) = k { return !files.contains(u) }; return false }
+        actOrder.removeAll(where: gone)
+        // more than five activities: the oldest are not shown, and a file that falls off is discarded
+        if actOrder.count > 5 {
+            for k in actOrder.dropLast(5) { if case .file(let u) = k { files.removeAll { $0 == u }; slotItems.removeValue(forKey: k) } }
+            actOrder.removeAll(where: gone)
+            fileSave()
+        }
     }
     var acts: [ActKind] { Array(actOrder.suffix(5)) }
+
+    /// The second notch (the right one, with exactly two activities) carries the open card by itself when its activity is selected.
+    var sideExpanded: Bool {
+        pinned && !hudActive && !dropping && banner == nil && alertText == nil && acts.count == 2 && selected == acts[1]
+    }
+    func bodyFor(_ k: ActKind) -> Body {
+        switch k {
+        case .media: return .media
+        case .timer: return .timer
+        case .charging, .lowBattery, .airpods: return .banner
+        case .file: return .file
+        }
+    }
 
     var cardKind: ActKind? { if let s = selected, acts.contains(s) { return s }; return acts.first }
 
@@ -1172,11 +1379,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     var body: Body {
         if hudActive { return .hud }
+        if dropping { return .drop }
         if banner != nil { return .banner }
         if alertText != nil { return .alert }
         switch cardKind {
         case .media?: return .media
         case .timer?: return .timer
+        case .file(_)?: return .file
         case .charging?, .lowBattery?, .airpods?: return .banner
         case nil: return .none
         }
@@ -1186,19 +1395,21 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let iconWing: CGFloat = 46                                       // space beside the notch for one icon
     /// Space beside the notch when a single activity shows its icon on the left and its detail on the right.
     func wingWidth(_ k: ActKind) -> CGFloat {
-        switch k { case .timer: return 66; case .charging, .lowBattery: return 62; default: return 50 }
+        switch k { case .timer: return 66; case .charging: return 58; case .lowBattery: return 62; case .airpods: return 44; default: return 50 }
     }
     /// Charging and low battery show their percentage (not an icon) in the narrow slots beside the notch.
     func showsPercent(_ k: ActKind) -> Bool { k == .charging || k == .lowBattery }
     func slotView(_ k: ActKind) -> (view: NSView, size: CGSize) {
-        guard let it = slotItems[k] else { return (NSView(), .zero) }
+        guard let it = slotItem(k) else { return (NSView(), .zero) }
         return showsPercent(k) ? (it.detail, it.detailSize) : (it.icon, CGSize(width: 24, height: 24))
     }
     func slotWing(_ k: ActKind) -> CGFloat { showsPercent(k) ? 58 : iconWing }     // room beside the notch for that slot
-    var bannerWing: CGFloat { if case .airpods? = displayBanner { return 60 }; return 110 }
-    var expandedExtra: CGFloat {
-        switch body {
+    var bannerWing: CGFloat { if case .airpods? = displayBanner { return 42 }; return 110 }       // AirPods: just the icon and the ring
+    var expandedExtra: CGFloat { expandedExtraFor(body) }
+    func expandedExtraFor(_ b: Body) -> CGFloat {
+        switch b {
         case .media:  return 122
+        case .file, .drop: return 62
         case .timer:  return 62
         case .banner, .hud: return 0
         default:      return 38
@@ -1220,7 +1431,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if shape == .expanded {
             // an expanded card keeps the other activities as small icons beside the notch
             // only the tall cards have room beside the notch; one-line banners (charging, AirPods...) fill the whole band
-            guard !hudActive, banner == nil, alertText == nil, let ck = cardKind, body == .media || body == .timer else { return Plan() }
+            guard !hudActive, banner == nil, alertText == nil, let ck = cardKind, body == .media || body == .timer || body == .file else { return Plan() }
             let others = a.filter { $0 != ck }
             switch others.count {
             case 0:  return Plan()
@@ -1231,7 +1442,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         switch a.count {
         case 0:  return Plan()
         case 1:  return Plan(left: a[0], right: a[0], rightDetail: true)
-        case 2:  return Plan(left: a[0], side: a[1])
+        case 2:  return Plan(left: a[0], side: sideExpanded ? nil : a[1])
         default: return Plan(left: a[0], right: a[1], pill: Array(a.dropFirst(2)))
         }
     }
@@ -1240,7 +1451,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     var notchLeft: CGFloat { screen.frame.midX - notchW / 2 }
     var notchRight: CGFloat { screen.frame.midX + notchW / 2 }
-    var compactH: CGFloat { notchH + 8 }
+    /// Height of the compact island. Charging on its own stays within the menu bar (no taller than the notch).
+    var compactH: CGFloat { (acts.count == 1 && acts[0] == .charging) ? notchH : notchH + 8 }
 
     func frame(for s: Shape) -> NSRect {
         let a = acts, n = a.count
@@ -1273,17 +1485,23 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// The detached icon right of the notch (exactly 2 activities).
     func sideRect() -> NSRect? {
         guard shape != .expanded, acts.count == 2 else { return nil }
+        let top = screen.frame.maxY
+        if sideExpanded {                                       // its own card: out to the right of the notch and down
+            let h = notchH + (bodyFor(acts[1]) == .banner ? 0 : expandedExtraFor(bodyFor(acts[1])))
+            return NSRect(x: notchRight + sideGap, y: top - h, width: 332, height: h)
+        }
         let h = compactH
-        let body: CGFloat = acts.count == 2 && showsPercent(acts[1]) ? 52 : 40
-        let w = body + 2 * earRadius(h)                        // icon body + the two ears
-        return NSRect(x: notchRight + sideGap, y: screen.frame.maxY - h, width: w, height: h)
+        let body: CGFloat = showsPercent(acts[1]) ? 52 : 40
+        var w = body + 2 * earRadius(h), height = h
+        if pressing && pressSide { w += 14; height += 6 }       // finger down on it: it (not the main island) swells
+        return NSRect(x: notchRight + sideGap, y: top - height, width: w, height: height)
     }
     let sideGap: CGFloat = 3
     let pillH: CGFloat = 34, pillGap: CGFloat = 6
     /// The pill under the notch (3...5 activities): returns its rect and its distance from the top of the screen.
     func pillRect() -> (NSRect, CGFloat)? {
         guard shape != .expanded, acts.count >= 3 else { return nil }
-        let items = acts.dropFirst(2).compactMap { slotItems[$0] }
+        let items = acts.dropFirst(2).compactMap { slotItem($0) }
         let w = 28 + items.reduce(0) { $0 + $1.pillWidth } + 16 * CGFloat(max(items.count - 1, 0))
         let ty = compactH + pillGap
         return (NSRect(x: screen.frame.midX - w / 2, y: screen.frame.maxY - ty - pillH, width: w, height: pillH), ty)
@@ -1297,23 +1515,34 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         view.autoresizingMask = [.width, .height]
         view.onPress = { [weak self] in self?.pressBegan() }
         view.onRelease = { [weak self] inside in self?.pressEnded(inside: inside) }
-        wire(c.prevB, #selector(prevTapped)); wire(c.playB, #selector(playPauseTapped)); wire(c.nextB, #selector(nextTapped))
-        wire(c.pauseB, #selector(timerToggleTapped)); wire(c.cancelB, #selector(timerCancelTapped))
         panel.contentView = view
         panel.orderFrontRegardless()
         makeSticky(panel)
         let r0 = frame(for: .collapsed)
         mainP = Piece(panel: panel); mainP.active = true; mainP.visible = true
         mainP.x.jump(r0.minX); mainP.w.jump(r0.width); mainP.h.jump(r0.height)
-        sideView = PillView(frame: .zero); pillView = PillView(frame: .zero); pillView.withDetail = true
-        sideView.notchStyle = true
+        sideView = IslandView(frame: .zero); pillView = PillView(frame: .zero); pillView.withDetail = true
+        sideView.content.notchH = notchH
         let sidePanel = makePanel(.zero), pillPanel = makePanel(.zero)
         sidePanel.contentView = sideView; pillPanel.contentView = pillView
         sideP = Piece(panel: sidePanel); pillP = Piece(panel: pillPanel)
-        for pv in [sideView!, pillView!] {
-            pv.onPress = { [weak self] in self?.pressBegan() }
-            pv.onRelease = { [weak self] inside in self?.pressEnded(inside: inside) }
+        pillView.onPress = { [weak self] in self?.pressBegan() }
+        pillView.onRelease = { [weak self] inside in self?.pressEnded(inside: inside) }
+        sideView.onPress = { [weak self] in self?.pressBegan() }
+        sideView.onRelease = { [weak self] inside in self?.pressEnded(inside: inside) }
+        sideView.onOpenSource = { [weak self] in self?.openSourceApp() }
+        sideView.onDragEnter = { [weak self] in self?.dragEntered = true }
+        sideView.onDragExit = { [weak self] in self?.dragEntered = false }
+        for content in [c, cSide] {                                  // both islands have the same buttons
+            wire(content.prevB, #selector(prevTapped)); wire(content.playB, #selector(playPauseTapped)); wire(content.nextB, #selector(nextTapped))
+            wire(content.pauseB, #selector(timerToggleTapped)); wire(content.cancelB, #selector(timerCancelTapped))
         }
+        attachShadow(to: mainP) { [weak self] size in
+            notchPath(size.width, size.height, earL: self?.view.earLeft ?? true, earR: self?.view.earRight ?? true)
+        }
+        attachShadow(to: sideP) { size in notchPath(size.width, size.height) }
+        attachShadow(to: pillP) { size in CGPath(roundedRect: CGRect(origin: .zero, size: size), cornerWidth: size.height / 2, cornerHeight: size.height / 2, transform: nil) }
+        mainP.shadow?.orderFrontRegardless(); mainP.shadow.map { makeSticky($0) }
         makeSlotItems()
         link = screen.displayLink(target: self, selector: #selector(animTick(_:)))
         link?.add(to: .main, forMode: .common)
@@ -1322,16 +1551,16 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let t = demoAlert { showAlert(t) }
         if demoTimer { timer.toggle(); pinned = true }
         if demoCharging { showBanner(.battery(title: "충전 중", level: 55, color: bannerGreen)) }
-        if demoAirpods { showBanner(.airpods(symbol: "airpodspro", level: 80)) }
+        if demoAirpods { showBanner(.airpods(symbol: "airpodspro", level: 80), autoHide: ProcessInfo.processInfo.environment["NI_AUTOHIDE"] != nil ? 4 : nil) }
         if let n = demoActsN {                                         // --demo-acts N: N fake activities, none pinned open
             if let pick = demoPick {
                 if pick.contains("media") { media = Media(title: "승리를 위하여", artist: "트랜스픽션", playing: true, duration: 208, elapsed: 29, readAt: Date(), storeID: "") }
-                if pick.contains("timer") { timer.toggle() }
+                if pick.contains("timer") { startDemoTimer() }
                 prevTimerStarted = timer.started
                 for (name, k) in [("charging", ActKind.charging), ("airpods", .airpods), ("lowBattery", .lowBattery)] where pick.contains(name) { demoKinds.insert(k) }
             } else {
             if n >= 1 { media = Media(title: "승리를 위하여", artist: "트랜스픽션", playing: true, duration: 208, elapsed: 29, readAt: Date(), storeID: "") }
-            if n >= 2 { timer.toggle() }
+            if n >= 2 { startDemoTimer() }
             prevTimerStarted = timer.started                           // don't auto-open for the demo stopwatch
             for (i, k) in [ActKind.charging, .airpods, .lowBattery].enumerated() where n >= 3 + i { demoKinds.insert(k) }
             }
@@ -1372,6 +1601,24 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
         if ProcessInfo.processInfo.environment["NI_NOSENSOR"] != nil { simLux = 1000 }     // test hook: ignore the real light sensor
+        fileLoad()
+        view.onDragEnter = { [weak self] in self?.dragEntered = true }
+        view.onDragExit = { [weak self] in self?.dragEntered = false }
+        let dropped: ([URL]) -> Void = { [weak self] urls in
+            guard let s = self else { return }
+            s.fileAdd(urls)
+            if let last = urls.last(where: { s.files.contains($0) }) { s.selected = .file(last); s.pinned = true }   // show what was dropped
+        }
+        view.onDrop = dropped; sideView.onDrop = dropped
+        for v in [view as FileDragView, sideView as FileDragView, pillView as FileDragView] {   // dragging a file out of the island
+            v.fileForDrag = { [weak self] e in self?.fileForDrag(e) }
+            v.onDragBegan = { [weak self] in self?.cancelPress() }
+            v.onDragFinished = { [weak self] u, taken in if taken { self?.fileRemove(u) } }   // taken out: it leaves the pocket
+        }
+        for content in [c, cSide] {
+            content.fRevealB.target = self; content.fRevealB.action = #selector(revealFileTapped)
+            content.fRemoveB.target = self; content.fRemoveB.action = #selector(removeFileTapped)
+        }
         c.hBar.onChange = { [weak self] v in self?.hudDragged(v) }
         view.onOpenSource = { [weak self] in self?.openSourceApp() }
         setupStatusItem()
@@ -1384,12 +1631,26 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func makePanel(_ frame: NSRect) -> NSPanel {
         let p = NSPanel(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-        p.level = .screenSaver
+        // Windows above the dragging level (500) cannot be drop targets, so stay just below it: still above menus and the Dock.
+        p.level = NSWindow.Level(rawValue: 400)
         p.backgroundColor = .clear
         p.isOpaque = false
-        p.hasShadow = false
+        p.hasShadow = false                                  // the system shadow draws a light rim; ShadowView draws a soft one instead
         p.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
         return p
+    }
+
+    /// A click-through window with a soft shadow of `provider`'s shape, kept just behind `piece`.
+    func attachShadow(to piece: Piece, _ provider: @escaping (CGSize) -> CGPath) {
+        let p = NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        p.level = NSWindow.Level(rawValue: 399)                  // just under the island windows
+        p.backgroundColor = .clear; p.isOpaque = false; p.hasShadow = false
+        p.ignoresMouseEvents = true                              // never in the way of a click or a drop
+        p.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+        let v = ShadowView(frame: .zero)
+        v.pathProvider = provider
+        p.contentView = v
+        piece.shadow = p
     }
 
     func symbolView(_ name: String, _ pt: CGFloat, _ tint: NSColor) -> NSImageView {
@@ -1400,9 +1661,21 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return v
     }
 
+    /// The slot views of an activity. Files get theirs on demand: the file's own icon, nothing else.
+    func slotItem(_ k: ActKind) -> SlotItem? {
+        if let it = slotItems[k] { return it }
+        guard case .file(let u) = k else { return nil }
+        let icon = NSImageView()
+        icon.image = NSWorkspace.shared.icon(forFile: u.path)
+        icon.imageScaling = .scaleProportionallyUpOrDown
+        let it = SlotItem(icon: icon, detail: NSView(), detailSize: .zero)
+        slotItems[k] = it
+        return it
+    }
+
     func makeSlotItems() {
         slotItems[.media] = SlotItem(icon: ArtView(radius: 6), detail: EqView(), detailSize: CGSize(width: 20, height: 16))
-        slotItems[.timer] = SlotItem(icon: symbolView("timer", 16, accent),
+        slotItems[.timer] = SlotItem(icon: TimerRing(),
                                      detail: makeLabel(13, .semibold, accent, mono: true, align: .right), detailSize: CGSize(width: 46, height: 18))
         slotItems[.charging] = SlotItem(icon: symbolView("bolt.fill", 15, bannerGreen),
                                         detail: makeLabel(13, .semibold, bannerGreen, mono: true, align: .center), detailSize: CGSize(width: 38, height: 18))
@@ -1411,14 +1684,18 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         slotItems[.airpods] = SlotItem(icon: symbolView("airpods", 17, .white), detail: RingView(), detailSize: CGSize(width: 24, height: 24))
     }
 
+    /// Demos: a stopwatch, or (NI_COUNTDOWN=1) a one-minute timer.
+    func startDemoTimer() {
+        if ProcessInfo.processInfo.environment["NI_COUNTDOWN"] != nil { timer.startCountdown(minutes: 1) } else { timer.toggle() }
+    }
+
     func wire(_ b: NSButton, _ sel: Selector) { b.target = self; b.action = sel }
 
     // MARK: actions
 
-    @objc func prevTapped() { haptic(); if demoMedia { return }; sendMediaCommand(5); pollSoon() }
-    @objc func nextTapped() { haptic(); if demoMedia { return }; sendMediaCommand(4); pollSoon() }
+    @objc func prevTapped() { if demoMedia { return }; sendMediaCommand(5); pollSoon() }
+    @objc func nextTapped() { if demoMedia { return }; sendMediaCommand(4); pollSoon() }
     @objc func playPauseTapped() {
-        haptic()
         if var m = media {                           // flip the icon at once; the next poll confirms it
             m.elapsed = m.elapsedNow; m.readAt = Date(); m.playing.toggle()
             if m.playing { lastPlayingAt = Date() }
@@ -1466,6 +1743,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let parent = NSMenuItem(title: "타이머", action: nil, keyEquivalent: "")
             parent.submenu = sub; menu.addItem(parent)
         }
+        if !files.isEmpty { add("주머니 비우기 (\(files.count))", #selector(filesClear)) }
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "NotchIsland 종료", action: #selector(menuQuit), keyEquivalent: "q")
         quit.target = self; menu.addItem(quit)
@@ -1479,7 +1757,6 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Bring the app that is playing to the front (Music, Spotify, the browser with the video...).
     func openSourceApp() {
-        haptic(.alignment)
         guard let id = media?.bundleID, !id.isEmpty else { return }
         if let running = NSRunningApplication.runningApplications(withBundleIdentifier: id).first {
             running.activate(options: [.activateAllWindows])
@@ -1489,8 +1766,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         pinned = false                               // go back to the compact island once the app is in front
     }
 
-    @objc func timerToggleTapped() { haptic(); timer.toggle(); refreshUI() }
-    @objc func timerCancelTapped() { haptic(); timer.reset(); refreshUI() }
+    @objc func timerToggleTapped() { timer.toggle(); refreshUI() }
+    @objc func timerCancelTapped() { timer.reset(); refreshUI() }
     func pollSoon() { DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in self?.pollMusic() } }
 
     /// Which activity is under the pointer. Anything on the notch itself or to the left of it is the activity attached
@@ -1508,12 +1785,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return a[0]
     }
 
-    /// Finger down: react at once (swell + haptic). With something running, a quick tap opens it on release,
+    /// Finger down: react at once (swell; the trackpad's own click is the only haptic). With something running, a quick tap opens it on release,
     /// and holding opens it after 0.25s without waiting for the release. With nothing running it pops out and back.
     func pressBegan() {
-        haptic(.alignment)
         pressKind = kindAtMouse()
-        pressedWhileExpanded = (shape == .expanded)
+        pressedWhileExpanded = (shape == .expanded) || sideExpanded
+        pressSide = acts.count == 2 && sideP.active && sideP.panel.frame.insetBy(dx: -6, dy: -6).contains(NSEvent.mouseLocation)
         if pressedWhileExpanded { return }           // already open: the release (a tap) closes it
         if !liveActivity {                           // nothing to show: pop out a little and go straight back in
             popUntil = Date().addingTimeInterval(0.22)
@@ -1523,12 +1800,11 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         longPressTimer?.invalidate()
         let t = Timer(timeInterval: 0.25, repeats: false) { [weak self] _ in
             guard let s = self, s.pressing else { return }
-            let hit = s.frame(for: s.shape).insetBy(dx: -40, dy: -40)
-            guard hit.contains(NSEvent.mouseLocation) else { return }   // dragged away while holding: do nothing
+            let zone = s.pressSide ? s.sideP.panel.frame : s.frame(for: s.shape)
+            guard zone.insetBy(dx: -40, dy: -40).contains(NSEvent.mouseLocation) else { return }   // dragged away while holding: do nothing
             s.pressing = false
             s.selected = s.pressKind
             s.pinned = true                          // popped out: stays out until you click elsewhere
-            haptic(.levelChange)
         }
         RunLoop.main.add(t, forMode: .common)
         longPressTimer = t
@@ -1541,12 +1817,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if wasPressing && inside && liveActivity {   // a quick tap (trackpad click / tap-to-click) opens it
             selected = pressKind
             pinned = true
-            haptic(.levelChange)
         }
         if pressedWhileExpanded && inside {          // tapping the open island shrinks it back
             if hudActive { hudUntil = .distantPast }
             else { pinned = false; alertText = nil; banner = nil }
-            haptic(.levelChange)
         }
         pressedWhileExpanded = false
     }
@@ -1580,6 +1854,69 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func sensorTouchEnded() {
         longPressTimer?.invalidate(); longPressTimer = nil
         pressing = false
+    }
+
+    // MARK: files (the pocket)
+
+    func fileAdd(_ urls: [URL]) {
+        for u in urls where !files.contains(u) { files.append(u) }
+        syncActivities(); fileSave(); refreshUI()
+    }
+    func fileRemove(_ u: URL) {
+        files.removeAll { $0 == u }; slotItems.removeValue(forKey: .file(u))
+        syncActivities(); fileSave(); refreshUI()
+    }
+    @objc func filesClear() {
+        for u in files { slotItems.removeValue(forKey: .file(u)) }
+        files.removeAll(); syncActivities(); fileSave(); refreshUI()
+    }
+    func fileSave() {
+        guard demoShelf == nil else { return }
+        UserDefaults.standard.set(files.map { $0.path }, forKey: "pocketFiles")
+    }
+    func fileLoad() {
+        let paths = demoShelf ?? UserDefaults.standard.stringArray(forKey: "pocketFiles") ?? []
+        files = Array(paths.filter { FileManager.default.fileExists(atPath: $0) }.map { URL(fileURLWithPath: $0) }.suffix(5))
+    }
+    @objc func revealFileTapped() { if case .file(let u)? = cardKind { NSWorkspace.shared.activateFileViewerSelecting([u]) } }
+    @objc func removeFileTapped() { if case .file(let u)? = cardKind { fileRemove(u); pinned = false } }
+
+    func fileSubtitle(_ u: URL) -> String {
+        if let c = fileInfo[u] { return c }
+        let size = (try? u.resourceValues(forKeys: [.fileSizeKey]).fileSize).flatMap { $0 }.map { ByteCountFormatter.string(fromByteCount: Int64($0), countStyle: .file) }
+        let info = [u.deletingLastPathComponent().lastPathComponent, size].compactMap { $0 }.joined(separator: " · ")
+        fileInfo[u] = info
+        return info
+    }
+
+    /// The file a drag starting at the pointer would carry: the open file card's icon / name, or a file icon in the compact island.
+    func fileForDrag(_ e: NSEvent) -> URL? {
+        if sideExpanded {
+            guard case .file(let u)? = selected else { return nil }
+            return cSide.fIcon.frame.union(cSide.fName.frame).contains(cSide.convert(e.locationInWindow, from: nil)) ? u : nil
+        }
+        if shape == .expanded {
+            guard body == .file, case .file(let u)? = cardKind else { return nil }
+            return c.fIcon.frame.union(c.fName.frame).contains(c.convert(e.locationInWindow, from: nil)) ? u : nil
+        }
+        if case .file(let u)? = kindAtMouse() { return u }
+        return nil
+    }
+    func cancelPress() { longPressTimer?.invalidate(); longPressTimer = nil; pressing = false }
+
+    /// Called every frame: is a file drag (from Finder...) in progress, and is it near the notch?
+    func trackFileDrag(_ m: NSPoint) {
+        let down = NSEvent.pressedMouseButtons & 1 != 0
+        let pb = NSPasteboard(name: .drag)
+        if down && !wasBtn { downChange = pb.changeCount; dragActive = false }
+        if down, !dragActive, pb.changeCount != downChange,
+           pb.canReadObject(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) { dragActive = true }
+        if !down { dragActive = false; dragEntered = false }
+        wasBtn = down
+        let zone = dropping ? frame(for: .expanded).insetBy(dx: -30, dy: -30)
+                            : NSRect(x: screen.frame.midX - 110, y: screen.frame.maxY - 70, width: 220, height: 70)
+        let near = dragActive && zone.contains(m)
+        if near != dragNear { dragNear = near }
     }
 
     // MARK: volume / brightness HUD
@@ -1682,9 +2019,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         RunLoop.main.add(kt, forMode: .common); keyTapTimer = kt
     }
 
-    func showBanner(_ k: BannerKind) {
+    func showBanner(_ k: BannerKind, autoHide: TimeInterval? = nil) {
         banner = k
-        pinned = true                                // stays until you click somewhere else
+        bannerHideAt = autoHide.map { Date().addingTimeInterval($0) }      // nil: stays until you click somewhere else
+        pinned = true
         haptic(.levelChange)
     }
 
@@ -1724,6 +2062,14 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if darkLatched && !wasCovered { sensorTouchBegan() }
             else if !darkLatched && wasCovered { sensorTouchEnded() }
         }
+        if let t = bannerHideAt, now > t {                      // a timed banner (AirPods connecting) goes away by itself
+            bannerHideAt = nil
+            if case .airpods? = banner { banner = nil; if selected == nil { pinned = false } }
+        }
+        trackFileDrag(NSEvent.mouseLocation)
+        if tick % 120 == 7, files.contains(where: { !FileManager.default.fileExists(atPath: $0.path) }) {       // deleted elsewhere
+            files = files.filter { FileManager.default.fileExists(atPath: $0.path) }; fileSave()
+        }
         if tick % 4 == 0 { pollVolume() }          // 15Hz: volume changes from anywhere (keys, menu bar, headphones)
         if tick % 120 == 0 { pollBattery() }       // 2s
         if tick % 120 == 47 { pollMusic() }        // 2s, offset from battery
@@ -1736,7 +2082,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if timer.finished {                        // countdown just hit zero
             timer.reset()
             NSSound.beep()
-            showAlert("⏰ 타이머 종료", seconds: 6)
+            showAlert("타이머 종료", seconds: 6)
         }
 
         if tick % 6 == 0 { refreshUI() }           // content at 10Hz; shape/hover/press every frame
@@ -1772,7 +2118,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applyAirPods(_ list: [AirPodsInfo]) {
         airList = list
         if airBaseline {                             // the first poll only records what is already connected
-            for d in list where !airKnown.contains(d.name) { showBanner(.airpods(symbol: d.symbol, level: d.level)) }
+            for d in list where !airKnown.contains(d.name) { showBanner(.airpods(symbol: d.symbol, level: d.level), autoHide: 4) }   // only at the moment of connecting
         }
         airKnown = Set(list.map { $0.name }); airBaseline = true
     }
@@ -1801,10 +2147,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !r.playing {
             guard media != nil, shape == .expanded || Date().timeIntervalSince(lastPlayingAt) < 4 else { media = nil; return }
         }
-        let isNew = media == nil || media?.title != r.title
+        let started = media == nil                   // playback just started (a track change alone never opens the card)
         media = r
         loadArtwork(for: r.storeID)
-        if mediaBaseline && r.playing && isNew {     // playback just started / the track changed: open the card at once
+        if mediaBaseline && r.playing && started {   // playback just started: open the card at once
             selected = .media
             pinned = true
             haptic(.levelChange)
@@ -1814,8 +2160,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func loadArtwork(for id: String) {
         guard id != artworkFor else { return }
         artworkFor = id
-        artwork = nil; artColor = accent
-        guard !id.isEmpty else { return }
+        guard !id.isEmpty else { artwork = nil; artColor = accent; return }     // no cover to look up: show the placeholder
+        // keep showing the previous cover until the new one has arrived, so it fades once instead of flashing
         if let hit = artCache[id] { artwork = hit.0; artColor = hit.1; return }
         fetchArtwork(storeID: id) { [weak self] img in
             guard let img = img else { return }
@@ -1837,36 +2183,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let b = body
         c.body = b
         c.ending = b == .none && acts.isEmpty
-        c.bandH = (shape == .expanded || (shape == .collapsed && atRest)) ? notchH : notchH + 8
+        c.bandH = (shape == .expanded || (shape == .collapsed && atRest)) ? notchH : compactH
         view.earRight = !(shape != .expanded && acts.count == 2)       // 2 activities: the island ends flush with the notch
 
-        // timer pieces
-        let timeText = timer.text()
-        setText(c.tTime, timeText)
-        setText(c.tLabel, timer.mode == .stopwatch ? "스톱워치" : "타이머")
-        setSymbol(c.pauseB, timer.running ? "pause.fill" : "play.fill", 20)
+        populate(c, bn: displayBanner, kind: cardKind)
 
-        // banner
-        if let bn = displayBanner {
-            switch bn {
-            case .battery(let title, let level, let color):
-                c.bannerIsAir = false
-                setText(c.bTitle, title); setText(c.bPct, "\(level)%")
-                c.bPct.textColor = color
-                c.bGlyph.fraction = CGFloat(level) / 100; c.bGlyph.color = color
-            case .airpods(let symbol, let level):
-                c.bannerIsAir = true
-                if symbol != bannerSymbol {
-                    bannerSymbol = symbol
-                    c.bAir.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
-                        .withSymbolConfiguration(.init(pointSize: 21, weight: .regular))
-                    c.bAir.contentTintColor = .white
-                }
-                c.bRing.fraction = CGFloat(level ?? 0) / 100
-            }
-        }
-
-        // volume / brightness HUD
+        // volume / brightness HUD (the main island only)
         if hudActive {
             let level = hudMuted ? 0 : hudValue
             let name: String
@@ -1888,6 +2210,56 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // alert
         setText(c.alertL, alertText ?? "")
 
+        // the second notch has a card of its own
+        let a = acts
+        let sk: ActKind? = a.count == 2 ? a[1] : nil
+        cSide.body = sk.map { bodyFor($0) } ?? .none
+        cSide.bandH = sideExpanded ? notchH : compactH
+        if let sk = sk { populate(cSide, bn: bannerFor(sk), kind: sk) }
+
+        refreshSlots()
+        let plan = makePlan()
+        if plan != lastPlan { lastPlan = plan; placeSlots(plan) }
+        c.needsLayout = true; cSide.needsLayout = true
+        c.applyVisibility(expanded: shape == .expanded)
+        cSide.applyVisibility(expanded: sideExpanded)
+    }
+
+    /// Fills the card of one island (the main one or the second notch) with the data of the activity it shows.
+    func populate(_ c: Content, bn: BannerKind?, kind: ActKind?) {
+        // timer pieces
+        setText(c.tTime, timer.text())
+        setText(c.tLabel, timer.mode == .stopwatch ? "스톱워치" : "타이머")
+        setSymbol(c.pauseB, timer.running ? "pause.fill" : "play.fill", 20)
+
+        // banner (charging / low battery / AirPods)
+        if let bn = bn {
+            switch bn {
+            case .battery(let title, let level, let color):
+                c.bannerIsAir = false
+                setText(c.bTitle, title); setText(c.bPct, "\(level)%")
+                c.bPct.textColor = color
+                c.bGlyph.fraction = CGFloat(level) / 100; c.bGlyph.color = color
+            case .airpods(let symbol, let level):
+                c.bannerIsAir = true
+                if symbol != c.bannerSymbol {
+                    c.bannerSymbol = symbol
+                    c.bAir.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
+                        .withSymbolConfiguration(.init(pointSize: 21, weight: .regular))
+                    c.bAir.contentTintColor = .white
+                }
+                c.bRing.fraction = CGFloat(level ?? 0) / 100
+            }
+        }
+
+        // file card
+        if case .file(let u)? = kind, c.fileShown != u {
+            c.fileShown = u
+            c.fIcon.image = NSWorkspace.shared.icon(forFile: u.path)
+            setText(c.fName, u.lastPathComponent)
+            setText(c.fSub, fileSubtitle(u))
+        }
+
         // media pieces
         if let m = media {
             setText(c.titleL, m.title)
@@ -1901,27 +2273,29 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             setSymbol(c.playB, m.playing ? "pause.fill" : "play.fill", 30)
             c.bodyEq.color = artColor; c.bodyEq.setPlaying(m.playing)
         }
-
-        refreshSlots()
-        let plan = makePlan()
-        if plan != lastPlan { lastPlan = plan; placeSlots(plan) }
-        c.needsLayout = true
-        c.applyVisibility(expanded: shape == .expanded)
     }
 
     /// Updates what the small slot views show.
     func refreshSlots() {
-        if let m = media, let it = slotItems[.media], let art = it.icon as? ArtView, let eq = it.detail as? EqView {
+        if let m = media, let it = slotItem(.media), let art = it.icon as? ArtView, let eq = it.detail as? EqView {
             art.setImage(artwork); eq.color = artColor; eq.setPlaying(m.playing)
         }
-        if let it = slotItems[.timer], let l = it.detail as? NSTextField { setText(l, timer.text()) }
-        if let it = slotItems[.charging], let l = it.detail as? NSTextField { setText(l, "\(chargeLevel)%") }
-        if let it = slotItems[.lowBattery], let l = it.detail as? NSTextField {
+        if let it = slotItem(.timer), let l = it.detail as? NSTextField {
+            setText(l, timer.text())
+            if let ring = it.icon as? TimerRing {
+                ring.countdown = timer.mode == .countdown
+                ring.fraction = timer.mode == .countdown
+                    ? CGFloat(timer.target > 0 ? max(0, timer.target - timer.elapsed) / timer.target : 0)     // shrinks
+                    : CGFloat(timer.elapsed.truncatingRemainder(dividingBy: 60) / 60)                           // fills, a lap a minute
+            }
+        }
+        if let it = slotItem(.charging), let l = it.detail as? NSTextField { setText(l, "\(chargeLevel)%") }
+        if let it = slotItem(.lowBattery), let l = it.detail as? NSTextField {
             setText(l, "\(lowLevel)%")
             let col = lowLevel <= 10 ? bannerRed : accent
             l.textColor = col; (it.icon as? NSImageView)?.contentTintColor = col
         }
-        if let it = slotItems[.airpods], let d = airInfo, let ring = it.detail as? RingView, let icon = it.icon as? NSImageView {
+        if let it = slotItem(.airpods), let d = airInfo, let ring = it.detail as? RingView, let icon = it.icon as? NSImageView {
             ring.fraction = CGFloat(d.level ?? 0) / 100
             if icon.toolTip != d.symbol {
                 icon.toolTip = d.symbol
@@ -1946,19 +2320,19 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if v.superview !== host { v.removeFromSuperview(); host.addSubview(v); v.alphaValue = 0 }
             if v.alphaValue < 1 { fade(v, to: 1) }
         }
-        if let lk = plan.left, let it = slotItems[lk] {
+        if let lk = plan.left, let it = slotItem(lk) {
             // a single activity: icon on the left, detail on the right. Several: the compact view (icon, or % for charging)
             let v = plan.rightDetail ? (view: it.icon, size: CGSize(width: 24, height: 24)) : slotView(lk)
             c.leftView = v.view; c.leftSize = v.size
             use(v.view, in: c)
         } else { c.leftView = nil }
-        if let rk = plan.right, let it = slotItems[rk] {
+        if let rk = plan.right, let it = slotItem(rk) {
             let v = plan.rightDetail ? (view: it.detail, size: it.detailSize) : slotView(rk)
             c.rightView = v.view; c.rightSize = v.size
             use(v.view, in: c)
         } else { c.rightView = nil }
-        if let sk = plan.side { let v = slotView(sk); use(v.view, in: sideView); sideView.single = v } else { sideView.single = nil }
-        let pitems = plan.pill.compactMap { slotItems[$0] }
+        if let sk = plan.side { let v = slotView(sk); use(v.view, in: cSide); cSide.centerView = v.view; cSide.centerSize = v.size } else { cSide.centerView = nil }
+        let pitems = plan.pill.compactMap { slotItem($0) }
         for it in pitems { use(it.icon, in: pillView); use(it.detail, in: pillView) }
         pillView.items = pitems
         let nowIDs = Set(now.map { ObjectIdentifier($0) })
@@ -1977,8 +2351,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func desiredShape() -> Shape {
         if !pinned { selected = nil }
         if pinned && !liveActivity && !forceOpen { pinned = false }   // nothing left to show
-        if forceOpen || pinned || hudActive { return .expanded }
-        if pressing || Date() < popUntil { return .pressed }
+        if forceOpen || (pinned && !sideExpanded) || hudActive || dropping { return .expanded }   // the second notch opens by itself
+        if (pressing && !pressSide) || Date() < popUntil { return .pressed }     // a press on the second notch leaves the main island alone
         if Date() < hoverUntil { return .peek }       // hovering only nudges it; a long press opens it
         if !acts.isEmpty { return .activity }
         return .collapsed
@@ -2020,6 +2394,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 p.x.jump(anchorX); p.w.jump(0); p.h.jump(r.height); p.ty.jump(ty)
                 p.panel.alphaValue = 0
                 p.panel.orderFrontRegardless(); makeSticky(p.panel); p.visible = true
+                if let sh = p.shadow { sh.orderFrontRegardless(); makeSticky(sh) }
             }
             if abs(p.x.tgt - r.minX) > 0.01 || abs(p.w.tgt - r.width) > 0.01 || abs(p.h.tgt - r.height) > 0.01 || abs(p.ty.tgt - ty) > 0.01 { changed = true }
             p.x.tgt = r.minX; p.w.tgt = r.width; p.h.tgt = r.height; p.ty.tgt = ty; p.fullW = r.width
@@ -2046,11 +2421,16 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             if p.settled { p.snap() } else { allSettled = false }
             if !p.active && p.settled && p.w.cur < 1.5 {          // shrunk away: take the window off screen
-                p.panel.orderOut(nil); p.visible = false; p.w.jump(0)
+                p.panel.orderOut(nil); p.shadow?.orderOut(nil); p.visible = false; p.w.jump(0)
                 continue
             }
             if !isMain { p.panel.alphaValue = p.fullW > 0 ? min(1, max(0, p.w.cur / p.fullW)) : 0 }
-            p.panel.setFrame(NSRect(x: p.x.cur, y: screen.frame.maxY - p.ty.cur - p.h.cur, width: max(p.w.cur, 1), height: max(p.h.cur, 1)), display: true)
+            let f = NSRect(x: p.x.cur, y: screen.frame.maxY - p.ty.cur - p.h.cur, width: max(p.w.cur, 1), height: max(p.h.cur, 1))
+            p.panel.setFrame(f, display: true)
+            if let sh = p.shadow {
+                sh.setFrame(f.insetBy(dx: -ShadowView.pad, dy: -ShadowView.pad), display: true)
+                sh.alphaValue = p.panel.alphaValue
+            }
         }
         atRest = mainP.settled
         if allSettled { l.isPaused = true }
