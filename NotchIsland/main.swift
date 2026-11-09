@@ -429,6 +429,7 @@ final class EqView: NSView {
             l.backgroundColor = color.cgColor
             l.cornerRadius = 1.5
             l.anchorPoint = CGPoint(x: 0.5, y: 0)
+            l.transform = CATransform3DMakeScale(1, 0.3, 1)
             layer?.addSublayer(l)
             bars.append(l)
         }
@@ -449,10 +450,11 @@ final class EqView: NSView {
         guard p != animating || bars.first?.animationKeys() == nil && p else { return }
         animating = p
         for (i, l) in bars.enumerated() {
+            let current = (l.presentation()?.value(forKeyPath: "transform.scale.y") as? NSNumber)?.doubleValue ?? 0.3
             l.removeAllAnimations()
             if p {
                 let a = CABasicAnimation(keyPath: "transform.scale.y")
-                a.fromValue = 0.25; a.toValue = 1.0
+                a.fromValue = current; a.toValue = 1.0
                 a.duration = 0.42 + Double(i) * 0.11
                 a.autoreverses = true; a.repeatCount = .infinity
                 a.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
@@ -460,6 +462,10 @@ final class EqView: NSView {
                 l.add(a, forKey: "eq")
             } else {
                 l.transform = CATransform3DMakeScale(1, 0.3, 1)
+                let a = CABasicAnimation(keyPath: "transform.scale.y")
+                a.fromValue = current; a.toValue = 0.3
+                a.duration = 0.25; a.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                l.add(a, forKey: "settle")
             }
         }
     }
@@ -467,7 +473,17 @@ final class EqView: NSView {
 
 final class ProgressBar: NSView {
     private let fill = CALayer()
-    var fraction: CGFloat = 0 { didSet { relayout() } }
+    var fraction: CGFloat = 0 {
+        didSet {
+            guard fraction != oldValue else { return }
+            let from = fill.presentation()?.frame ?? fill.frame
+            relayout()
+            let a = CABasicAnimation(keyPath: "bounds.size.width")
+            a.fromValue = from.width; a.toValue = fill.bounds.width
+            a.duration = 0.15; a.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            fill.add(a, forKey: "progress")
+        }
+    }
     init() {
         super.init(frame: .zero)
         wantsLayer = true
@@ -510,8 +526,17 @@ final class BatteryGlyph: NSView {
 final class RingView: NSView {
     private let track = CAShapeLayer(), prog = CAShapeLayer()
     var fraction: CGFloat = 0 {
-        didSet { CATransaction.begin(); CATransaction.setDisableActions(true)
-                 prog.strokeEnd = min(max(fraction, 0), 1); CATransaction.commit() }
+        didSet {
+            guard fraction != oldValue else { return }
+            let from = prog.presentation()?.strokeEnd ?? prog.strokeEnd
+            let to = min(max(fraction, 0), 1)
+            CATransaction.begin(); CATransaction.setDisableActions(true)
+            prog.strokeEnd = to; CATransaction.commit()
+            let a = CABasicAnimation(keyPath: "strokeEnd")
+            a.fromValue = from; a.toValue = to; a.duration = 0.4
+            a.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            prog.add(a, forKey: "level")
+        }
     }
     var color: NSColor = bannerGreen { didSet { prog.strokeColor = color.cgColor } }
     init() {
@@ -550,7 +575,8 @@ final class LevelBar: NSView {
     var sliderMode = false {
         didSet {
             guard sliderMode != oldValue else { return }
-            CATransaction.begin(); CATransaction.setAnimationDuration(0.18)
+            CATransaction.begin(); CATransaction.setAnimationDuration(0.25)
+            CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeInEaseOut))
             seg.opacity = sliderMode ? 0 : 1
             slider.opacity = sliderMode ? 1 : 0
             CATransaction.commit()
@@ -809,7 +835,8 @@ final class Content: Flip {
             if lastAlpha[key] == a { continue }
             lastAlpha[key] = a
             NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = on ? 0.28 : (ending ? 0.65 : 0.14)      // a finished activity fades out unhurriedly
+                ctx.duration = on ? 0.3 : (ending ? 0.5 : 0.22)
+                ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
                 v.animator().alphaValue = a
             }
         }
@@ -1472,11 +1499,11 @@ final class App: NSObject, NSApplicationDelegate {
             shape = target
             refreshUI()                                // wings/body change with the shape
             switch target {
-            case .pressed:  stiffness = 900; damping = 48     // snaps to the finger
-            case .peek:     stiffness = 600; damping = 40
-            case .expanded: stiffness = 380; damping = 21     // gentle overshoot: the "pop"
-            case .collapsed: stiffness = 90; damping = 19     // activity ended: glides in slowly (~0.7s), no bounce
-            default:        stiffness = 420; damping = 36     // settles back without bouncing
+            case .pressed:  stiffness = 520; damping = 42
+            case .peek:     stiffness = 380; damping = 37
+            case .expanded: stiffness = 300; damping = 30
+            case .collapsed: stiffness = 120; damping = 22
+            default:        stiffness = 300; damping = 34
             }
         }
         let size = frame(for: shape).size
@@ -1495,7 +1522,9 @@ final class App: NSObject, NSApplicationDelegate {
             velH += (-stiffness * (curH - tgtH) - damping * velH) * h
             curW += velW * h; curH += velH * h
         }
-        if curH < notchH { curH = notchH; if velH < 0 { velH = 0 } }          // never shrink above the notch
+        // Momentum from an interrupted expansion must never carry either edge inside the hardware notch.
+        if curW < notchW { curW = notchW; if velW < 0 { velW = 0 } }
+        if curH < notchH { curH = notchH; if velH < 0 { velH = 0 } }
         if abs(curW - tgtW) < 0.1 && abs(curH - tgtH) < 0.1 && abs(velW) < 2 && abs(velH) < 2 {
             curW = tgtW; curH = tgtH; velW = 0; velH = 0; l.isPaused = true; atRest = true
         }

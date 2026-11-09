@@ -6,6 +6,11 @@ cd "$(dirname "$0")"
 APP=build/NotchIsland.app
 rm -rf "$APP"
 mkdir -p build "$APP/Contents/MacOS" "$APP/Contents/Resources"
+ICONSET=build/NotchIsland.iconset
+rm -rf "$ICONSET"
+mkdir -p "$ICONSET"
+swift Resources/make-icon.swift "$ICONSET"
+iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/NotchIsland.icns"
 
 # Pin the deployment target. Without it the compiler targets the SDK's own version (here macOS 28.0), and
 # Launch Services then refuses to open the app on an older macOS ("not compatible with this version of macOS").
@@ -25,6 +30,11 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleIdentifier</key><string>com.kusbeoms.NotchIsland</string>
     <key>CFBundleExecutable</key><string>NotchIsland</string>
     <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleIconFile</key><string>NotchIsland</string>
+    <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+    <key>CFBundleDevelopmentRegion</key><string>ko</string>
+    <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
+    <key>NSHumanReadableDescription</key><string>MacBook 노치에서 미디어와 타이머, 시스템 상태를 확인합니다.</string>
     <key>CFBundleShortVersionString</key><string>1.0</string>
     <key>CFBundleVersion</key><string>1</string>
     <key>LSMinimumSystemVersion</key><string>14.0</string>
