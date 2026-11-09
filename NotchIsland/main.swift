@@ -767,6 +767,90 @@ final class TimerRing: NSView {
     }
 }
 
+/// A wheel seen edge-on under the island. There is an invisible circle with its centre inside the island; the ticks stand on
+/// its rim and point outwards. The rim bulges out below the island in the middle and tucks back in behind the island at both
+/// ends, so the dial looks wrapped onto the island. (This view sits behind the island's black body, which hides the ends.)
+/// One long tick per live activity; the wheel goes round without an end, so the activities repeat on it.
+final class DialView: NSView {
+    static let perMajor = 6                                  // minor ticks between two activities
+    static let gap: CGFloat = 11                             // distance between ticks along the rim
+    static let radius: CGFloat = 230                         // radius of the invisible circle
+    static let bulge: CGFloat = 38                           // how far the rim hangs below the island's bottom edge
+    struct Geometry { var body = NSRect.zero }
+    var geometry = Geometry() { didSet { relayout() } }
+    private var ticks: [CALayer] = []
+    var count = 1 { didSet { if count != oldValue { relayout() } } }
+    private(set) var position: CGFloat = 0                   // in activities: 0 = the first, 1 = the second...
+    private var target: CGFloat = 0
+    private var velocity: CGFloat = 0
+    private var timer: Timer?
+    /// Light mode: dark ticks. Dark mode: light ticks. (Each tick also has an outline of the opposite colour, so it reads on
+    /// any background without the screen having to be looked at.)
+    var lightAppearance = false { didSet { if lightAppearance != oldValue { relayout() } } }
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        for _ in 0..<60 {
+            let l = CALayer()
+            l.borderWidth = 1
+            l.cornerRadius = 2.2
+            l.shadowColor = NSColor.black.cgColor; l.shadowOpacity = 0.3; l.shadowRadius = 2; l.shadowOffset = .zero
+            l.bounds = CGRect(x: 0, y: 0, width: 4.4, height: 14)
+            layer?.addSublayer(l); ticks.append(l)
+        }
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override func layout() { super.layout(); relayout() }
+
+    /// Moves the wheel to `t` (in activities). A finger turning it sets it directly; otherwise it springs there.
+    func set(_ t: CGFloat, animated: Bool) {
+        target = t
+        if !animated { position = t; velocity = 0; timer?.invalidate(); timer = nil; relayout(); return }
+        guard timer == nil, abs(position - target) > 0.0008 || abs(velocity) > 0.01 else { return }
+        let dt: CGFloat = 1.0 / 60
+        let tm = Timer(timeInterval: Double(dt), repeats: true) { [weak self] tm in
+            guard let s = self else { tm.invalidate(); return }
+            s.velocity += (-230 * (s.position - s.target) - 25 * s.velocity) * dt        // a soft spring, a touch of overshoot
+            s.position += s.velocity * dt
+            if abs(s.position - s.target) < 0.0008 && abs(s.velocity) < 0.01 { s.position = s.target; s.velocity = 0; tm.invalidate(); s.timer = nil }
+            s.relayout()
+        }
+        RunLoop.main.add(tm, forMode: .common); timer = tm
+    }
+
+    private func relayout() {
+        let body = geometry.body
+        guard body.width > 0 else { return }
+        let R = DialView.radius, g = DialView.bulge
+        let c = CGPoint(x: body.midX, y: body.minY + (R - g))             // the circle's centre, inside the island
+        let thetaMax = acos(1 - g / R)                                      // where the rim comes back up to the island's bottom edge
+        let gap = DialView.gap, per = DialView.perMajor
+        let unit = CGFloat(per) * gap
+        let first = Int(floor((position * unit - R * thetaMax) / gap)) - 1
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        for (i, l) in ticks.enumerated() {
+            let k = first + i
+            let th = (CGFloat(k) * gap - position * unit) / R               // angle from straight down; ticks are spaced evenly on the rim
+            guard abs(th) < thetaMax else { l.isHidden = true; continue }
+            let n = CGPoint(x: sin(th), y: -cos(th))                        // outwards from the centre
+            let edge = abs(th) / thetaMax                                   // 0 in the middle ... 1 where it tucks in
+            let major = ((k % per) + per) % per == 0                        // the wheel goes round: the activities repeat on it
+            let selected = major && abs(CGFloat(k / per) - position) < 0.5
+            let len = (major ? 22 : 12) * (1 - 0.3 * edge)
+            let mid = R - 3 + len / 2                                       // a tick starts just inside the rim and points outwards
+            l.backgroundColor = NSColor(white: lightAppearance ? 0.1 : 1, alpha: 1).cgColor
+            l.borderColor = NSColor(white: lightAppearance ? 1 : 0, alpha: 0.85).cgColor
+            l.isHidden = false
+            l.bounds = CGRect(x: 0, y: 0, width: 4.4, height: len + 2)
+            l.position = CGPoint(x: c.x + n.x * mid, y: c.y + n.y * mid)
+            l.transform = CATransform3DMakeRotation(atan2(n.y, n.x) + .pi / 2, 0, 0, 1)
+            l.opacity = Float(pow(cos(edge * .pi / 2), 0.8) * (major ? (selected ? 1 : 0.7) : 0.5))
+        }
+        CATransaction.commit()
+    }
+}
+
 func makeLabel(_ size: CGFloat, _ weight: NSFont.Weight, _ color: NSColor, mono: Bool = false,
                align: NSTextAlignment = .left) -> NSTextField {
     let l = NSTextField(labelWithString: "")
@@ -912,12 +996,13 @@ final class Piece {
     let panel: NSPanel
     var shadow: NSPanel?
     var x = SpringV(), w = SpringV(), h = SpringV(), ty = SpringV()    // left edge, width, height, distance from the top of the screen
+    var m = SpringV()                                                  // extra room under the island (for the dial)
     var fullW: CGFloat = 1
     var active = false      // wants to be on screen
     var visible = false     // is on screen (an inactive piece stays until it has shrunk away)
     init(panel: NSPanel) { self.panel = panel }
-    var settled: Bool { x.settled && w.settled && h.settled && ty.settled }
-    func snap() { x.snap(); w.snap(); h.snap(); ty.snap() }
+    var settled: Bool { x.settled && w.settled && h.settled && ty.settled && m.settled }
+    func snap() { x.snap(); w.snap(); h.snap(); ty.snap(); m.snap() }
 }
 
 /// The detached icon circle and the pill under the notch: black capsules holding slot views, centred.
@@ -925,9 +1010,7 @@ final class PillView: FileDragView {
     var onPress: (() -> Void)?
     var onRelease: ((Bool) -> Void)?
     var items: [SlotItem] = [] { didSet { needsLayout = true } }
-    var single: (view: NSView, size: CGSize)? { didSet { needsLayout = true } }   // one view, centred (the second notch)
     var withDetail = false { didSet { needsLayout = true } }
-    var notchStyle = false { didSet { needsLayout = true } }    // a second notch: attached to the top edge of the screen
     private let shapeMask = CAShapeLayer()
 
     override init(frame: NSRect) {
@@ -943,12 +1026,8 @@ final class PillView: FileDragView {
         let r = bounds.height / 2
         CATransaction.begin(); CATransaction.setDisableActions(true)
         shapeMask.frame = bounds
-        shapeMask.path = notchStyle ? notchPath(bounds.width, bounds.height)
-                                    : CGPath(roundedRect: bounds, cornerWidth: r, cornerHeight: r, transform: nil)
+        shapeMask.path = CGPath(roundedRect: bounds, cornerWidth: r, cornerHeight: r, transform: nil)
         CATransaction.commit()
-        if let one = single {
-            one.view.frame = NSRect(x: (bounds.width - one.size.width) / 2, y: (bounds.height - one.size.height) / 2, width: one.size.width, height: one.size.height)
-        }
         let widths = items.map { withDetail ? $0.pillWidth : 24 }
         let total = widths.reduce(0, +) + 16 * CGFloat(max(items.count - 1, 0))
         var x = (bounds.width - total) / 2
@@ -979,8 +1058,6 @@ final class Content: Flip {
     var leftView: NSView?            // slot views drawn beside the notch (managed by App)
     var rightView: NSView?
     var rightSize = CGSize(width: 24, height: 24)
-    var centerView: NSView?          // the second notch's compact icon, centred
-    var centerSize = CGSize(width: 24, height: 24)
     var bannerSymbol = ""
     var fileShown: URL?
     var leftSize = CGSize(width: 24, height: 24)
@@ -1059,7 +1136,6 @@ final class Content: Flip {
         leftView?.frame = NSRect(x: leftInset, y: (bandH - leftSize.height) / 2, width: leftSize.width, height: leftSize.height)
         rightView?.frame = NSRect(x: w - rightInset - rightSize.width, y: (bandH - rightSize.height) / 2,
                                   width: rightSize.width, height: rightSize.height)
-        centerView?.frame = NSRect(x: (w - centerSize.width) / 2, y: (bandH - centerSize.height) / 2, width: centerSize.width, height: centerSize.height)
         // media
         art.frame = NSRect(x: pad, y: top, width: 48, height: 48)
         let tx = pad + 48 + 12, tw = max(0, w - tx - pad - 26)
@@ -1140,31 +1216,44 @@ final class IslandView: FileDragView {
     var onPress: (() -> Void)?
     var onRelease: ((Bool) -> Void)?       // true when the finger came up inside the island
     let content = Content(frame: .zero)
+    let dial = DialView()                  // drawn outside the black body, round its lower edge
+    private let body = NSView()            // the black island itself (masked to the notch shape); `content` lives in it
     private let shapeMask = CAShapeLayer()
     var earLeft = true { didSet { if earLeft != oldValue { needsLayout = true } } }
     var earRight = true { didSet { if earRight != oldValue { needsLayout = true } } }   // false: the right edge is flush with the notch
+    /// Room under the island (the window is taller than the island by this much) for the dial's ticks.
+    var bottomInset: CGFloat = 0 { didSet { if bottomInset != oldValue { needsLayout = true } } }
+    var bodyRect: NSRect { NSRect(x: 0, y: bottomInset, width: bounds.width, height: max(bounds.height - bottomInset, 0)) }
 
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
-        layer?.backgroundColor = NSColor.black.cgColor
-        layer?.mask = shapeMask
+        body.wantsLayer = true
+        body.layer?.backgroundColor = NSColor.black.cgColor
+        body.layer?.mask = shapeMask
         content.frame = bounds
         content.autoresizingMask = []                     // laid out by hand: it sits between the ears
-        addSubview(content)
+        body.addSubview(content)
+        dial.alphaValue = 0
+        addSubview(dial)                                  // behind the island: the ends of the dial tuck in behind the black body
+        addSubview(body)
         registerForDraggedTypes([.fileURL])
     }
     required init?(coder: NSCoder) { fatalError() }
 
     override func layout() {
         super.layout()
-        let t = earRadius(bounds.height)
+        body.frame = bodyRect
+        let w = body.bounds.width, h = body.bounds.height
+        let t = earRadius(h)
         let l = earLeft ? t : 0, r = earRight ? t : 0
-        content.frame = NSRect(x: l, y: 0, width: max(0, bounds.width - l - r), height: bounds.height)
+        content.frame = NSRect(x: l, y: 0, width: max(0, w - l - r), height: h)
         CATransaction.begin(); CATransaction.setDisableActions(true)
-        shapeMask.frame = bounds
-        shapeMask.path = notchPath(bounds.width, bounds.height, earL: earLeft, earR: earRight)
+        shapeMask.frame = body.bounds
+        shapeMask.path = notchPath(w, h, earL: earLeft, earR: earRight)
         CATransaction.commit()
+        dial.frame = bounds
+        dial.geometry = DialView.Geometry(body: bodyRect)
     }
 
     var onOpenSource: (() -> Void)?
@@ -1172,6 +1261,8 @@ final class IslandView: FileDragView {
     var onDragEnter: (() -> Void)?
     var onDragExit: (() -> Void)?
     var onDrop: (([URL]) -> Void)?
+    var onScroll: ((NSEvent) -> Void)?
+    override func scrollWheel(with event: NSEvent) { onScroll?(event) }
 
     // Files dragged onto the island (from Finder...) go into the shelf.
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
@@ -1194,8 +1285,12 @@ final class IslandView: FileDragView {
     /// Only controls that are actually visible can take a click. (Hidden-by-alpha controls stacked on top of a
     /// visible one used to swallow its clicks.) Everything else is a press on the island itself.
     override func hitTest(_ point: NSPoint) -> NSView? {
-        guard let sv = superview, bounds.contains(convert(point, from: sv)) else { return nil }
-        let p = content.convert(convert(point, from: sv), from: self)
+        guard let sv = superview else { return nil }
+        let here = convert(point, from: sv)
+        let strip = NSRect(x: 0, y: 0, width: bounds.width, height: bottomInset + 6)      // the dial, just under the island
+        guard bodyRect.contains(here) || (bottomInset > 0 && strip.contains(here)) else { return nil }
+        guard bodyRect.contains(here) else { return self }
+        let p = content.convert(here, from: self)
         for v in content.subviews.reversed() where (v is NSButton || v is LevelBar) && !v.isHidden && v.alphaValue > 0.3 {
             if v.frame.contains(p) { return v }
         }
@@ -1209,6 +1304,7 @@ final class IslandView: FileDragView {
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override func mouseDown(with event: NSEvent) {
+        guard bodyRect.contains(convert(event.locationInWindow, from: nil)) else { return }       // the dial is for scrolling only
         downPoint = event.locationInWindow
         sourceTapActive = overSource(event)
         if !sourceTapActive { onPress?() }
@@ -1219,7 +1315,7 @@ final class IslandView: FileDragView {
             if overSource(event) { onOpenSource?() }
             return
         }
-        onRelease?(bounds.contains(convert(event.locationInWindow, from: nil)))
+        onRelease?(bodyRect.contains(convert(event.locationInWindow, from: nil)))
     }
 }
 
@@ -1235,10 +1331,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // spring-driven window size (smooth, interruptible, velocity-preserving)
     var link: CADisplayLink?
-    var mainP: Piece!, sideP: Piece!, pillP: Piece!
-    var sideView: IslandView!, pillView: PillView!
-    var cSide: Content { sideView.content }
-    var pressSide = false                  // the press that is in progress started on the second notch
+    var mainP: Piece!, pillP: Piece!
+    var pillView: PillView!
     var stiffness: CGFloat = 400, damping: CGFloat = 30     // the island's own spring (changes with the shape)
     var signalSources: [DispatchSourceSignal] = []
     var simLux: Double?
@@ -1347,10 +1441,6 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     var acts: [ActKind] { Array(actOrder.suffix(5)) }
 
-    /// The second notch (the right one, with exactly two activities) carries the open card by itself when its activity is selected.
-    var sideExpanded: Bool {
-        pinned && !hudActive && !dropping && banner == nil && alertText == nil && acts.count == 2 && selected == acts[1]
-    }
     func bodyFor(_ k: ActKind) -> Body {
         switch k {
         case .media: return .media
@@ -1358,6 +1448,72 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .charging, .lowBattery, .airpods: return .banner
         case .file: return .file
         }
+    }
+
+    /// The dial is shown along the bottom of an open activity card when there is more than one activity to choose from.
+    var dialShown: Bool { !hudActive && !dropping && banner == nil && alertText == nil && acts.count >= 2 && cardKind != nil }
+    var dialMargin: CGFloat { (shape == .expanded && dialShown) ? 62 : 0 }       // room under the island for the dial's ticks
+    var dialWasOn = false
+    var scrollHolding: Bool { dialShown && shape == .expanded && Date().timeIntervalSince(lastScrollAt) < 1.0 }
+    var holdH: CGFloat = 0                              // while scrolling the card never gets lower, so the pointer stays on the dial
+    var lastScrollAt = Date.distantPast
+    var dialPos: CGFloat = 0                            // where the fingers have turned the wheel, in activities (continuous)
+    var dialLastTick = 0
+    var lastDialHaptic = Date.distantPast
+    var dialSettle: Timer?
+
+    /// Two fingers sideways over the dial turn the wheel: it follows the fingers (and keeps going when they flick it), every tick
+    /// is a little magnet, the long ticks (the running activities) also tap the trackpad, and when it stops it settles on the
+    /// nearest activity.
+    func handleScroll(_ e: NSEvent) {
+        guard shape == .expanded, dialShown, e.hasPreciseScrollingDeltas,
+              e.locationInWindow.y < view.bottomInset + 66 else { return }               // over the dial, or the foot of the card
+        let now = Date()
+        let fresh = e.phase == .began || e.phase == .mayBegin || now.timeIntervalSince(lastScrollAt) > 0.3
+        if fresh { dialPos = view.dial.position; dialLastTick = Int((dialPos * CGFloat(DialView.perMajor)).rounded()) }
+        lastScrollAt = now
+        holdH = max(holdH, mainP.h.cur, mainP.h.tgt)
+        let finger = e.isDirectionInvertedFromDevice ? e.scrollingDeltaX : -e.scrollingDeltaX     // fingers moving left < 0
+        let unit = DialView.gap * CGFloat(DialView.perMajor)
+        dialPos -= finger / (unit * 0.9)                                                       // fingers left: on to the next (and round again)
+        turnDial()
+        dialSettle?.invalidate()
+        let t = Timer(timeInterval: 0.14, repeats: false) { [weak self] _ in self?.settleDial() }   // no more events (or momentum): settle
+        RunLoop.main.add(t, forMode: .common); dialSettle = t
+    }
+
+    /// Shows the wheel where the fingers have it, pulled towards the nearest tick like a detent, and follows it with the card.
+    func turnDial() {
+        let per = CGFloat(DialView.perMajor)
+        let t = dialPos * per
+        let n = t.rounded(), f = t - n
+        let pulled = n + (f < 0 ? -1 : 1) * 0.5 * pow(min(2 * abs(f), 1), 2.0)       // it dwells on a tick, then slips to the next
+        view.dial.set(pulled / per, animated: false)
+        let tick = Int(n), perI = DialView.perMajor
+        if tick != dialLastTick {
+            // the little magnets on the ordinary ticks are silent; a tap on the trackpad only when the wheel catches on one of the
+            // long ticks, i.e. on a running activity (also when a quick turn skips past several ticks in one go)
+            let lo = min(tick, dialLastTick), hi = max(tick, dialLastTick)
+            let caught = (lo...hi).contains { $0 % perI == 0 && $0 != dialLastTick }
+            dialLastTick = tick
+            if caught, Date().timeIntervalSince(lastDialHaptic) > 0.03 {
+                lastDialHaptic = Date()
+                haptic(.levelChange)
+            }
+        }
+        let a = acts
+        guard !a.isEmpty else { return }
+        let idx = ((Int(dialPos.rounded()) % a.count) + a.count) % a.count          // endless: past the last comes the first
+        if a[idx] != cardKind { selected = a[idx] }
+    }
+
+    func settleDial() {
+        guard shape == .expanded, dialShown, !acts.isEmpty else { return }
+        let r = dialPos.rounded()
+        let idx = ((Int(r) % acts.count) + acts.count) % acts.count
+        dialPos = r
+        selected = acts[idx]
+        view.dial.set(r, animated: true)
     }
 
     var cardKind: ActKind? { if let s = selected, acts.contains(s) { return s }; return acts.first }
@@ -1422,7 +1578,6 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var left: ActKind?
         var right: ActKind?
         var rightDetail = false         // right slot shows the detail of the same activity (single activity)
-        var side: ActKind?              // the detached icon (exactly 2 activities)
         var pill: [ActKind] = []        // the pill under the notch (3...5 activities)
     }
 
@@ -1442,7 +1597,6 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         switch a.count {
         case 0:  return Plan()
         case 1:  return Plan(left: a[0], right: a[0], rightDetail: true)
-        case 2:  return Plan(left: a[0], side: sideExpanded ? nil : a[1])
         default: return Plan(left: a[0], right: a[1], pill: Array(a.dropFirst(2)))
         }
     }
@@ -1462,7 +1616,6 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             switch n {
             case 0: let w = notchW + extra; return r(mid - w / 2, w, h)
             case 1: let w = notchW + 2 * wingWidth(a[0]) + extra; return r(mid - w / 2, w, h)
-            case 2: let wl = slotWing(a[0]); return r(notchLeft - wl - extra, notchW + wl + extra, h)     // grows to the left only
             default: let wl = max(slotWing(a[0]), slotWing(a[1])); let w = notchW + 2 * wl + extra; return r(mid - w / 2, w, h)
             }
         }
@@ -1482,21 +1635,6 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// The detached icon right of the notch (exactly 2 activities).
-    func sideRect() -> NSRect? {
-        guard shape != .expanded, acts.count == 2 else { return nil }
-        let top = screen.frame.maxY
-        if sideExpanded {                                       // its own card: out to the right of the notch and down
-            let h = notchH + (bodyFor(acts[1]) == .banner ? 0 : expandedExtraFor(bodyFor(acts[1])))
-            return NSRect(x: notchRight + sideGap, y: top - h, width: 332, height: h)
-        }
-        let h = compactH
-        let body: CGFloat = showsPercent(acts[1]) ? 52 : 40
-        var w = body + 2 * earRadius(h), height = h
-        if pressing && pressSide { w += 14; height += 6 }       // finger down on it: it (not the main island) swells
-        return NSRect(x: notchRight + sideGap, y: top - height, width: w, height: height)
-    }
-    let sideGap: CGFloat = 3
     let pillH: CGFloat = 34, pillGap: CGFloat = 6
     /// The pill under the notch (3...5 activities): returns its rect and its distance from the top of the screen.
     func pillRect() -> (NSRect, CGFloat)? {
@@ -1521,26 +1659,17 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let r0 = frame(for: .collapsed)
         mainP = Piece(panel: panel); mainP.active = true; mainP.visible = true
         mainP.x.jump(r0.minX); mainP.w.jump(r0.width); mainP.h.jump(r0.height)
-        sideView = IslandView(frame: .zero); pillView = PillView(frame: .zero); pillView.withDetail = true
-        sideView.content.notchH = notchH
-        let sidePanel = makePanel(.zero), pillPanel = makePanel(.zero)
-        sidePanel.contentView = sideView; pillPanel.contentView = pillView
-        sideP = Piece(panel: sidePanel); pillP = Piece(panel: pillPanel)
+        pillView = PillView(frame: .zero); pillView.withDetail = true
+        let pillPanel = makePanel(.zero)
+        pillPanel.contentView = pillView
+        pillP = Piece(panel: pillPanel)
         pillView.onPress = { [weak self] in self?.pressBegan() }
         pillView.onRelease = { [weak self] inside in self?.pressEnded(inside: inside) }
-        sideView.onPress = { [weak self] in self?.pressBegan() }
-        sideView.onRelease = { [weak self] inside in self?.pressEnded(inside: inside) }
-        sideView.onOpenSource = { [weak self] in self?.openSourceApp() }
-        sideView.onDragEnter = { [weak self] in self?.dragEntered = true }
-        sideView.onDragExit = { [weak self] in self?.dragEntered = false }
-        for content in [c, cSide] {                                  // both islands have the same buttons
-            wire(content.prevB, #selector(prevTapped)); wire(content.playB, #selector(playPauseTapped)); wire(content.nextB, #selector(nextTapped))
-            wire(content.pauseB, #selector(timerToggleTapped)); wire(content.cancelB, #selector(timerCancelTapped))
-        }
+        wire(c.prevB, #selector(prevTapped)); wire(c.playB, #selector(playPauseTapped)); wire(c.nextB, #selector(nextTapped))
+        wire(c.pauseB, #selector(timerToggleTapped)); wire(c.cancelB, #selector(timerCancelTapped))
         attachShadow(to: mainP) { [weak self] size in
             notchPath(size.width, size.height, earL: self?.view.earLeft ?? true, earR: self?.view.earRight ?? true)
         }
-        attachShadow(to: sideP) { size in notchPath(size.width, size.height) }
         attachShadow(to: pillP) { size in CGPath(roundedRect: CGRect(origin: .zero, size: size), cornerWidth: size.height / 2, cornerHeight: size.height / 2, transform: nil) }
         mainP.shadow?.orderFrontRegardless(); mainP.shadow.map { makeSticky($0) }
         makeSlotItems()
@@ -1609,16 +1738,15 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             s.fileAdd(urls)
             if let last = urls.last(where: { s.files.contains($0) }) { s.selected = .file(last); s.pinned = true }   // show what was dropped
         }
-        view.onDrop = dropped; sideView.onDrop = dropped
-        for v in [view as FileDragView, sideView as FileDragView, pillView as FileDragView] {   // dragging a file out of the island
+        view.onDrop = dropped
+        view.onScroll = { [weak self] e in self?.handleScroll(e) }
+        for v in [view as FileDragView, pillView as FileDragView] {   // dragging a file out of the island
             v.fileForDrag = { [weak self] e in self?.fileForDrag(e) }
             v.onDragBegan = { [weak self] in self?.cancelPress() }
             v.onDragFinished = { [weak self] u, taken in if taken { self?.fileRemove(u) } }   // taken out: it leaves the pocket
         }
-        for content in [c, cSide] {
-            content.fRevealB.target = self; content.fRevealB.action = #selector(revealFileTapped)
-            content.fRemoveB.target = self; content.fRemoveB.action = #selector(removeFileTapped)
-        }
+        c.fRevealB.target = self; c.fRevealB.action = #selector(revealFileTapped)
+        c.fRemoveB.target = self; c.fRemoveB.action = #selector(removeFileTapped)
         c.hBar.onChange = { [weak self] v in self?.hudDragged(v) }
         view.onOpenSource = { [weak self] in self?.openSourceApp() }
         setupStatusItem()
@@ -1776,12 +1904,11 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let a = acts
         guard !a.isEmpty else { return nil }
         let m = NSEvent.mouseLocation
-        if sideP.active, a.count == 2, sideP.panel.frame.insetBy(dx: -6, dy: -6).contains(m) { return a[1] }
         if pillP.active, a.count >= 3, pillP.panel.frame.insetBy(dx: -6, dy: -6).contains(m) {
             let items = Array(a.dropFirst(2)), f = pillP.panel.frame
             return items[min(items.count - 1, max(0, Int((m.x - f.minX) / max(f.width, 1) * CGFloat(items.count))))]
         }
-        if a.count >= 3, m.x > notchRight { return a[1] }
+        if a.count >= 2, m.x > notchRight { return a[1] }
         return a[0]
     }
 
@@ -1789,8 +1916,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// and holding opens it after 0.25s without waiting for the release. With nothing running it pops out and back.
     func pressBegan() {
         pressKind = kindAtMouse()
-        pressedWhileExpanded = (shape == .expanded) || sideExpanded
-        pressSide = acts.count == 2 && sideP.active && sideP.panel.frame.insetBy(dx: -6, dy: -6).contains(NSEvent.mouseLocation)
+        pressedWhileExpanded = (shape == .expanded)
         if pressedWhileExpanded { return }           // already open: the release (a tap) closes it
         if !liveActivity {                           // nothing to show: pop out a little and go straight back in
             popUntil = Date().addingTimeInterval(0.22)
@@ -1800,7 +1926,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         longPressTimer?.invalidate()
         let t = Timer(timeInterval: 0.25, repeats: false) { [weak self] _ in
             guard let s = self, s.pressing else { return }
-            let zone = s.pressSide ? s.sideP.panel.frame : s.frame(for: s.shape)
+            let zone = s.frame(for: s.shape)
             guard zone.insetBy(dx: -40, dy: -40).contains(NSEvent.mouseLocation) else { return }   // dragged away while holding: do nothing
             s.pressing = false
             s.selected = s.pressKind
@@ -1891,10 +2017,6 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// The file a drag starting at the pointer would carry: the open file card's icon / name, or a file icon in the compact island.
     func fileForDrag(_ e: NSEvent) -> URL? {
-        if sideExpanded {
-            guard case .file(let u)? = selected else { return nil }
-            return cSide.fIcon.frame.union(cSide.fName.frame).contains(cSide.convert(e.locationInWindow, from: nil)) ? u : nil
-        }
         if shape == .expanded {
             guard body == .file, case .file(let u)? = cardKind else { return nil }
             return c.fIcon.frame.union(c.fName.frame).contains(c.convert(e.locationInWindow, from: nil)) ? u : nil
@@ -2066,6 +2188,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             bannerHideAt = nil
             if case .airpods? = banner { banner = nil; if selected == nil { pinned = false } }
         }
+        if mainP.m.cur > 0.5 || mainP.m.tgt > 0 {             // only the island and the dial take the pointer; the margin is click-through
+            let pf = panel.frame, mp = NSEvent.mouseLocation
+            let bodyR = NSRect(x: pf.minX, y: pf.minY + mainP.m.cur, width: pf.width, height: pf.height - mainP.m.cur)
+            let stripR = NSRect(x: pf.minX, y: pf.minY, width: pf.width, height: mainP.m.cur + 8)
+            panel.ignoresMouseEvents = !(bodyR.contains(mp) || stripR.contains(mp) || (scrollHolding && pf.contains(mp)))
+        } else if panel.ignoresMouseEvents { panel.ignoresMouseEvents = false }
+        if tick % 30 == 3 { view.dial.lightAppearance = NSApp.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .aqua }   // tick colour follows light / dark mode
         trackFileDrag(NSEvent.mouseLocation)
         if tick % 120 == 7, files.contains(where: { !FileManager.default.fileExists(atPath: $0.path) }) {       // deleted elsewhere
             files = files.filter { FileManager.default.fileExists(atPath: $0.path) }; fileSave()
@@ -2184,9 +2313,22 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         c.body = b
         c.ending = b == .none && acts.isEmpty
         c.bandH = (shape == .expanded || (shape == .collapsed && atRest)) ? notchH : compactH
-        view.earRight = !(shape != .expanded && acts.count == 2)       // 2 activities: the island ends flush with the notch
 
         populate(c, bn: displayBanner, kind: cardKind)
+        if let k = cardKind, let i = acts.firstIndex(of: k) {           // the wheel follows the shown activity (and a finger on it)
+            view.dial.count = acts.count
+            if Date().timeIntervalSince(lastScrollAt) > 0.6 {
+                // the wheel only ever turns the short way round to the shown activity (it may have been spun several times)
+                let n = CGFloat(acts.count)
+                let near = CGFloat(i) + n * ((view.dial.position - CGFloat(i)) / n).rounded()
+                dialPos = near; view.dial.set(near, animated: true)
+            }
+        }
+        let dialOn = shape == .expanded && dialShown
+        if dialOn != dialWasOn {
+            dialWasOn = dialOn
+            NSAnimationContext.runAnimationGroup { ctx in ctx.duration = dialOn ? 0.3 : 0.18; view.dial.animator().alphaValue = dialOn ? 1 : 0 }
+        }
 
         // volume / brightness HUD (the main island only)
         if hudActive {
@@ -2210,19 +2352,11 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // alert
         setText(c.alertL, alertText ?? "")
 
-        // the second notch has a card of its own
-        let a = acts
-        let sk: ActKind? = a.count == 2 ? a[1] : nil
-        cSide.body = sk.map { bodyFor($0) } ?? .none
-        cSide.bandH = sideExpanded ? notchH : compactH
-        if let sk = sk { populate(cSide, bn: bannerFor(sk), kind: sk) }
-
         refreshSlots()
         let plan = makePlan()
         if plan != lastPlan { lastPlan = plan; placeSlots(plan) }
-        c.needsLayout = true; cSide.needsLayout = true
+        c.needsLayout = true
         c.applyVisibility(expanded: shape == .expanded)
-        cSide.applyVisibility(expanded: sideExpanded)
     }
 
     /// Fills the card of one island (the main one or the second notch) with the data of the activity it shows.
@@ -2331,7 +2465,6 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             c.rightView = v.view; c.rightSize = v.size
             use(v.view, in: c)
         } else { c.rightView = nil }
-        if let sk = plan.side { let v = slotView(sk); use(v.view, in: cSide); cSide.centerView = v.view; cSide.centerSize = v.size } else { cSide.centerView = nil }
         let pitems = plan.pill.compactMap { slotItem($0) }
         for it in pitems { use(it.icon, in: pillView); use(it.detail, in: pillView) }
         pillView.items = pitems
@@ -2351,8 +2484,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func desiredShape() -> Shape {
         if !pinned { selected = nil }
         if pinned && !liveActivity && !forceOpen { pinned = false }   // nothing left to show
-        if forceOpen || (pinned && !sideExpanded) || hudActive || dropping { return .expanded }   // the second notch opens by itself
-        if (pressing && !pressSide) || Date() < popUntil { return .pressed }     // a press on the second notch leaves the main island alone
+        if forceOpen || pinned || hudActive || dropping { return .expanded }
+        if pressing || Date() < popUntil { return .pressed }
         if Date() < hoverUntil { return .peek }       // hovering only nudges it; a long press opens it
         if !acts.isEmpty { return .activity }
         return .collapsed
@@ -2375,11 +2508,15 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         var wake = false
         let r = frame(for: shape)
+        // While you scroll, the invisible margin under the island keeps its old extent (the card itself shrinks to fit), so the
+        // pointer stays inside the window even when the next card is lower. It is let go a second after the last scroll.
+        if !scrollHolding { holdH = 0 }
+        let holdExtra = scrollHolding ? max(0, holdH - r.height) : 0
+        if abs(dialMargin + holdExtra - mainP.m.tgt) > 0.01 { mainP.m.tgt = dialMargin + holdExtra; wake = true }
         if abs(r.minX - mainP.x.tgt) > 0.01 || abs(r.width - mainP.w.tgt) > 0.01 || abs(r.height - mainP.h.tgt) > 0.01 {
             mainP.x.tgt = r.minX; mainP.w.tgt = r.width; mainP.h.tgt = r.height
             wake = true
         }
-        if setTarget(sideP, sideRect(), ty: 0, anchorX: notchRight + sideGap) { wake = true }
         let pr = pillRect()
         if setTarget(pillP, pr?.0, ty: pr?.1 ?? compactH + pillGap, anchorX: screen.frame.midX) { wake = true }
         if wake { atRest = false; link?.isPaused = false }
@@ -2409,10 +2546,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let dt = min(max(l.targetTimestamp - l.timestamp, 1.0 / 240), 1.0 / 30)
         let steps = Int((dt * 240).rounded(.up)); let h = dt / CGFloat(steps)
         var allSettled = true
-        for p in [mainP!, sideP!, pillP!] where p.active || p.visible {
+        for p in [mainP!, pillP!] where p.active || p.visible {
             let isMain = p === mainP
             let k: CGFloat = isMain ? stiffness : 300, cd: CGFloat = isMain ? damping : 28
-            for _ in 0..<steps { p.x.step(h, k, cd); p.w.step(h, k, cd); p.h.step(h, k, cd); p.ty.step(h, k, cd) }
+            for _ in 0..<steps { p.x.step(h, k, cd); p.w.step(h, k, cd); p.h.step(h, k, cd); p.ty.step(h, k, cd); p.m.step(h, k, cd) }
             if isMain {
                 // Momentum from an interrupted move must never uncover the hardware notch.
                 if p.x.cur > notchLeft { p.x.cur = notchLeft; if p.x.vel > 0 { p.x.vel = 0 } }
@@ -2425,8 +2562,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 continue
             }
             if !isMain { p.panel.alphaValue = p.fullW > 0 ? min(1, max(0, p.w.cur / p.fullW)) : 0 }
-            let f = NSRect(x: p.x.cur, y: screen.frame.maxY - p.ty.cur - p.h.cur, width: max(p.w.cur, 1), height: max(p.h.cur, 1))
-            p.panel.setFrame(f, display: true)
+            let margin = max(p.m.cur, 0)
+            let f = NSRect(x: p.x.cur, y: screen.frame.maxY - p.ty.cur - p.h.cur, width: max(p.w.cur, 1), height: max(p.h.cur, 1))   // the island
+            if isMain { view.bottomInset = margin }
+            p.panel.setFrame(NSRect(x: f.minX, y: f.minY - margin, width: f.width, height: f.height + margin), display: true)
             if let sh = p.shadow {
                 sh.setFrame(f.insetBy(dx: -ShadowView.pad, dy: -ShadowView.pad), display: true)
                 sh.alphaValue = p.panel.alphaValue
