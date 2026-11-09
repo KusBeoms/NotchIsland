@@ -1,4 +1,6 @@
 import AppKit
+import AudioToolbox
+import CoreAudio
 import IOKit.ps
 
 // NotchIsland — a Dynamic-Island-style overlay for the MacBook notch.
@@ -27,6 +29,8 @@ var demoTimer = false
 var demoMedia = false
 var demoCharging = false
 var demoAirpods = false
+var demoVolume = false
+var demoBrightness = false
 var argIt = CommandLine.arguments.dropFirst().makeIterator()
 while let a = argIt.next() {
     switch a {
@@ -37,6 +41,8 @@ while let a = argIt.next() {
     case "--demo-media": demoMedia = true
     case "--demo-charging": demoCharging = true
     case "--demo-airpods": demoAirpods = true
+    case "--demo-volume": demoVolume = true
+    case "--demo-brightness": demoBrightness = true
     default: break
     }
 }
@@ -200,6 +206,122 @@ func queryAirPods() -> [AirPodsInfo] {
 enum BannerKind {
     case battery(title: String, level: Int, color: NSColor)
     case airpods(symbol: String, level: Int?)
+}
+
+// MARK: - Volume / brightness (read, set) and the media keys that drive them
+
+enum SystemLevels {
+    private static func outputDevice() -> AudioObjectID? {
+        var dev = AudioObjectID(0); var sz = UInt32(MemoryLayout<AudioObjectID>.size)
+        var a = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                                           mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &a, 0, nil, &sz, &dev) == noErr, dev != 0 else { return nil }
+        return dev
+    }
+    private static func addr(_ sel: AudioObjectPropertySelector) -> AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(mSelector: sel, mScope: kAudioDevicePropertyScopeOutput, mElement: kAudioObjectPropertyElementMain)
+    }
+    private static func settable(_ d: AudioObjectID, _ a: inout AudioObjectPropertyAddress) -> Bool {
+        var ok: DarwinBoolean = false
+        return AudioObjectHasProperty(d, &a) && AudioObjectIsPropertySettable(d, &a, &ok) == noErr && ok.boolValue
+    }
+
+    static var volumeControllable: Bool {
+        guard let d = outputDevice() else { return false }
+        var a = addr(kAudioHardwareServiceDeviceProperty_VirtualMainVolume)
+        return settable(d, &a)
+    }
+    static func volume() -> Float? {
+        guard let d = outputDevice() else { return nil }
+        var a = addr(kAudioHardwareServiceDeviceProperty_VirtualMainVolume)
+        guard AudioObjectHasProperty(d, &a) else { return nil }
+        var v: Float32 = 0; var sz = UInt32(4)
+        return AudioObjectGetPropertyData(d, &a, 0, nil, &sz, &v) == noErr ? v : nil
+    }
+    @discardableResult static func setVolume(_ v: Float) -> Bool {
+        guard let d = outputDevice() else { return false }
+        var a = addr(kAudioHardwareServiceDeviceProperty_VirtualMainVolume)
+        guard settable(d, &a) else { return false }
+        var x = Float32(min(max(v, 0), 1))
+        return AudioObjectSetPropertyData(d, &a, 0, nil, 4, &x) == noErr
+    }
+    static func muted() -> Bool? {
+        guard let d = outputDevice() else { return nil }
+        var a = addr(kAudioDevicePropertyMute)
+        guard AudioObjectHasProperty(d, &a) else { return nil }
+        var v: UInt32 = 0; var sz = UInt32(4)
+        return AudioObjectGetPropertyData(d, &a, 0, nil, &sz, &v) == noErr ? v != 0 : nil
+    }
+    @discardableResult static func setMuted(_ m: Bool) -> Bool {
+        guard let d = outputDevice() else { return false }
+        var a = addr(kAudioDevicePropertyMute)
+        guard settable(d, &a) else { return false }
+        var x: UInt32 = m ? 1 : 0
+        return AudioObjectSetPropertyData(d, &a, 0, nil, 4, &x) == noErr
+    }
+
+    // Brightness goes through the private DisplayServices framework (the same one System Settings uses).
+    private static let ds = dlopen("/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices", RTLD_NOW)
+    private typealias GetB = @convention(c) (UInt32, UnsafeMutablePointer<Float>) -> Int32
+    private typealias SetB = @convention(c) (UInt32, Float) -> Int32
+
+    static var builtinDisplay: CGDirectDisplayID? {
+        var ids = [CGDirectDisplayID](repeating: 0, count: 8); var n: UInt32 = 0
+        CGGetActiveDisplayList(8, &ids, &n)
+        return ids.prefix(Int(n)).first { CGDisplayIsBuiltin($0) != 0 }
+    }
+    static func brightness() -> Float? {
+        guard let h = ds, let sym = dlsym(h, "DisplayServicesGetBrightness"), let id = builtinDisplay else { return nil }
+        var b: Float = 0
+        return unsafeBitCast(sym, to: GetB.self)(id, &b) == 0 ? b : nil
+    }
+    static var brightnessControllable: Bool {
+        guard let h = ds else { return false }
+        return dlsym(h, "DisplayServicesSetBrightness") != nil && brightness() != nil
+    }
+    @discardableResult static func setBrightness(_ v: Float) -> Bool {
+        guard let h = ds, let sym = dlsym(h, "DisplayServicesSetBrightness"), let id = builtinDisplay else { return false }
+        return unsafeBitCast(sym, to: SetB.self)(id, min(max(v, 0), 1)) == 0
+    }
+}
+
+/// Swallows the volume / brightness / mute keys (so the system HUD never fires) and hands them to `onKey`.
+/// Needs the Accessibility permission; `install()` simply returns false until it is granted.
+final class MediaKeyTap {
+    var onKey: ((_ code: Int, _ down: Bool, _ fine: Bool) -> Bool)?   // true = handled (swallow the event)
+    private(set) var tap: CFMachPort?
+    var isActive: Bool { tap != nil }
+
+    @discardableResult func install() -> Bool {
+        if tap != nil { return true }
+        let mask = CGEventMask(1) << 14                      // NX_SYSDEFINED: media / function keys
+        let callback: CGEventTapCallBack = { _, type, event, refcon in
+            guard let refcon = refcon else { return Unmanaged.passUnretained(event) }
+            return Unmanaged<MediaKeyTap>.fromOpaque(refcon).takeUnretainedValue().handle(type, event)
+        }
+        guard let t = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
+                                        eventsOfInterest: mask, callback: callback,
+                                        userInfo: Unmanaged.passUnretained(self).toOpaque()) else { return false }
+        tap = t
+        CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(kCFAllocatorDefault, t, 0), .commonModes)
+        CGEvent.tapEnable(tap: t, enable: true)
+        return true
+    }
+
+    fileprivate func handle(_ type: CGEventType, _ event: CGEvent) -> Unmanaged<CGEvent>? {
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {     // the system pauses slow taps: turn it back on
+            if let t = tap { CGEvent.tapEnable(tap: t, enable: true) }
+            return Unmanaged.passUnretained(event)
+        }
+        guard let ns = NSEvent(cgEvent: event), ns.type == .systemDefined, ns.subtype.rawValue == 8 else {
+            return Unmanaged.passUnretained(event)
+        }
+        let d1 = ns.data1
+        let code = (d1 & 0xFFFF0000) >> 16
+        let down = ((d1 & 0x0000FF00) >> 8) == 0xA          // 0xA = key down (also for auto-repeat), 0xB = key up
+        let fine = event.flags.contains(.maskShift) && event.flags.contains(.maskAlternate)   // Shift+Option = quarter steps
+        return (onKey?(code, down, fine) ?? false) ? nil : Unmanaged.passUnretained(event)
+    }
 }
 
 // MARK: - Artwork (album art via Apple's public iTunes lookup, keyed by the track's store id)
@@ -412,6 +534,93 @@ final class RingView: NSView {
     }
 }
 
+/// The original HUD's bar: 16 flat cells; while the pointer is over the HUD they melt into a smooth slider with a
+/// knob. Eased fill; click or drag sets the level. The view is tall (easy to hit) but draws thin.
+final class LevelBar: NSView {
+    private static let count = 16
+    private static let knobW: CGFloat = 18, knobH: CGFloat = 14, lineH: CGFloat = 4
+    private let seg = CALayer(), slider = CALayer()
+    private var track: [CALayer] = [], fill: [CALayer] = []
+    private let sTrack = CALayer(), sFill = CALayer(), knob = CALayer()
+    private var shown: Float = 0, target: Float = 0
+    private var timer: Timer?
+    var onChange: ((Float) -> Void)?
+
+    /// Pointer over the HUD: cells -> slider with a knob.
+    var sliderMode = false {
+        didSet {
+            guard sliderMode != oldValue else { return }
+            CATransaction.begin(); CATransaction.setAnimationDuration(0.18)
+            seg.opacity = sliderMode ? 0 : 1
+            slider.opacity = sliderMode ? 1 : 0
+            CATransaction.commit()
+        }
+    }
+
+    init() {
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.addSublayer(seg); layer?.addSublayer(slider)
+        for _ in 0..<LevelBar.count {
+            let t = CALayer(); t.backgroundColor = NSColor(white: 1, alpha: 0.25).cgColor; t.cornerRadius = 1.5; t.masksToBounds = true
+            let f = CALayer(); f.backgroundColor = NSColor(white: 1, alpha: 0.95).cgColor
+            t.addSublayer(f); seg.addSublayer(t); track.append(t); fill.append(f)
+        }
+        sTrack.backgroundColor = NSColor(white: 1, alpha: 0.25).cgColor; sTrack.cornerRadius = LevelBar.lineH / 2
+        sFill.backgroundColor = NSColor(white: 1, alpha: 0.95).cgColor;  sFill.cornerRadius = LevelBar.lineH / 2
+        knob.backgroundColor = NSColor.white.cgColor; knob.cornerRadius = LevelBar.knobH / 2
+        knob.shadowColor = NSColor.black.cgColor; knob.shadowOpacity = 0.35; knob.shadowRadius = 2; knob.shadowOffset = .zero
+        slider.addSublayer(sTrack); slider.addSublayer(sFill); slider.addSublayer(knob)
+        slider.opacity = 0
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func layout() { super.layout(); render() }
+
+    private func render() {
+        let n = CGFloat(LevelBar.count), gap: CGFloat = 2, mid = bounds.height / 2
+        let cw = (bounds.width - gap * (n - 1)) / n, ch = LevelBar.lineH
+        let kw = LevelBar.knobW, kh = LevelBar.knobH
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        seg.frame = bounds; slider.frame = bounds
+        for i in 0..<LevelBar.count {
+            track[i].frame = CGRect(x: CGFloat(i) * (cw + gap), y: mid - ch / 2, width: cw, height: ch)
+            let frac = CGFloat(min(max(shown * Float(LevelBar.count) - Float(i), 0), 1))
+            fill[i].frame = CGRect(x: 0, y: 0, width: cw * frac, height: ch)
+        }
+        let cx = kw / 2 + CGFloat(shown) * max(bounds.width - kw, 0)
+        sTrack.frame = CGRect(x: 0, y: mid - ch / 2, width: bounds.width, height: ch)
+        sFill.frame = CGRect(x: 0, y: mid - ch / 2, width: cx, height: ch)
+        knob.frame = CGRect(x: cx - kw / 2, y: mid - kh / 2, width: kw, height: kh)
+        CATransaction.commit()
+    }
+
+    /// Eased towards the new value; `animated: false` jumps (used while the pointer drags).
+    func set(_ v: Float, animated: Bool) {
+        target = min(max(v, 0), 1)
+        if !animated { shown = target; timer?.invalidate(); timer = nil; render(); return }
+        guard timer == nil, abs(shown - target) > 0.002 else { return }
+        let t = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] tm in
+            guard let s = self else { tm.invalidate(); return }
+            s.shown += (s.target - s.shown) * 0.3
+            if abs(s.target - s.shown) < 0.002 { s.shown = s.target; tm.invalidate(); s.timer = nil }
+            s.render()
+        }
+        RunLoop.main.add(t, forMode: .common); timer = t
+    }
+
+    private func pick(_ e: NSEvent) {
+        let x = convert(e.locationInWindow, from: nil).x, w = max(bounds.width, 1)
+        let frac = sliderMode ? (x - LevelBar.knobW / 2) / max(w - LevelBar.knobW, 1) : x / w   // knob centre follows the pointer
+        let v = (Float(frac) * 64).rounded() / 64                                          // 1/64 grid
+        set(v, animated: false)
+        onChange?(min(max(v, 0), 1))
+    }
+    override func mouseDown(with event: NSEvent) { pick(event) }
+    override func mouseDragged(with event: NSEvent) { pick(event) }
+}
+
 func makeLabel(_ size: CGFloat, _ weight: NSFont.Weight, _ color: NSColor, mono: Bool = false,
                align: NSTextAlignment = .left) -> NSTextField {
     let l = NSTextField(labelWithString: "")
@@ -439,9 +648,35 @@ func setSymbol(_ b: NSButton, _ name: String, _ pt: CGFloat) {
         .withSymbolConfiguration(.init(pointSize: pt, weight: .bold))
 }
 
+// MARK: - Notch silhouette
+//
+// Like the hardware notch the shape is wider at the very top than below it: the top corners flare OUT into
+// the top edge of the screen (concave "ears", radius `earRadius`) and the bottom corners are convex.
+// Idle island = 6pt ears / 14pt bottom corners (the notch itself); both ease up as it grows into a card.
+func earRadius(_ h: CGFloat) -> CGFloat { min(18, max(6, 6 + (h - 40) * 0.2)) }
+func bottomRadius(_ h: CGFloat) -> CGFloat { min(26, max(14, 14 + (h - 40) * 0.18)) }
+
+func notchPath(_ w: CGFloat, _ h: CGFloat) -> CGPath {
+    let t = earRadius(h)
+    let b = max(0, min(bottomRadius(h), h - t, (w - 2 * t) / 2))
+    let p = CGMutablePath()                                     // y grows upward; the top edge is y = h
+    p.move(to: CGPoint(x: 0, y: h))
+    p.addLine(to: CGPoint(x: w, y: h))
+    p.addArc(center: CGPoint(x: w, y: h - t), radius: t, startAngle: .pi / 2, endAngle: .pi, clockwise: false)   // right ear
+    p.addLine(to: CGPoint(x: w - t, y: b))
+    p.addArc(center: CGPoint(x: w - t - b, y: b), radius: b, startAngle: 0, endAngle: -.pi / 2, clockwise: true)  // bottom right
+    p.addLine(to: CGPoint(x: t + b, y: 0))
+    p.addArc(center: CGPoint(x: t + b, y: b), radius: b, startAngle: -.pi / 2, endAngle: -.pi, clockwise: true)   // bottom left
+    p.addLine(to: CGPoint(x: t, y: h - t))
+    p.addArc(center: CGPoint(x: 0, y: h - t), radius: t, startAngle: 0, endAngle: .pi / 2, clockwise: false)     // left ear
+    p.closeSubpath()
+    return p
+}
+
 // MARK: - Content (flipped: y grows downward from the top of the island)
 
-enum Body { case none, banner, alert, media, timer }
+enum Body { case none, hud, banner, alert, media, timer }
+enum LevelKind { case volume, brightness }
 enum LeftWing { case none, art, timer }
 enum RightWing { case none, eq, time }
 
@@ -454,7 +689,7 @@ final class Content: Flip {
     private var lastAlpha: [ObjectIdentifier: CGFloat] = [:]
 
     // wings
-    let wingArt = ArtView(radius: 10)      // = pill corner (18) - margin (8): corners stay concentric
+    let wingArt = ArtView(radius: 6)       // = bottom corner (14) - margin (8): corners stay concentric
     let wingTimerIcon = NSImageView()
     let wingEq = EqView()
     let wingTime = makeLabel(13, .semibold, accent, mono: true, align: .right)
@@ -473,7 +708,7 @@ final class Content: Flip {
     let pauseB = makeSymbolButton("pause.fill", 20, accent)
     let cancelB = makeSymbolButton("xmark", 18, .white)
     let tLabel = makeLabel(13, .semibold, accent, align: .right)
-    let tTime = makeLabel(38, .semibold, accent, mono: true, align: .right)
+    let tTime = makeLabel(34, .semibold, accent, mono: true, align: .right)
     // banner body (charging / AirPods): a pill as tall as the notch, content on both sides of it
     var bannerIsAir = false
     let bTitle = makeLabel(16, .semibold, .white)
@@ -481,6 +716,10 @@ final class Content: Flip {
     let bGlyph = BatteryGlyph()
     let bAir = NSImageView()
     let bRing = RingView()
+    // volume / brightness HUD: icon on the left of the notch, level bar on the right
+    let hIcon = NSImageView()
+    let hBar = LevelBar()
+    var hIconName = ""
     // alert body
     let alertL = makeLabel(15, .semibold, .white, align: .center)
 
@@ -489,21 +728,22 @@ final class Content: Flip {
         wingTimerIcon.image = NSImage(systemSymbolName: "timer", accessibilityDescription: nil)?
             .withSymbolConfiguration(.init(pointSize: 16, weight: .semibold))
         wingTimerIcon.contentTintColor = accent
-        for b in [pauseB, cancelB] { b.wantsLayer = true; b.layer?.cornerRadius = 23 }
+        for b in [pauseB, cancelB] { b.wantsLayer = true; b.layer?.cornerRadius = 22 }
         pauseB.layer?.backgroundColor = accent.withAlphaComponent(0.28).cgColor
         cancelB.layer?.backgroundColor = NSColor(white: 1, alpha: 0.2).cgColor
+        hIcon.contentTintColor = .white
         for v in all { addSubview(v); v.alphaValue = 0 }
     }
     required init?(coder: NSCoder) { fatalError() }
 
     var all: [NSView] {
         [wingArt, wingTimerIcon, wingEq, wingTime, art, titleL, artistL, bodyEq, progress, elapsedL, remainL,
-         prevB, playB, nextB, pauseB, cancelB, tLabel, tTime, alertL, bTitle, bPct, bGlyph, bAir, bRing]
+         prevB, playB, nextB, pauseB, cancelB, tLabel, tTime, alertL, bTitle, bPct, bGlyph, bAir, bRing, hIcon, hBar]
     }
 
     override func layout() {
         super.layout()
-        let w = bounds.width, pad: CGFloat = 18, top = notchH + 4
+        let w = bounds.width, pad: CGFloat = 16, top = notchH + 2
         // wings: the art tile gets the same margin on the left, top and bottom
         let tile: CGFloat = 24
         let m = max((bandH - tile) / 2, 0)
@@ -514,31 +754,34 @@ final class Content: Flip {
         wingEq.frame = NSRect(x: w - rightInset - 20, y: (bandH - 16) / 2, width: 20, height: 16)
         wingTime.frame = NSRect(x: w - rightInset - 70, y: (bandH - 18) / 2, width: 70, height: 18)
         // media
-        art.frame = NSRect(x: pad, y: top, width: 52, height: 52)
-        let tx = pad + 52 + 12, tw = max(0, w - tx - pad - 28)
-        titleL.frame = NSRect(x: tx, y: top + 7, width: tw, height: 20)
-        artistL.frame = NSRect(x: tx, y: top + 28, width: tw, height: 18)
-        bodyEq.frame = NSRect(x: w - pad - 20, y: top + 8, width: 20, height: 20)
-        progress.frame = NSRect(x: pad, y: top + 62, width: w - 2 * pad, height: 5)
-        elapsedL.frame = NSRect(x: pad, y: top + 70, width: 60, height: 14)
-        remainL.frame = NSRect(x: w - pad - 60, y: top + 70, width: 60, height: 14)
-        let cy = top + 88
-        playB.frame = NSRect(x: w / 2 - 25, y: cy, width: 50, height: 36)
-        prevB.frame = NSRect(x: w / 2 - 25 - 80, y: cy, width: 50, height: 36)
-        nextB.frame = NSRect(x: w / 2 - 25 + 80, y: cy, width: 50, height: 36)
+        art.frame = NSRect(x: pad, y: top, width: 48, height: 48)
+        let tx = pad + 48 + 12, tw = max(0, w - tx - pad - 26)
+        titleL.frame = NSRect(x: tx, y: top + 4, width: tw, height: 20)
+        artistL.frame = NSRect(x: tx, y: top + 25, width: tw, height: 18)
+        bodyEq.frame = NSRect(x: w - pad - 20, y: top + 6, width: 20, height: 20)
+        progress.frame = NSRect(x: pad, y: top + 56, width: w - 2 * pad, height: 4)
+        elapsedL.frame = NSRect(x: pad, y: top + 62, width: 60, height: 14)
+        remainL.frame = NSRect(x: w - pad - 60, y: top + 62, width: 60, height: 14)
+        let cy = top + 76
+        playB.frame = NSRect(x: w / 2 - 25, y: cy, width: 50, height: 32)
+        prevB.frame = NSRect(x: w / 2 - 25 - 70, y: cy, width: 50, height: 32)
+        nextB.frame = NSRect(x: w / 2 - 25 + 70, y: cy, width: 50, height: 32)
         // timer
-        pauseB.frame = NSRect(x: pad, y: top + 4, width: 46, height: 46)
-        cancelB.frame = NSRect(x: pad + 56, y: top + 4, width: 46, height: 46)
-        tLabel.frame = NSRect(x: w - pad - 190, y: top - 2, width: 190, height: 16)
-        tTime.frame = NSRect(x: w - pad - 190, y: top + 12, width: 190, height: 46)
-        // banner
-        bTitle.frame = NSRect(x: 20, y: (notchH - 20) / 2, width: 130, height: 20)
-        bAir.frame = NSRect(x: 20, y: (notchH - 26) / 2, width: 30, height: 26)
-        bGlyph.frame = NSRect(x: w - 20 - 34, y: (notchH - 15) / 2, width: 34, height: 15)
-        bPct.frame = NSRect(x: w - 20 - 34 - 8 - 60, y: (notchH - 20) / 2, width: 60, height: 20)
-        bRing.frame = NSRect(x: w - 20 - 26, y: (notchH - 26) / 2, width: 26, height: 26)
+        pauseB.frame = NSRect(x: pad, y: top + 2, width: 44, height: 44)
+        cancelB.frame = NSRect(x: pad + 52, y: top + 2, width: 44, height: 44)
+        tLabel.frame = NSRect(x: w - pad - 150, y: top - 2, width: 150, height: 16)
+        tTime.frame = NSRect(x: w - pad - 150, y: top + 10, width: 150, height: 42)
+        // banner (left/right inset 14 inside the body)
+        bTitle.frame = NSRect(x: 14, y: (notchH - 20) / 2, width: 100, height: 20)
+        bAir.frame = NSRect(x: 14, y: (notchH - 26) / 2, width: 30, height: 26)
+        bGlyph.frame = NSRect(x: w - 14 - 34, y: (notchH - 15) / 2, width: 34, height: 15)
+        bPct.frame = NSRect(x: w - 14 - 34 - 8 - 56, y: (notchH - 20) / 2, width: 56, height: 20)
+        bRing.frame = NSRect(x: w - 14 - 26, y: (notchH - 26) / 2, width: 26, height: 26)
+        // HUD
+        hIcon.frame = NSRect(x: pad, y: top + 6, width: 24, height: 24)          // below the notch, icon on the left
+        hBar.frame = NSRect(x: pad + 24 + 14, y: top + 7, width: max(0, w - pad - 24 - 14 - pad), height: 22)
         // alert
-        alertL.frame = NSRect(x: pad, y: notchH + 8, width: w - 2 * pad, height: 22)
+        alertL.frame = NSRect(x: pad, y: notchH + 6, width: w - 2 * pad, height: 22)
     }
 
     /// Cross-fade every element to what the current shape/body/wings need.
@@ -558,6 +801,7 @@ final class Content: Flip {
             (bTitle, expanded && b == .banner && !bannerIsAir), (bPct, expanded && b == .banner && !bannerIsAir),
             (bGlyph, expanded && b == .banner && !bannerIsAir),
             (bAir, expanded && b == .banner && bannerIsAir), (bRing, expanded && b == .banner && bannerIsAir),
+            (hIcon, expanded && b == .hud), (hBar, expanded && b == .hud),
         ]
         for (v, on) in want {
             let a: CGFloat = on ? 1 : 0
@@ -578,29 +822,33 @@ final class IslandView: NSView {
     var onPress: (() -> Void)?
     var onRelease: ((Bool) -> Void)?       // true when the finger came up inside the island
     let content = Content(frame: .zero)
+    private let shapeMask = CAShapeLayer()
 
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
         layer?.backgroundColor = NSColor.black.cgColor
-        layer?.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]   // round only the bottom corners
+        layer?.mask = shapeMask
         content.frame = bounds
-        content.autoresizingMask = [.width, .height]
+        content.autoresizingMask = []                     // laid out by hand: it sits between the ears
         addSubview(content)
     }
     required init?(coder: NSCoder) { fatalError() }
 
     override func layout() {
         super.layout()
-        // 18pt for the compact pill, easing up to 34pt for the big card; never more than half the height
-        let r = min(34, max(18, 18 + (bounds.height - 40) * 0.5))
-        layer?.cornerRadius = min(r, bounds.height / 2)
+        let t = earRadius(bounds.height)
+        content.frame = NSRect(x: t, y: 0, width: max(0, bounds.width - 2 * t), height: bounds.height)
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        shapeMask.frame = bounds
+        shapeMask.path = notchPath(bounds.width, bounds.height)
+        CATransaction.commit()
     }
 
     // Labels must not swallow presses; only visible buttons keep their own clicks.
     override func hitTest(_ point: NSPoint) -> NSView? {
         guard let v = super.hitTest(point) else { return nil }
-        if v is NSButton, !v.isHidden, v.alphaValue > 0.3 { return v }
+        if (v is NSButton || v is LevelBar), !v.isHidden, v.alphaValue > 0.3 { return v }
         return self
     }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -649,6 +897,17 @@ final class App: NSObject, NSApplicationDelegate {
     var artCache: [String: (NSImage, NSColor)] = [:]
     var battery: Battery?
     var banner: BannerKind?
+    // volume / brightness HUD (transient: it goes away by itself, unlike alerts)
+    var hudKind: LevelKind = .volume
+    var hudValue: Float = 0
+    var hudMuted = false
+    var hudUntil = Date.distantPast
+    var lastVol: Float?, lastMute: Bool?
+    let keyTap = MediaKeyTap()
+    var brightTarget: Float?
+    var brightCur: Float = 0
+    var brightTimer: Timer?
+    var keyTapTimer: Timer?
     var bannerSymbol = ""
     var airBusy = false, airBaseline = false
     var mediaBaseline = false            // first poll only records what was already playing
@@ -671,19 +930,23 @@ final class App: NSObject, NSApplicationDelegate {
     var notchH: CGFloat { max(screen.safeAreaInsets.top, 32) }
 
     var body: Body {
+        if hudActive { return .hud }
         if banner != nil { return .banner }
         if alertText != nil { return .alert }
         if media != nil { return .media }
         if timer.started { return .timer }
         return .none
     }
+    var hudActive: Bool { Date() < hudUntil }
     var liveActivity: Bool { body != .none }
+    var wingW: CGFloat { timer.started ? 66 : 50 }                // space beside the notch in the compact pill
+    var bannerWing: CGFloat { if case .airpods = banner { return 60 }; return 110 }
     var expandedExtra: CGFloat {
         switch body {
-        case .media:  return 136
-        case .timer:  return 72
-        case .banner: return 0
-        default:      return 42
+        case .media:  return 122
+        case .timer:  return 62
+        case .banner, .hud: return 0
+        default:      return 38
         }
     }
 
@@ -702,13 +965,19 @@ final class App: NSObject, NSApplicationDelegate {
     func frame(for s: Shape) -> NSRect {
         let (w, h): (CGFloat, CGFloat)
         let hasCompact = media != nil || timer.started
-        let base: CGFloat = hasCompact ? notchW + 160 : notchW   // peek/pressed grow from here
+        let compactW = notchW + 2 * wingW                        // just wide enough for the art tile / the time
+        let base: CGFloat = hasCompact ? compactW : notchW        // peek/pressed grow from here
         switch s {
         case .collapsed: (w, h) = (notchW, notchH)
-        case .activity:  (w, h) = (notchW + 160, notchH + 8)    // a little taller so the art tile gets even margins
+        case .activity:  (w, h) = (compactW, notchH + 8)        // a little taller so the art tile gets even margins
         case .peek:      (w, h) = (base + 24, hasCompact ? notchH + 8 : notchH)    // swells sideways only
-        case .pressed:   (w, h) = (base + 44, hasCompact ? notchH + 8 : notchH)    // swells further sideways
-        case .expanded:  (w, h) = body == .banner ? (notchW + 250, notchH) : (400, notchH + expandedExtra)
+        case .pressed:   (w, h) = (base + 44, hasCompact ? notchH + 8 : notchH + 6)   // idle press: sideways AND a little down
+        case .expanded:
+            switch body {
+            case .hud:    (w, h) = (284, notchH + 40)                     // dropped below the notch
+            case .banner: (w, h) = (notchW + 2 * bannerWing, notchH)
+            default:      (w, h) = (332, notchH + expandedExtra)
+            }
         }
         return NSRect(x: screen.frame.midX - w / 2, y: screen.frame.maxY - h, width: w, height: h)
     }
@@ -741,6 +1010,8 @@ final class App: NSObject, NSApplicationDelegate {
         if demoTimer { timer.toggle(); pinned = true }
         if demoCharging { showBanner(.battery(title: "충전 중", level: 55, color: bannerGreen)) }
         if demoAirpods { showBanner(.airpods(symbol: "airpodspro", level: 80)) }
+        if demoVolume { showHUD(.volume, 0.62, muted: false, seconds: 30) }
+        if demoBrightness { showHUD(.brightness, 0.78, muted: false, seconds: 30) }
         if demoMedia {
             media = Media(title: "승리를 위하여", artist: "트랜스픽션", playing: true, duration: 208, elapsed: 29, readAt: Date(), storeID: "")
             pinned = ProcessInfo.processInfo.environment["NI_NOPIN"] == nil     // NI_NOPIN=1: start collapsed (screenshots)
@@ -771,6 +1042,9 @@ final class App: NSObject, NSApplicationDelegate {
                 src.resume(); signalSources.append(src)
             }
         }
+        c.hBar.onChange = { [weak self] v in self?.hudDragged(v) }
+        keyTap.onKey = { [weak self] code, down, fine in self?.handleMediaKey(code, down, fine) ?? false }
+        setupKeyTap()
         refreshUI()
         Timer.scheduledTimer(withTimeInterval: 1.0 / 60, repeats: true) { [weak self] _ in self?.step() }
     }
@@ -828,7 +1102,8 @@ final class App: NSObject, NSApplicationDelegate {
             haptic(.levelChange)
         }
         if pressedWhileExpanded && inside {          // tapping the open island shrinks it back
-            pinned = false; alertText = nil; banner = nil
+            if hudActive { hudUntil = .distantPast }
+            else { pinned = false; alertText = nil; banner = nil }
             haptic(.levelChange)
         }
         pressedWhileExpanded = false
@@ -841,7 +1116,7 @@ final class App: NSObject, NSApplicationDelegate {
     func sensorTouchBegan() {
         haptic(.alignment)
         if shape == .expanded || pinned {
-            pinned = false; alertText = nil; banner = nil
+            if hudActive { hudUntil = .distantPast } else { pinned = false; alertText = nil; banner = nil }
             haptic(.levelChange)
             return
         }
@@ -862,6 +1137,105 @@ final class App: NSObject, NSApplicationDelegate {
     func sensorTouchEnded() {
         longPressTimer?.invalidate(); longPressTimer = nil
         pressing = false
+    }
+
+    // MARK: volume / brightness HUD
+
+    func showHUD(_ kind: LevelKind, _ value: Float, muted: Bool = false, seconds: TimeInterval = 1.8) {
+        hudKind = kind; hudValue = value; hudMuted = muted
+        hudUntil = Date().addingTimeInterval(seconds)
+        refreshUI()
+    }
+
+    /// Volume changed by something else (menu bar slider, headphones, another app): show it too.
+    func pollVolume() {
+        guard let v = SystemLevels.volume(), let m = SystemLevels.muted() else { return }
+        defer { lastVol = v; lastMute = m }
+        guard let lv = lastVol, let lm = lastMute else { return }              // first read is the baseline
+        if abs(v - lv) > 0.004 || m != lm { showHUD(.volume, v, muted: m || v < 0.001) }
+    }
+
+    /// Media keys, once the Accessibility permission has been granted. Returns true when the key was handled.
+    func handleMediaKey(_ code: Int, _ down: Bool, _ fine: Bool) -> Bool {
+        let step: Float = fine ? 1.0 / 64 : 1.0 / 16
+        func snap(_ v: Float) -> Float { (v / step).rounded() * step }
+        switch code {
+        case 0, 1, 7:                                                          // volume up / down, mute
+            guard SystemLevels.volumeControllable else { return false }         // e.g. HDMI output: leave it to the system
+            guard down else { return true }
+            let wasMuted = SystemLevels.muted() ?? false
+            let cur = SystemLevels.volume() ?? 0
+            if code == 7 {
+                let now = !wasMuted
+                SystemLevels.setMuted(now)
+                showHUD(.volume, cur, muted: now || cur < 0.001)
+                return true
+            }
+            if wasMuted { SystemLevels.setMuted(false) }
+            let nv = min(1, max(0, snap(cur) + (code == 0 ? step : -step)))
+            SystemLevels.setVolume(nv)
+            showHUD(.volume, nv, muted: nv < 0.001)
+            return true
+        case 2, 3:                                                             // brightness up / down
+            guard SystemLevels.brightnessControllable else { return false }
+            guard down else { return true }
+            let cur = brightTarget ?? SystemLevels.brightness() ?? 0     // chain presses from where the glide is heading
+            let nb = min(1, max(0, snap(cur) + (code == 2 ? step : -step)))
+            rampBrightness(to: nb)
+            showHUD(.brightness, nb)
+            return true
+        default:
+            return false                                                       // keyboard backlight etc.: untouched
+        }
+    }
+
+    /// Eases the real brightness to `t` (~0.25s) instead of jumping a whole step at once.
+    func rampBrightness(to t: Float) {
+        brightTarget = t
+        guard brightTimer == nil else { return }
+        brightCur = SystemLevels.brightness() ?? t
+        let timer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] tm in
+            guard let s = self, let target = s.brightTarget else { tm.invalidate(); self?.brightTimer = nil; return }
+            let d = target - s.brightCur
+            if abs(d) < 0.004 {
+                s.brightCur = target; SystemLevels.setBrightness(target)
+                s.brightTarget = nil; tm.invalidate(); s.brightTimer = nil
+                return
+            }
+            s.brightCur += d * 0.22                                            // ease-out
+            SystemLevels.setBrightness(s.brightCur)
+        }
+        RunLoop.main.add(timer, forMode: .common); brightTimer = timer
+    }
+
+    /// The pointer set the level on the HUD bar.
+    func hudDragged(_ v: Float) {
+        let demo = demoVolume || demoBrightness                                 // demos never touch the real levels
+        switch hudKind {
+        case .volume:
+            if !demo { if SystemLevels.muted() == true { SystemLevels.setMuted(false) }; SystemLevels.setVolume(v) }
+            showHUD(.volume, v, muted: v < 0.001, seconds: 1.8)
+        case .brightness:
+            brightTarget = nil                                                  // cancel any glide: follow the pointer directly
+            if !demo { SystemLevels.setBrightness(v) }
+            showHUD(.brightness, v, seconds: 1.8)
+        }
+    }
+
+    func setupKeyTap() {
+        guard ProcessInfo.processInfo.environment["NI_NOKEYTAP"] == nil else { return }     // test hook
+        if !AXIsProcessTrusted() {
+            // Prompt on launch whenever access is missing, including after permission is revoked.
+            _ = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
+        }
+        func tryInstall() {
+            if !keyTap.isActive, AXIsProcessTrusted(), keyTap.install(),
+               ProcessInfo.processInfo.environment["NI_DEBUG"] != nil {
+                FileHandle.standardError.write("media key tap installed\n".data(using: .utf8)!)
+            }
+        }
+        tryInstall()
+        keyTapTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { _ in tryInstall() }   // picks up a later grant
     }
 
     func showBanner(_ k: BannerKind) {
@@ -889,7 +1263,12 @@ final class App: NSObject, NSApplicationDelegate {
         let pad: CGFloat = shape == .expanded ? 8 : 4
         let hit = frame(for: shape).insetBy(dx: -pad, dy: -pad)
         let probe = NSRect(x: hit.minX, y: hit.minY, width: hit.width, height: hit.height + 4) // include the screen's top edge
-        if probe.contains(m) { hoverUntil = now.addingTimeInterval(0.25) }
+        if probe.contains(m) {
+            hoverUntil = now.addingTimeInterval(0.25)
+            if hudActive { hudUntil = max(hudUntil, now.addingTimeInterval(0.9)) }   // pointer on the HUD: keep it
+        }
+        let overHUD = hudActive && probe.contains(m)
+        if c.hBar.sliderMode != overHUD { c.hBar.sliderMode = overHUD }              // cells melt into a slider under the pointer
 
         if tick % 2 == 0 {                         // 30Hz: the ambient light sensor is the touch sensor
             let v = simLux ?? als_read()              // simLux is only set by the test hook below
@@ -901,6 +1280,7 @@ final class App: NSObject, NSApplicationDelegate {
             if darkLatched && !wasCovered { sensorTouchBegan() }
             else if !darkLatched && wasCovered { sensorTouchEnded() }
         }
+        if tick % 4 == 0 { pollVolume() }          // 15Hz: volume changes from anywhere (keys, menu bar, headphones)
         if tick % 120 == 0 { pollBattery() }       // 2s
         if tick % 120 == 47 { pollMusic() }        // 2s, offset from battery
         if let m = media, !m.playing, !demoMedia, shape != .expanded,
@@ -1036,6 +1416,25 @@ final class App: NSObject, NSApplicationDelegate {
             }
         }
 
+        // volume / brightness HUD
+        if hudActive {
+            let level = hudMuted ? 0 : hudValue
+            let name: String
+            switch hudKind {
+            case .volume:
+                name = (hudMuted || hudValue < 0.001) ? "speaker.slash.fill"
+                     : hudValue < 0.34 ? "speaker.wave.1.fill" : hudValue < 0.67 ? "speaker.wave.2.fill" : "speaker.wave.3.fill"
+            case .brightness:
+                name = hudValue < 0.5 ? "sun.min.fill" : "sun.max.fill"
+            }
+            if name != c.hIconName {
+                c.hIconName = name
+                c.hIcon.image = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+                    .withSymbolConfiguration(.init(pointSize: 19, weight: .semibold))
+            }
+            c.hBar.set(level, animated: true)
+        }
+
         // alert
         setText(c.alertL, alertText ?? "")
 
@@ -1059,7 +1458,7 @@ final class App: NSObject, NSApplicationDelegate {
 
     func desiredShape() -> Shape {
         if pinned && !liveActivity && !forceOpen { pinned = false }   // nothing left to show
-        if forceOpen || pinned { return .expanded }
+        if forceOpen || pinned || hudActive { return .expanded }
         if pressing || Date() < popUntil { return .pressed }
         if Date() < hoverUntil { return .peek }       // hovering only nudges it; a long press opens it
         if media != nil || timer.started { return .activity }
@@ -1102,6 +1501,13 @@ final class App: NSObject, NSApplicationDelegate {
         }
         panel.setFrame(NSRect(x: screen.frame.midX - curW / 2, y: screen.frame.maxY - curH, width: curW, height: curH), display: true)
     }
+}
+
+// One island at a time: a second copy (e.g. a hand-started one while the login item runs) exits quietly.
+let instanceLockFD = open(NSTemporaryDirectory() + "com.kusbeoms.NotchIsland.lock", O_CREAT | O_RDWR, 0o600)
+if instanceLockFD >= 0 && flock(instanceLockFD, LOCK_EX | LOCK_NB) != 0 {
+    FileHandle.standardError.write("NotchIsland is already running.\n".data(using: .utf8)!)
+    exit(0)
 }
 
 let app = NSApplication.shared
