@@ -30,6 +30,9 @@ var demoMedia = false
 var demoCharging = false
 var demoAirpods = false
 var demoVolume = false
+var demoActsN: Int? = nil           // --demo-acts N: show N fake live activities (1...5)
+var demoKinds = Set<ActKind>()
+var demoPick: [String]? = nil          // --demo-kinds media,timer,charging,airpods,lowBattery (any subset)
 var demoBrightness = false
 var argIt = CommandLine.arguments.dropFirst().makeIterator()
 while let a = argIt.next() {
@@ -42,6 +45,8 @@ while let a = argIt.next() {
     case "--demo-charging": demoCharging = true
     case "--demo-airpods": demoAirpods = true
     case "--demo-volume": demoVolume = true
+    case "--demo-kinds": demoPick = argIt.next()?.split(separator: ",").map(String.init); demoActsN = demoActsN ?? 0
+    case "--demo-acts": if let v = argIt.next(), let n = Int(v) { demoActsN = min(max(n, 0), 5) }
     case "--demo-brightness": demoBrightness = true
     default: break
     }
@@ -94,6 +99,7 @@ struct Media {
     var elapsed: TimeInterval      // position at `readAt`
     var readAt: Date
     var storeID: String
+    var bundleID: String = ""          // the app that is playing (a browser for web video)
     var elapsedNow: TimeInterval {
         let e = elapsed + (playing ? Date().timeIntervalSince(readAt) : 0)
         return duration > 0 ? min(e, duration) : e
@@ -111,6 +117,11 @@ if (req) {
     var info = item.nowPlayingInfo;
     var g = function (k) { try { return ObjC.unwrap(info.objectForKey(k)); } catch (e) { return null; } };
     var title = g("kMRMediaRemoteNowPlayingInfoTitle");
+    var appBundle = "";
+    try {
+      var client = req.localNowPlayingPlayerPath.client;
+      appBundle = ObjC.unwrap(client.parentApplicationBundleIdentifier) || ObjC.unwrap(client.bundleIdentifier) || "";
+    } catch (e) {}
     if (title) {
       var pos = null;
       try { pos = item.metadata.calculatedPlaybackPosition; } catch (e) {}
@@ -120,7 +131,8 @@ if (req) {
         rate: g("kMRMediaRemoteNowPlayingInfoPlaybackRate") || 0,
         duration: g("kMRMediaRemoteNowPlayingInfoDuration") || 0,
         elapsed: (pos !== null && pos !== undefined) ? pos : (g("kMRMediaRemoteNowPlayingInfoElapsedTime") || 0),
-        id: String(g("kMRMediaRemoteNowPlayingInfoiTunesStoreIdentifier") || "")
+        id: String(g("kMRMediaRemoteNowPlayingInfoiTunesStoreIdentifier") || ""),
+        app: appBundle
       });
     }
   }
@@ -160,7 +172,8 @@ func queryNowPlaying() -> PollResult {
           let title = j["title"] as? String else { return .failed }
     func num(_ k: String) -> Double { (j[k] as? NSNumber)?.doubleValue ?? 0 }
     return .media(Media(title: title, artist: (j["artist"] as? String) ?? "", playing: num("rate") > 0,
-                        duration: num("duration"), elapsed: num("elapsed"), readAt: Date(), storeID: (j["id"] as? String) ?? ""))
+                        duration: num("duration"), elapsed: num("elapsed"), readAt: Date(), storeID: (j["id"] as? String) ?? "",
+                        bundleID: (j["app"] as? String) ?? ""))
 }
 
 /// MediaRemote command ids: 2 toggle play/pause, 4 next, 5 previous.
@@ -355,24 +368,33 @@ func fetchArtwork(storeID: String, completion: @escaping (NSImage?) -> Void) {
 
 // MARK: - Timer model
 
+/// Seconds from the CPU's hardware counter. Keeps counting through sleep and is immune to clock changes
+/// (manual time changes, network time sync, time zone), unlike `Date`.
+func hardwareSeconds() -> TimeInterval {
+    struct TB { static let r: mach_timebase_info_data_t = { var i = mach_timebase_info_data_t(); mach_timebase_info(&i); return i }() }
+    return TimeInterval(mach_continuous_time()) * TimeInterval(TB.r.numer) / TimeInterval(TB.r.denom) / 1e9
+}
+
 final class TimerModel {
     enum Mode { case stopwatch, countdown }
     var mode: Mode = .stopwatch
     var running = false
     var target: TimeInterval = 300       // countdown length
     private var accumulated: TimeInterval = 0
-    private var startedAt: Date?
+    private var startedAt: TimeInterval?     // hardwareSeconds() when it was last started
 
-    var elapsed: TimeInterval { accumulated + (running ? Date().timeIntervalSince(startedAt ?? Date()) : 0) }
+    var elapsed: TimeInterval { accumulated + (running ? hardwareSeconds() - (startedAt ?? hardwareSeconds()) : 0) }
     var display: TimeInterval { mode == .stopwatch ? elapsed : max(0, target - elapsed) }
     var finished: Bool { mode == .countdown && elapsed >= target }
 
     func toggle() {
         if running { accumulated = elapsed; running = false; startedAt = nil }
-        else { if finished { reset() }; startedAt = Date(); running = true }
+        else { if finished { reset() }; startedAt = hardwareSeconds(); running = true }
     }
     var started: Bool { running || accumulated > 0 }
     func reset() { running = false; accumulated = 0; startedAt = nil; target = 300 }
+    func startStopwatch() { reset(); mode = .stopwatch; toggle() }
+    func startCountdown(minutes: Int) { reset(); mode = .countdown; target = TimeInterval(minutes * 60); toggle() }
     func switchMode() { reset(); mode = (mode == .stopwatch) ? .countdown : .stopwatch }
     func addMinute() { if mode == .countdown { target += 60 } }
 
@@ -682,19 +704,20 @@ func setSymbol(_ b: NSButton, _ name: String, _ pt: CGFloat) {
 func earRadius(_ h: CGFloat) -> CGFloat { min(18, max(6, 6 + (h - 40) * 0.2)) }
 func bottomRadius(_ h: CGFloat) -> CGFloat { min(26, max(14, 14 + (h - 40) * 0.18)) }
 
-func notchPath(_ w: CGFloat, _ h: CGFloat) -> CGPath {
+func notchPath(_ w: CGFloat, _ h: CGFloat, earL: Bool = true, earR: Bool = true) -> CGPath {
     let t = earRadius(h)
-    let b = max(0, min(bottomRadius(h), h - t, (w - 2 * t) / 2))
+    let tl = earL ? t : 0, tr = earR ? t : 0
+    let b = max(0, min(bottomRadius(h), h - t, (w - tl - tr) / 2))
     let p = CGMutablePath()                                     // y grows upward; the top edge is y = h
     p.move(to: CGPoint(x: 0, y: h))
     p.addLine(to: CGPoint(x: w, y: h))
-    p.addArc(center: CGPoint(x: w, y: h - t), radius: t, startAngle: .pi / 2, endAngle: .pi, clockwise: false)   // right ear
-    p.addLine(to: CGPoint(x: w - t, y: b))
-    p.addArc(center: CGPoint(x: w - t - b, y: b), radius: b, startAngle: 0, endAngle: -.pi / 2, clockwise: true)  // bottom right
-    p.addLine(to: CGPoint(x: t + b, y: 0))
-    p.addArc(center: CGPoint(x: t + b, y: b), radius: b, startAngle: -.pi / 2, endAngle: -.pi, clockwise: true)   // bottom left
-    p.addLine(to: CGPoint(x: t, y: h - t))
-    p.addArc(center: CGPoint(x: 0, y: h - t), radius: t, startAngle: 0, endAngle: .pi / 2, clockwise: false)     // left ear
+    if earR { p.addArc(center: CGPoint(x: w, y: h - t), radius: t, startAngle: .pi / 2, endAngle: .pi, clockwise: false) }   // right ear
+    p.addLine(to: CGPoint(x: w - tr, y: b))
+    p.addArc(center: CGPoint(x: w - tr - b, y: b), radius: b, startAngle: 0, endAngle: -.pi / 2, clockwise: true)           // bottom right
+    p.addLine(to: CGPoint(x: tl + b, y: 0))
+    p.addArc(center: CGPoint(x: tl + b, y: b), radius: b, startAngle: -.pi / 2, endAngle: -.pi, clockwise: true)            // bottom left
+    p.addLine(to: CGPoint(x: tl, y: earL ? h - t : h))
+    if earL { p.addArc(center: CGPoint(x: 0, y: h - t), radius: t, startAngle: 0, endAngle: .pi / 2, clockwise: false) }    // left ear
     p.closeSubpath()
     return p
 }
@@ -703,22 +726,103 @@ func notchPath(_ w: CGFloat, _ h: CGFloat) -> CGPath {
 
 enum Body { case none, hud, banner, alert, media, timer }
 enum LevelKind { case volume, brightness }
-enum LeftWing { case none, art, timer }
-enum RightWing { case none, eq, time }
+
+/// Everything that can be a live activity, in the order they are listed when several run at once.
+enum ActKind: Hashable { case media, timer, charging, lowBattery, airpods }
+let allKinds: [ActKind] = [.media, .timer, .charging, .airpods, .lowBattery]
+
+/// The two small views an activity can be drawn with: a 24pt icon, and a detail (time, %, equalizer, ring).
+final class SlotItem {
+    let icon: NSView
+    let detail: NSView
+    let detailSize: CGSize
+    init(icon: NSView, detail: NSView, detailSize: CGSize) { self.icon = icon; self.detail = detail; self.detailSize = detailSize }
+    var pillWidth: CGFloat { 24 + 6 + detailSize.width }
+}
+
+/// One critically-damped-ish spring channel.
+struct SpringV {
+    var cur: CGFloat = 0, vel: CGFloat = 0, tgt: CGFloat = 0
+    mutating func step(_ h: CGFloat, _ k: CGFloat, _ c: CGFloat) { vel += (-k * (cur - tgt) - c * vel) * h; cur += vel * h }
+    var settled: Bool { abs(cur - tgt) < 0.1 && abs(vel) < 2 }
+    mutating func snap() { cur = tgt; vel = 0 }
+    mutating func jump(_ v: CGFloat) { cur = v; tgt = v; vel = 0 }
+}
+
+/// A window (the island itself, the detached icon, the pill under the notch) and the springs that move it.
+final class Piece {
+    let panel: NSPanel
+    var x = SpringV(), w = SpringV(), h = SpringV(), ty = SpringV()    // left edge, width, height, distance from the top of the screen
+    var fullW: CGFloat = 1
+    var active = false      // wants to be on screen
+    var visible = false     // is on screen (an inactive piece stays until it has shrunk away)
+    init(panel: NSPanel) { self.panel = panel }
+    var settled: Bool { x.settled && w.settled && h.settled && ty.settled }
+    func snap() { x.snap(); w.snap(); h.snap(); ty.snap() }
+}
+
+/// The detached icon circle and the pill under the notch: black capsules holding slot views, centred.
+final class PillView: NSView {
+    var onPress: (() -> Void)?
+    var onRelease: ((Bool) -> Void)?
+    var items: [SlotItem] = [] { didSet { needsLayout = true } }
+    var single: (view: NSView, size: CGSize)? { didSet { needsLayout = true } }   // one view, centred (the second notch)
+    var withDetail = false { didSet { needsLayout = true } }
+    var notchStyle = false { didSet { needsLayout = true } }    // a second notch: attached to the top edge of the screen
+    private let shapeMask = CAShapeLayer()
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.black.cgColor
+        layer?.mask = shapeMask
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func layout() {
+        super.layout()
+        let r = bounds.height / 2
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        shapeMask.frame = bounds
+        shapeMask.path = notchStyle ? notchPath(bounds.width, bounds.height)
+                                    : CGPath(roundedRect: bounds, cornerWidth: r, cornerHeight: r, transform: nil)
+        CATransaction.commit()
+        if let one = single {
+            one.view.frame = NSRect(x: (bounds.width - one.size.width) / 2, y: (bounds.height - one.size.height) / 2, width: one.size.width, height: one.size.height)
+        }
+        let widths = items.map { withDetail ? $0.pillWidth : 24 }
+        let total = widths.reduce(0, +) + 16 * CGFloat(max(items.count - 1, 0))
+        var x = (bounds.width - total) / 2
+        for (it, wd) in zip(items, widths) {
+            it.icon.frame = NSRect(x: x, y: (bounds.height - 24) / 2, width: 24, height: 24)
+            if withDetail {
+                it.detail.frame = NSRect(x: x + 30, y: (bounds.height - it.detailSize.height) / 2,
+                                         width: it.detailSize.width, height: it.detailSize.height)
+            }
+            x += wd + 16
+        }
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard let sv = superview else { return nil }
+        return bounds.contains(convert(point, from: sv)) ? self : nil
+    }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func mouseDown(with event: NSEvent) { onPress?() }
+    override func mouseUp(with event: NSEvent) { onRelease?(bounds.contains(convert(event.locationInWindow, from: nil))) }
+}
 
 final class Content: Flip {
     var notchH: CGFloat = 32
     var bandH: CGFloat = 32          // height of the top band the wings live in (taller while compact)
     var body: Body = .none
-    var left: LeftWing = .none
-    var right: RightWing = .none
+    var ending = false               // everything is going away: fade slowly
+    var leftView: NSView?            // slot views drawn beside the notch (managed by App)
+    var rightView: NSView?
+    var rightSize = CGSize(width: 24, height: 24)
+    var leftSize = CGSize(width: 24, height: 24)
     private var lastAlpha: [ObjectIdentifier: CGFloat] = [:]
 
-    // wings
-    let wingArt = ArtView(radius: 6)       // = bottom corner (14) - margin (8): corners stay concentric
-    let wingTimerIcon = NSImageView()
-    let wingEq = EqView()
-    let wingTime = makeLabel(13, .semibold, accent, mono: true, align: .right)
     // media body
     let art = ArtView(radius: 10)
     let titleL = makeLabel(15, .semibold, .white)
@@ -751,9 +855,6 @@ final class Content: Flip {
 
     override init(frame: NSRect) {
         super.init(frame: frame)
-        wingTimerIcon.image = NSImage(systemSymbolName: "timer", accessibilityDescription: nil)?
-            .withSymbolConfiguration(.init(pointSize: 16, weight: .semibold))
-        wingTimerIcon.contentTintColor = accent
         for b in [pauseB, cancelB] { b.wantsLayer = true; b.layer?.cornerRadius = 22 }
         pauseB.layer?.backgroundColor = accent.withAlphaComponent(0.28).cgColor
         cancelB.layer?.backgroundColor = NSColor(white: 1, alpha: 0.2).cgColor
@@ -763,22 +864,24 @@ final class Content: Flip {
     required init?(coder: NSCoder) { fatalError() }
 
     var all: [NSView] {
-        [wingArt, wingTimerIcon, wingEq, wingTime, art, titleL, artistL, bodyEq, progress, elapsedL, remainL,
+        [art, titleL, artistL, bodyEq, progress, elapsedL, remainL,
          prevB, playB, nextB, pauseB, cancelB, tLabel, tTime, alertL, bTitle, bPct, bGlyph, bAir, bRing, hIcon, hBar]
     }
+
+    /// Cover + title + artist: tapping it opens the app that is playing.
+    var sourceRect: NSRect { art.frame.union(titleL.frame).union(artistL.frame) }
 
     override func layout() {
         super.layout()
         let w = bounds.width, pad: CGFloat = 16, top = notchH + 2
-        // wings: the art tile gets the same margin on the left, top and bottom
+        // wings: the icon tile gets the same margin on the left, top and bottom
         let tile: CGFloat = 24
         let m = max((bandH - tile) / 2, 0)
         let leftInset: CGFloat = bandH > notchH ? m : 14        // compact pill: even margins; expanded: wing icons
-        let rightInset: CGFloat = bandH > notchH ? m + 6 : 14
-        wingArt.frame = NSRect(x: leftInset, y: m, width: tile, height: tile)
-        wingTimerIcon.frame = NSRect(x: leftInset, y: m, width: tile, height: tile)
-        wingEq.frame = NSRect(x: w - rightInset - 20, y: (bandH - 16) / 2, width: 20, height: 16)
-        wingTime.frame = NSRect(x: w - rightInset - 70, y: (bandH - 18) / 2, width: 70, height: 18)
+        let rightInset: CGFloat = bandH > notchH ? (rightSize.width > tile ? m + 6 : m) : 14
+        leftView?.frame = NSRect(x: leftInset, y: (bandH - leftSize.height) / 2, width: leftSize.width, height: leftSize.height)
+        rightView?.frame = NSRect(x: w - rightInset - rightSize.width, y: (bandH - rightSize.height) / 2,
+                                  width: rightSize.width, height: rightSize.height)
         // media
         art.frame = NSRect(x: pad, y: top, width: 48, height: 48)
         let tx = pad + 48 + 12, tw = max(0, w - tx - pad - 26)
@@ -813,10 +916,7 @@ final class Content: Flip {
     /// Cross-fade every element to what the current shape/body/wings need.
     func applyVisibility(expanded: Bool) {
         let b = body
-        let ending = (b == .none && left == .none && right == .none)
         let want: [(NSView, Bool)] = [
-            (wingArt, left == .art), (wingTimerIcon, left == .timer),
-            (wingEq, right == .eq), (wingTime, right == .time),
             (art, expanded && b == .media), (titleL, expanded && b == .media), (artistL, expanded && b == .media),
             (bodyEq, expanded && b == .media), (progress, expanded && b == .media),
             (elapsedL, expanded && b == .media), (remainL, expanded && b == .media),
@@ -850,6 +950,8 @@ final class IslandView: NSView {
     var onRelease: ((Bool) -> Void)?       // true when the finger came up inside the island
     let content = Content(frame: .zero)
     private let shapeMask = CAShapeLayer()
+    var earLeft = true { didSet { if earLeft != oldValue { needsLayout = true } } }
+    var earRight = true { didSet { if earRight != oldValue { needsLayout = true } } }   // false: the right edge is flush with the notch
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -865,29 +967,51 @@ final class IslandView: NSView {
     override func layout() {
         super.layout()
         let t = earRadius(bounds.height)
-        content.frame = NSRect(x: t, y: 0, width: max(0, bounds.width - 2 * t), height: bounds.height)
+        let l = earLeft ? t : 0, r = earRight ? t : 0
+        content.frame = NSRect(x: l, y: 0, width: max(0, bounds.width - l - r), height: bounds.height)
         CATransaction.begin(); CATransaction.setDisableActions(true)
         shapeMask.frame = bounds
-        shapeMask.path = notchPath(bounds.width, bounds.height)
+        shapeMask.path = notchPath(bounds.width, bounds.height, earL: earLeft, earR: earRight)
         CATransaction.commit()
     }
 
-    // Labels must not swallow presses; only visible buttons keep their own clicks.
+    var onOpenSource: (() -> Void)?
+    private var sourceTapActive = false
+
+    /// Only controls that are actually visible can take a click. (Hidden-by-alpha controls stacked on top of a
+    /// visible one used to swallow its clicks.) Everything else is a press on the island itself.
     override func hitTest(_ point: NSPoint) -> NSView? {
-        guard let v = super.hitTest(point) else { return nil }
-        if (v is NSButton || v is LevelBar), !v.isHidden, v.alphaValue > 0.3 { return v }
+        guard let sv = superview, bounds.contains(convert(point, from: sv)) else { return nil }
+        let p = content.convert(convert(point, from: sv), from: self)
+        for v in content.subviews.reversed() where (v is NSButton || v is LevelBar) && !v.isHidden && v.alphaValue > 0.3 {
+            if v.frame.contains(p) { return v }
+        }
         return self
     }
+
+    private func overSource(_ e: NSEvent) -> Bool {
+        guard content.body == .media, content.art.alphaValue > 0.3 else { return false }
+        return content.sourceRect.contains(content.convert(e.locationInWindow, from: nil))
+    }
+
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-    override func mouseDown(with event: NSEvent) { onPress?() }
+    override func mouseDown(with event: NSEvent) {
+        sourceTapActive = overSource(event)
+        if !sourceTapActive { onPress?() }
+    }
     override func mouseUp(with event: NSEvent) {
+        if sourceTapActive {
+            sourceTapActive = false
+            if overSource(event) { onOpenSource?() }
+            return
+        }
         onRelease?(bounds.contains(convert(event.locationInWindow, from: nil)))
     }
 }
 
 // MARK: - App
 
-final class App: NSObject, NSApplicationDelegate {
+final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     enum Shape { case collapsed, activity, peek, pressed, expanded }
 
     // press / long-press state
@@ -897,9 +1021,9 @@ final class App: NSObject, NSApplicationDelegate {
 
     // spring-driven window size (smooth, interruptible, velocity-preserving)
     var link: CADisplayLink?
-    var curW: CGFloat = 0, curH: CGFloat = 0, velW: CGFloat = 0, velH: CGFloat = 0
-    var tgtW: CGFloat = 0, tgtH: CGFloat = 0
-    var stiffness: CGFloat = 400, damping: CGFloat = 30
+    var mainP: Piece!, sideP: Piece!, pillP: Piece!
+    var sideView: PillView!, pillView: PillView!
+    var stiffness: CGFloat = 400, damping: CGFloat = 30     // the island's own spring (changes with the shape)
     var signalSources: [DispatchSourceSignal] = []
     var simLux: Double?
     var atRest = true                      // spring has settled
@@ -924,6 +1048,14 @@ final class App: NSObject, NSApplicationDelegate {
     var artCache: [String: (NSImage, NSColor)] = [:]
     var battery: Battery?
     var banner: BannerKind?
+    // live activities, oldest first; at most 5 are shown (the oldest are dropped first)
+    var actOrder: [ActKind] = []
+    var selected: ActKind?                     // which activity the expanded card shows
+    var pressKind: ActKind?
+    var airList: [AirPodsInfo] = []
+    var slotItems: [ActKind: SlotItem] = [:]
+    var lastPlan: Plan?
+    var usedViews: [NSView] = []
     // volume / brightness HUD (transient: it goes away by itself, unlike alerts)
     var hudKind: LevelKind = .volume
     var hudValue: Float = 0
@@ -935,6 +1067,7 @@ final class App: NSObject, NSApplicationDelegate {
     var brightCur: Float = 0
     var brightTimer: Timer?
     var keyTapTimer: Timer?
+    var statusItem: NSStatusItem?
     var bannerSymbol = ""
     var airBusy = false, airBaseline = false
     var mediaBaseline = false            // first poll only records what was already playing
@@ -956,18 +1089,74 @@ final class App: NSObject, NSApplicationDelegate {
     }
     var notchH: CGFloat { max(screen.safeAreaInsets.top, 32) }
 
+    // MARK: activities
+
+    var chargeLevel: Int { demoActsN != nil ? 55 : (battery?.level ?? 0) }
+    var lowLevel: Int { demoActsN != nil ? 12 : (battery?.level ?? 0) }
+    var airInfo: AirPodsInfo? { demoActsN != nil ? AirPodsInfo(name: "demo", symbol: "airpodspro", level: 80) : airList.first }
+
+    func isActive(_ k: ActKind) -> Bool {
+        switch k {
+        case .media: return media != nil
+        case .timer: return timer.started
+        case .charging:   return demoActsN != nil ? demoKinds.contains(k) : (battery?.plugged == true && battery?.charging == true)
+        case .lowBattery: return demoActsN != nil ? demoKinds.contains(k) : (battery?.plugged == false && (battery?.level ?? 100) <= 20)
+        case .airpods:    return demoActsN != nil ? demoKinds.contains(k) : !airList.isEmpty
+        }
+    }
+
+    /// Keeps `actOrder` = the running activities in the order they started.
+    func syncActivities() {
+        for k in allKinds {
+            let on = isActive(k), has = actOrder.contains(k)
+            if on && !has { actOrder.append(k) } else if !on && has { actOrder.removeAll { $0 == k } }
+        }
+    }
+    var acts: [ActKind] { Array(actOrder.suffix(5)) }
+
+    var cardKind: ActKind? { if let s = selected, acts.contains(s) { return s }; return acts.first }
+
+    func bannerFor(_ k: ActKind) -> BannerKind? {
+        switch k {
+        case .charging:   return .battery(title: "충전 중", level: chargeLevel, color: bannerGreen)
+        case .lowBattery: return .battery(title: "배터리 부족", level: lowLevel, color: lowLevel <= 10 ? bannerRed : accent)
+        case .airpods:    let d = airInfo; return .airpods(symbol: d?.symbol ?? "airpods", level: d?.level)
+        default:          return nil
+        }
+    }
+    /// What the banner body shows: a one-off banner, or the selected charging / AirPods activity.
+    var displayBanner: BannerKind? {
+        if let b = banner { return b }
+        guard !hudActive, alertText == nil, let k = cardKind else { return nil }
+        return bannerFor(k)
+    }
+
     var body: Body {
         if hudActive { return .hud }
         if banner != nil { return .banner }
         if alertText != nil { return .alert }
-        if media != nil { return .media }
-        if timer.started { return .timer }
-        return .none
+        switch cardKind {
+        case .media?: return .media
+        case .timer?: return .timer
+        case .charging?, .lowBattery?, .airpods?: return .banner
+        case nil: return .none
+        }
     }
     var hudActive: Bool { Date() < hudUntil }
-    var liveActivity: Bool { body != .none }
-    var wingW: CGFloat { timer.started ? 66 : 50 }                // space beside the notch in the compact pill
-    var bannerWing: CGFloat { if case .airpods = banner { return 60 }; return 110 }
+    var liveActivity: Bool { hudActive || banner != nil || alertText != nil || !acts.isEmpty }
+    let iconWing: CGFloat = 46                                       // space beside the notch for one icon
+    /// Space beside the notch when a single activity shows its icon on the left and its detail on the right.
+    func wingWidth(_ k: ActKind) -> CGFloat {
+        switch k { case .timer: return 66; case .charging, .lowBattery: return 62; default: return 50 }
+    }
+    /// Charging and low battery show their percentage (not an icon) in the narrow slots beside the notch.
+    func showsPercent(_ k: ActKind) -> Bool { k == .charging || k == .lowBattery }
+    func slotView(_ k: ActKind) -> (view: NSView, size: CGSize) {
+        guard let it = slotItems[k] else { return (NSView(), .zero) }
+        return showsPercent(k) ? (it.detail, it.detailSize) : (it.icon, CGSize(width: 24, height: 24))
+    }
+    func slotWing(_ k: ActKind) -> CGFloat { showsPercent(k) ? 58 : iconWing }     // room beside the notch for that slot
+    var bannerWing: CGFloat { if case .airpods? = displayBanner { return 60 }; return 110 }
     var expandedExtra: CGFloat {
         switch body {
         case .media:  return 122
@@ -977,46 +1166,92 @@ final class App: NSObject, NSApplicationDelegate {
         }
     }
 
-    func wings() -> (LeftWing, RightWing) {
-        let m = media != nil, t = timer.started
-        if shape == .expanded {
-            switch body {
-            case .media: return t ? (.timer, .time) : (.none, .none)
-            case .timer: return m ? (.art, .eq) : (.none, .none)
-            default:     return (.none, .none)   // banner / alert: nothing beside it
-            }
-        }
-        return (m ? .art : (t ? .timer : .none), t ? .time : (m ? .eq : .none))
+    // MARK: layout plan: which activity goes where
+
+    struct Plan: Equatable {
+        var left: ActKind?
+        var right: ActKind?
+        var rightDetail = false         // right slot shows the detail of the same activity (single activity)
+        var side: ActKind?              // the detached icon (exactly 2 activities)
+        var pill: [ActKind] = []        // the pill under the notch (3...5 activities)
     }
 
+    func makePlan() -> Plan {
+        let a = acts
+        if shape == .expanded {
+            // an expanded card keeps the other activities as small icons beside the notch
+            // only the tall cards have room beside the notch; one-line banners (charging, AirPods...) fill the whole band
+            guard !hudActive, banner == nil, alertText == nil, let ck = cardKind, body == .media || body == .timer else { return Plan() }
+            let others = a.filter { $0 != ck }
+            switch others.count {
+            case 0:  return Plan()
+            case 1:  return Plan(left: others[0], right: others[0], rightDetail: true)
+            default: return Plan(left: others[0], right: others[1])
+            }
+        }
+        switch a.count {
+        case 0:  return Plan()
+        case 1:  return Plan(left: a[0], right: a[0], rightDetail: true)
+        case 2:  return Plan(left: a[0], side: a[1])
+        default: return Plan(left: a[0], right: a[1], pill: Array(a.dropFirst(2)))
+        }
+    }
+
+    // MARK: geometry (screen coordinates, y up)
+
+    var notchLeft: CGFloat { screen.frame.midX - notchW / 2 }
+    var notchRight: CGFloat { screen.frame.midX + notchW / 2 }
+    var compactH: CGFloat { notchH + 8 }
+
     func frame(for s: Shape) -> NSRect {
-        let (w, h): (CGFloat, CGFloat)
-        let hasCompact = media != nil || timer.started
-        let compactW = notchW + 2 * wingW                        // just wide enough for the art tile / the time
-        let base: CGFloat = hasCompact ? compactW : notchW        // peek/pressed grow from here
+        let a = acts, n = a.count
+        let mid = screen.frame.midX, top = screen.frame.maxY
+        func r(_ x: CGFloat, _ w: CGFloat, _ h: CGFloat) -> NSRect { NSRect(x: x, y: top - h, width: w, height: h) }
+        func compact(extra: CGFloat, h: CGFloat) -> NSRect {
+            switch n {
+            case 0: let w = notchW + extra; return r(mid - w / 2, w, h)
+            case 1: let w = notchW + 2 * wingWidth(a[0]) + extra; return r(mid - w / 2, w, h)
+            case 2: let wl = slotWing(a[0]); return r(notchLeft - wl - extra, notchW + wl + extra, h)     // grows to the left only
+            default: let wl = max(slotWing(a[0]), slotWing(a[1])); let w = notchW + 2 * wl + extra; return r(mid - w / 2, w, h)
+            }
+        }
         switch s {
-        case .collapsed: (w, h) = (notchW, notchH)
-        case .activity:  (w, h) = (compactW, notchH + 8)        // a little taller so the art tile gets even margins
-        case .peek:      (w, h) = (base + 24, hasCompact ? notchH + 8 : notchH)    // swells sideways only
-        case .pressed:   (w, h) = (base + 44, hasCompact ? notchH + 8 : notchH + 6)   // idle press: sideways AND a little down
+        case .collapsed: return r(notchLeft, notchW, notchH)
+        case .activity:  return n == 0 ? r(notchLeft, notchW, notchH) : compact(extra: 0, h: compactH)
+        case .peek:      return compact(extra: 24, h: n == 0 ? notchH : compactH)           // swells sideways only
+        case .pressed:   return compact(extra: 44, h: n == 0 ? notchH + 6 : compactH)      // idle press: sideways AND a little down
         case .expanded:
+            let w: CGFloat, h: CGFloat
             switch body {
             case .hud:    (w, h) = (284, notchH + 40)                     // dropped below the notch
             case .banner: (w, h) = (notchW + 2 * bannerWing, notchH)
             default:      (w, h) = (332, notchH + expandedExtra)
             }
+            return r(mid - w / 2, w, h)
         }
-        return NSRect(x: screen.frame.midX - w / 2, y: screen.frame.maxY - h, width: w, height: h)
+    }
+
+    /// The detached icon right of the notch (exactly 2 activities).
+    func sideRect() -> NSRect? {
+        guard shape != .expanded, acts.count == 2 else { return nil }
+        let h = compactH
+        let body: CGFloat = acts.count == 2 && showsPercent(acts[1]) ? 52 : 40
+        let w = body + 2 * earRadius(h)                        // icon body + the two ears
+        return NSRect(x: notchRight + sideGap, y: screen.frame.maxY - h, width: w, height: h)
+    }
+    let sideGap: CGFloat = 3
+    let pillH: CGFloat = 34, pillGap: CGFloat = 6
+    /// The pill under the notch (3...5 activities): returns its rect and its distance from the top of the screen.
+    func pillRect() -> (NSRect, CGFloat)? {
+        guard shape != .expanded, acts.count >= 3 else { return nil }
+        let items = acts.dropFirst(2).compactMap { slotItems[$0] }
+        let w = 28 + items.reduce(0) { $0 + $1.pillWidth } + 16 * CGFloat(max(items.count - 1, 0))
+        let ty = compactH + pillGap
+        return (NSRect(x: screen.frame.midX - w / 2, y: screen.frame.maxY - ty - pillH, width: w, height: pillH), ty)
     }
 
     func applicationDidFinishLaunching(_ n: Notification) {
-        panel = NSPanel(contentRect: frame(for: .collapsed), styleMask: [.borderless, .nonactivatingPanel],
-                        backing: .buffered, defer: false)
-        panel.level = .screenSaver
-        panel.backgroundColor = .clear
-        panel.isOpaque = false
-        panel.hasShadow = false
-        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+        panel = makePanel(frame(for: .collapsed))
 
         view = IslandView(frame: NSRect(origin: .zero, size: panel.frame.size))
         view.content.notchH = notchH
@@ -1027,8 +1262,19 @@ final class App: NSObject, NSApplicationDelegate {
         wire(c.pauseB, #selector(timerToggleTapped)); wire(c.cancelB, #selector(timerCancelTapped))
         panel.contentView = view
         panel.orderFrontRegardless()
-        let sz = frame(for: .collapsed).size
-        curW = sz.width; curH = sz.height; tgtW = sz.width; tgtH = sz.height
+        let r0 = frame(for: .collapsed)
+        mainP = Piece(panel: panel); mainP.active = true; mainP.visible = true
+        mainP.x.jump(r0.minX); mainP.w.jump(r0.width); mainP.h.jump(r0.height)
+        sideView = PillView(frame: .zero); pillView = PillView(frame: .zero); pillView.withDetail = true
+        sideView.notchStyle = true
+        let sidePanel = makePanel(.zero), pillPanel = makePanel(.zero)
+        sidePanel.contentView = sideView; pillPanel.contentView = pillView
+        sideP = Piece(panel: sidePanel); pillP = Piece(panel: pillPanel)
+        for pv in [sideView!, pillView!] {
+            pv.onPress = { [weak self] in self?.pressBegan() }
+            pv.onRelease = { [weak self] inside in self?.pressEnded(inside: inside) }
+        }
+        makeSlotItems()
         link = screen.displayLink(target: self, selector: #selector(animTick(_:)))
         link?.add(to: .main, forMode: .common)
         link?.isPaused = true
@@ -1037,6 +1283,19 @@ final class App: NSObject, NSApplicationDelegate {
         if demoTimer { timer.toggle(); pinned = true }
         if demoCharging { showBanner(.battery(title: "충전 중", level: 55, color: bannerGreen)) }
         if demoAirpods { showBanner(.airpods(symbol: "airpodspro", level: 80)) }
+        if let n = demoActsN {                                         // --demo-acts N: N fake activities, none pinned open
+            if let pick = demoPick {
+                if pick.contains("media") { media = Media(title: "승리를 위하여", artist: "트랜스픽션", playing: true, duration: 208, elapsed: 29, readAt: Date(), storeID: "") }
+                if pick.contains("timer") { timer.toggle() }
+                prevTimerStarted = timer.started
+                for (name, k) in [("charging", ActKind.charging), ("airpods", .airpods), ("lowBattery", .lowBattery)] where pick.contains(name) { demoKinds.insert(k) }
+            } else {
+            if n >= 1 { media = Media(title: "승리를 위하여", artist: "트랜스픽션", playing: true, duration: 208, elapsed: 29, readAt: Date(), storeID: "") }
+            if n >= 2 { timer.toggle() }
+            prevTimerStarted = timer.started                           // don't auto-open for the demo stopwatch
+            for (i, k) in [ActKind.charging, .airpods, .lowBattery].enumerated() where n >= 3 + i { demoKinds.insert(k) }
+            }
+        }
         if demoVolume { showHUD(.volume, 0.62, muted: false, seconds: 30) }
         if demoBrightness { showHUD(.brightness, 0.78, muted: false, seconds: 30) }
         if demoMedia {
@@ -1056,7 +1315,10 @@ final class App: NSObject, NSApplicationDelegate {
             s.banner = nil
         }
         if ProcessInfo.processInfo.environment["NI_TEST_SIGNALS"] != nil {     // test hook: simulate the sensor
-            signal(SIGUSR1, SIG_IGN); signal(SIGUSR2, SIG_IGN); signal(SIGWINCH, SIG_IGN)
+            signal(SIGUSR1, SIG_IGN); signal(SIGUSR2, SIG_IGN); signal(SIGWINCH, SIG_IGN); signal(SIGURG, SIG_IGN)
+            let hudSrc = DispatchSource.makeSignalSource(signal: SIGURG, queue: .main)     // SIGURG = pop a brightness HUD (test hook)
+            hudSrc.setEventHandler { [weak self] in self?.showHUD(.brightness, 0.6, seconds: 1.8) }
+            hudSrc.resume(); signalSources.append(hudSrc)
             let endSrc = DispatchSource.makeSignalSource(signal: SIGWINCH, queue: .main)   // SIGWINCH = every activity ends
             endSrc.setEventHandler { [weak self] in self?.timer.reset(); self?.media = nil; self?.alertText = nil; self?.banner = nil }
             endSrc.resume(); signalSources.append(endSrc)
@@ -1069,11 +1331,44 @@ final class App: NSObject, NSApplicationDelegate {
                 src.resume(); signalSources.append(src)
             }
         }
+        if ProcessInfo.processInfo.environment["NI_NOSENSOR"] != nil { simLux = 1000 }     // test hook: ignore the real light sensor
         c.hBar.onChange = { [weak self] v in self?.hudDragged(v) }
+        view.onOpenSource = { [weak self] in self?.openSourceApp() }
+        setupStatusItem()
         keyTap.onKey = { [weak self] code, down, fine in self?.handleMediaKey(code, down, fine) ?? false }
         setupKeyTap()
         refreshUI()
-        Timer.scheduledTimer(withTimeInterval: 1.0 / 60, repeats: true) { [weak self] _ in self?.step() }
+        let stepTimer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in self?.step() }
+        RunLoop.main.add(stepTimer, forMode: .common)       // .common: also runs while a menu is open or a drag is in progress
+    }
+
+    func makePanel(_ frame: NSRect) -> NSPanel {
+        let p = NSPanel(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        p.level = .screenSaver
+        p.backgroundColor = .clear
+        p.isOpaque = false
+        p.hasShadow = false
+        p.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+        return p
+    }
+
+    func symbolView(_ name: String, _ pt: CGFloat, _ tint: NSColor) -> NSImageView {
+        let v = NSImageView()
+        v.image = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: pt, weight: .semibold))
+        v.contentTintColor = tint
+        return v
+    }
+
+    func makeSlotItems() {
+        slotItems[.media] = SlotItem(icon: ArtView(radius: 6), detail: EqView(), detailSize: CGSize(width: 20, height: 16))
+        slotItems[.timer] = SlotItem(icon: symbolView("timer", 16, accent),
+                                     detail: makeLabel(13, .semibold, accent, mono: true, align: .right), detailSize: CGSize(width: 46, height: 18))
+        slotItems[.charging] = SlotItem(icon: symbolView("bolt.fill", 15, bannerGreen),
+                                        detail: makeLabel(13, .semibold, bannerGreen, mono: true, align: .center), detailSize: CGSize(width: 38, height: 18))
+        slotItems[.lowBattery] = SlotItem(icon: symbolView("battery.25percent", 16, bannerRed),
+                                          detail: makeLabel(13, .semibold, bannerRed, mono: true, align: .center), detailSize: CGSize(width: 38, height: 18))
+        slotItems[.airpods] = SlotItem(icon: symbolView("airpods", 17, .white), detail: RingView(), detailSize: CGSize(width: 24, height: 24))
     }
 
     func wire(_ b: NSButton, _ sel: Selector) { b.target = self; b.action = sel }
@@ -1092,14 +1387,92 @@ final class App: NSObject, NSApplicationDelegate {
         if !demoMedia { sendMediaCommand(2); pollSoon() }
         refreshUI()
     }
+    // MARK: menu bar item
+
+    func setupStatusItem() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        item.button?.image = NSImage(systemSymbolName: "capsule.fill", accessibilityDescription: "NotchIsland")
+        item.button?.image?.isTemplate = true
+        let menu = NSMenu()
+        menu.delegate = self
+        item.menu = menu
+        statusItem = item
+        if ProcessInfo.processInfo.environment["NI_DEBUG"] != nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                let w = item.button?.window
+                FileHandle.standardError.write("status item: visible=\(item.isVisible) window=\(String(describing: w?.frame)) onscreen=\(w?.isVisible ?? false) screen=\(String(describing: w?.screen?.frame))\n".data(using: .utf8)!)
+            }
+        }
+    }
+
+    /// Rebuilt every time it opens, so the items match what is running right now.
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        func add(_ title: String, _ sel: Selector, _ tag: Int = 0, key: String = "") {
+            let i = NSMenuItem(title: title, action: sel, keyEquivalent: key)
+            i.target = self; i.tag = tag; menu.addItem(i)
+        }
+        if timer.started {
+            menu.addItem(withTitle: (timer.mode == .stopwatch ? "스톱워치 " : "타이머 ") + timer.text(), action: nil, keyEquivalent: "").isEnabled = false
+            add(timer.running ? "일시정지" : "계속", #selector(menuToggleTimer))
+            add("취소", #selector(menuCancelTimer))
+        } else {
+            add("스톱워치 시작", #selector(menuStopwatch))
+            let sub = NSMenu()
+            for m in [1, 3, 5, 10, 15, 30] {
+                let i = NSMenuItem(title: "\(m)분", action: #selector(menuCountdown(_:)), keyEquivalent: "")
+                i.target = self; i.tag = m; sub.addItem(i)
+            }
+            let parent = NSMenuItem(title: "타이머", action: nil, keyEquivalent: "")
+            parent.submenu = sub; menu.addItem(parent)
+        }
+        menu.addItem(.separator())
+        let quit = NSMenuItem(title: "NotchIsland 종료", action: #selector(menuQuit), keyEquivalent: "q")
+        quit.target = self; menu.addItem(quit)
+    }
+
+    @objc func menuStopwatch() { timer.startStopwatch(); refreshUI() }
+    @objc func menuCountdown(_ sender: NSMenuItem) { timer.startCountdown(minutes: sender.tag); refreshUI() }
+    @objc func menuToggleTimer() { timer.toggle(); refreshUI() }
+    @objc func menuCancelTimer() { timer.reset(); refreshUI() }
+    @objc func menuQuit() { NSApp.terminate(nil) }
+
+    /// Bring the app that is playing to the front (Music, Spotify, the browser with the video...).
+    func openSourceApp() {
+        haptic(.alignment)
+        guard let id = media?.bundleID, !id.isEmpty else { return }
+        if let running = NSRunningApplication.runningApplications(withBundleIdentifier: id).first {
+            running.activate(options: [.activateAllWindows])
+        } else if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) {
+            NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
+        }
+        pinned = false                               // go back to the compact island once the app is in front
+    }
+
     @objc func timerToggleTapped() { haptic(); timer.toggle(); refreshUI() }
     @objc func timerCancelTapped() { haptic(); timer.reset(); refreshUI() }
     func pollSoon() { DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in self?.pollMusic() } }
+
+    /// Which activity is under the pointer. Anything on the notch itself or to the left of it is the activity attached
+    /// to the notch on the left (the first one); the right wing, the detached icon and the pill pick their own.
+    func kindAtMouse() -> ActKind? {
+        let a = acts
+        guard !a.isEmpty else { return nil }
+        let m = NSEvent.mouseLocation
+        if sideP.active, a.count == 2, sideP.panel.frame.insetBy(dx: -6, dy: -6).contains(m) { return a[1] }
+        if pillP.active, a.count >= 3, pillP.panel.frame.insetBy(dx: -6, dy: -6).contains(m) {
+            let items = Array(a.dropFirst(2)), f = pillP.panel.frame
+            return items[min(items.count - 1, max(0, Int((m.x - f.minX) / max(f.width, 1) * CGFloat(items.count))))]
+        }
+        if a.count >= 3, m.x > notchRight { return a[1] }
+        return a[0]
+    }
 
     /// Finger down: react at once (swell + haptic). With something running, a quick tap opens it on release,
     /// and holding opens it after 0.25s without waiting for the release. With nothing running it pops out and back.
     func pressBegan() {
         haptic(.alignment)
+        pressKind = kindAtMouse()
         pressedWhileExpanded = (shape == .expanded)
         if pressedWhileExpanded { return }           // already open: the release (a tap) closes it
         if !liveActivity {                           // nothing to show: pop out a little and go straight back in
@@ -1113,6 +1486,7 @@ final class App: NSObject, NSApplicationDelegate {
             let hit = s.frame(for: s.shape).insetBy(dx: -40, dy: -40)
             guard hit.contains(NSEvent.mouseLocation) else { return }   // dragged away while holding: do nothing
             s.pressing = false
+            s.selected = s.pressKind
             s.pinned = true                          // popped out: stays out until you click elsewhere
             haptic(.levelChange)
         }
@@ -1125,6 +1499,7 @@ final class App: NSObject, NSApplicationDelegate {
         let wasPressing = pressing
         pressing = false
         if wasPressing && inside && liveActivity {   // a quick tap (trackpad click / tap-to-click) opens it
+            selected = pressKind
             pinned = true
             haptic(.levelChange)
         }
@@ -1153,6 +1528,7 @@ final class App: NSObject, NSApplicationDelegate {
         let t = Timer(timeInterval: 0.3, repeats: false) { [weak self] _ in
             guard let s = self, s.pressing, s.darkLatched else { return }   // still covered
             s.pressing = false
+            s.selected = s.acts.first                // touching the sensor picks the activity attached to the notch (left)
             s.pinned = true
             haptic(.levelChange)
         }
@@ -1262,7 +1638,8 @@ final class App: NSObject, NSApplicationDelegate {
             }
         }
         tryInstall()
-        keyTapTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { _ in tryInstall() }   // picks up a later grant
+        let kt = Timer(timeInterval: 3, repeats: true) { _ in tryInstall() }   // picks up a later grant
+        RunLoop.main.add(kt, forMode: .common); keyTapTimer = kt
     }
 
     func showBanner(_ k: BannerKind) {
@@ -1310,11 +1687,11 @@ final class App: NSObject, NSApplicationDelegate {
         if tick % 4 == 0 { pollVolume() }          // 15Hz: volume changes from anywhere (keys, menu bar, headphones)
         if tick % 120 == 0 { pollBattery() }       // 2s
         if tick % 120 == 47 { pollMusic() }        // 2s, offset from battery
-        if let m = media, !m.playing, !demoMedia, shape != .expanded,
+        if let m = media, !m.playing, !demoMedia, demoActsN == nil, shape != .expanded,
            now.timeIntervalSince(lastPlayingAt) > 4 { media = nil }     // paused for a while: let it go
         if tick % 360 == 211 { pollAirPods() }     // 6s
 
-        if timer.started && !prevTimerStarted { pinned = true; haptic(.levelChange) }   // stopwatch started: open it
+        if timer.started && !prevTimerStarted { selected = .timer; pinned = true; haptic(.levelChange) }   // stopwatch started: open it
         prevTimerStarted = timer.started
         if timer.finished {                        // countdown just hit zero
             timer.reset()
@@ -1353,6 +1730,7 @@ final class App: NSObject, NSApplicationDelegate {
     }
 
     func applyAirPods(_ list: [AirPodsInfo]) {
+        airList = list
         if airBaseline {                             // the first poll only records what is already connected
             for d in list where !airKnown.contains(d.name) { showBanner(.airpods(symbol: d.symbol, level: d.level)) }
         }
@@ -1360,7 +1738,7 @@ final class App: NSObject, NSApplicationDelegate {
     }
 
     func pollMusic() {
-        guard !musicBusy, !demoMedia, ProcessInfo.processInfo.environment["NI_NOMEDIA"] == nil else { return }   // NI_NOMEDIA=1: test hook
+        guard !musicBusy, !demoMedia, demoActsN == nil, ProcessInfo.processInfo.environment["NI_NOMEDIA"] == nil else { return }   // NI_NOMEDIA=1: test hook
         musicBusy = true
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let r = queryNowPlaying()
@@ -1378,11 +1756,16 @@ final class App: NSObject, NSApplicationDelegate {
         defer { mediaBaseline = true }
         if r.playing { lastPlayingAt = Date() }
         // keep a paused track around for a while so it can be resumed from the island
-        guard r.playing || shape == .expanded || Date().timeIntervalSince(lastPlayingAt) < 4 else { media = nil; return }
+        // A paused track is only KEPT while it is already showing (so it can be resumed from the island).
+        // Once it has gone away it never comes back by itself: only playing again starts a new activity.
+        if !r.playing {
+            guard media != nil, shape == .expanded || Date().timeIntervalSince(lastPlayingAt) < 4 else { media = nil; return }
+        }
         let isNew = media == nil || media?.title != r.title
         media = r
         loadArtwork(for: r.storeID)
         if mediaBaseline && r.playing && isNew {     // playback just started / the track changed: open the card at once
+            selected = .media
             pinned = true
             haptic(.levelChange)
         }
@@ -1410,21 +1793,21 @@ final class App: NSObject, NSApplicationDelegate {
     func setText(_ f: NSTextField, _ s: String) { if f.stringValue != s { f.stringValue = s } }
 
     func refreshUI() {
+        syncActivities()
         let b = body
         c.body = b
+        c.ending = b == .none && acts.isEmpty
         c.bandH = (shape == .expanded || (shape == .collapsed && atRest)) ? notchH : notchH + 8
-        let (l, r) = wings()
-        c.left = l; c.right = r
+        view.earRight = !(shape != .expanded && acts.count == 2)       // 2 activities: the island ends flush with the notch
 
         // timer pieces
         let timeText = timer.text()
-        setText(c.wingTime, timeText)
         setText(c.tTime, timeText)
         setText(c.tLabel, timer.mode == .stopwatch ? "스톱워치" : "타이머")
         setSymbol(c.pauseB, timer.running ? "pause.fill" : "play.fill", 20)
 
         // banner
-        if let bn = banner {
+        if let bn = displayBanner {
             switch bn {
             case .battery(let title, let level, let color):
                 c.bannerIsAir = false
@@ -1469,30 +1852,100 @@ final class App: NSObject, NSApplicationDelegate {
         if let m = media {
             setText(c.titleL, m.title)
             setText(c.artistL, m.artist)
-            c.art.setImage(artwork); c.wingArt.setImage(artwork)
+            c.art.setImage(artwork)
             let e = m.elapsedNow
             setText(c.elapsedL, mmss(e))
             setText(c.remainL, m.duration > 0 ? "-" + mmss(m.duration - e) : "")
             c.progress.fraction = m.duration > 0 ? CGFloat(e / m.duration) : 0
             c.progress.isHidden = m.duration <= 0
             setSymbol(c.playB, m.playing ? "pause.fill" : "play.fill", 30)
-            for eq in [c.wingEq, c.bodyEq] { eq.color = artColor; eq.setPlaying(m.playing) }
+            c.bodyEq.color = artColor; c.bodyEq.setPlaying(m.playing)
         }
 
+        refreshSlots()
+        let plan = makePlan()
+        if plan != lastPlan { lastPlan = plan; placeSlots(plan) }
         c.needsLayout = true
         c.applyVisibility(expanded: shape == .expanded)
     }
 
+    /// Updates what the small slot views show.
+    func refreshSlots() {
+        if let m = media, let it = slotItems[.media], let art = it.icon as? ArtView, let eq = it.detail as? EqView {
+            art.setImage(artwork); eq.color = artColor; eq.setPlaying(m.playing)
+        }
+        if let it = slotItems[.timer], let l = it.detail as? NSTextField { setText(l, timer.text()) }
+        if let it = slotItems[.charging], let l = it.detail as? NSTextField { setText(l, "\(chargeLevel)%") }
+        if let it = slotItems[.lowBattery], let l = it.detail as? NSTextField {
+            setText(l, "\(lowLevel)%")
+            let col = lowLevel <= 10 ? bannerRed : accent
+            l.textColor = col; (it.icon as? NSImageView)?.contentTintColor = col
+        }
+        if let it = slotItems[.airpods], let d = airInfo, let ring = it.detail as? RingView, let icon = it.icon as? NSImageView {
+            ring.fraction = CGFloat(d.level ?? 0) / 100
+            if icon.toolTip != d.symbol {
+                icon.toolTip = d.symbol
+                icon.image = NSImage(systemSymbolName: d.symbol, accessibilityDescription: nil)?.withSymbolConfiguration(.init(pointSize: 17, weight: .semibold))
+            }
+        }
+    }
+
+    func fade(_ v: NSView, to a: CGFloat) {
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = a > 0 ? 0.28 : 0.35
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            v.animator().alphaValue = a
+        }
+    }
+
+    /// Hands the slot views to the windows that now show them; views that are no longer shown fade out.
+    func placeSlots(_ plan: Plan) {
+        var now: [NSView] = []
+        func use(_ v: NSView, in host: NSView) {
+            now.append(v)
+            if v.superview !== host { v.removeFromSuperview(); host.addSubview(v); v.alphaValue = 0 }
+            if v.alphaValue < 1 { fade(v, to: 1) }
+        }
+        if let lk = plan.left, let it = slotItems[lk] {
+            // a single activity: icon on the left, detail on the right. Several: the compact view (icon, or % for charging)
+            let v = plan.rightDetail ? (view: it.icon, size: CGSize(width: 24, height: 24)) : slotView(lk)
+            c.leftView = v.view; c.leftSize = v.size
+            use(v.view, in: c)
+        } else { c.leftView = nil }
+        if let rk = plan.right, let it = slotItems[rk] {
+            let v = plan.rightDetail ? (view: it.detail, size: it.detailSize) : slotView(rk)
+            c.rightView = v.view; c.rightSize = v.size
+            use(v.view, in: c)
+        } else { c.rightView = nil }
+        if let sk = plan.side { let v = slotView(sk); use(v.view, in: sideView); sideView.single = v } else { sideView.single = nil }
+        let pitems = plan.pill.compactMap { slotItems[$0] }
+        for it in pitems { use(it.icon, in: pillView); use(it.detail, in: pillView) }
+        pillView.items = pitems
+        let nowIDs = Set(now.map { ObjectIdentifier($0) })
+        let stale = usedViews.filter { !nowIDs.contains(ObjectIdentifier($0)) }
+        for v in stale { fade(v, to: 0) }
+        usedViews = now
+        if !stale.isEmpty {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                guard let s = self else { return }
+                let keep = Set(s.usedViews.map { ObjectIdentifier($0) })
+                for v in stale where !keep.contains(ObjectIdentifier(v)) { v.removeFromSuperview() }
+            }
+        }
+    }
+
     func desiredShape() -> Shape {
+        if !pinned { selected = nil }
         if pinned && !liveActivity && !forceOpen { pinned = false }   // nothing left to show
         if forceOpen || pinned || hudActive { return .expanded }
         if pressing || Date() < popUntil { return .pressed }
         if Date() < hoverUntil { return .peek }       // hovering only nudges it; a long press opens it
-        if media != nil || timer.started { return .activity }
+        if !acts.isEmpty { return .activity }
         return .collapsed
     }
 
     func applyShape() {
+        syncActivities()                             // the list must be current before deciding what is on screen
         let target = desiredShape()
         if target != shape {
             if target == .peek && shape != .pressed { haptic(.alignment) }   // light tick when the pointer arrives
@@ -1506,29 +1959,61 @@ final class App: NSObject, NSApplicationDelegate {
             default:        stiffness = 300; damping = 34
             }
         }
-        let size = frame(for: shape).size
-        if abs(size.width - tgtW) > 0.01 || abs(size.height - tgtH) > 0.01 {
-            tgtW = size.width; tgtH = size.height
-            atRest = false
-            link?.isPaused = false
+        var wake = false
+        let r = frame(for: shape)
+        if abs(r.minX - mainP.x.tgt) > 0.01 || abs(r.width - mainP.w.tgt) > 0.01 || abs(r.height - mainP.h.tgt) > 0.01 {
+            mainP.x.tgt = r.minX; mainP.w.tgt = r.width; mainP.h.tgt = r.height
+            wake = true
         }
+        if setTarget(sideP, sideRect(), ty: 0, anchorX: notchRight + sideGap) { wake = true }
+        let pr = pillRect()
+        if setTarget(pillP, pr?.0, ty: pr?.1 ?? compactH + pillGap, anchorX: screen.frame.midX) { wake = true }
+        if wake { atRest = false; link?.isPaused = false }
+    }
+
+    /// Points an auxiliary window at a rect, or (nil) makes it shrink back into its anchor. Returns true if anything changed.
+    func setTarget(_ p: Piece, _ r: NSRect?, ty: CGFloat, anchorX: CGFloat) -> Bool {
+        if let r = r {
+            var changed = false
+            if !p.active {                                    // appears: grows out of its anchor
+                p.active = true; changed = true
+                p.x.jump(anchorX); p.w.jump(0); p.h.jump(r.height); p.ty.jump(ty)
+                p.panel.alphaValue = 0
+                p.panel.orderFrontRegardless(); p.visible = true
+            }
+            if abs(p.x.tgt - r.minX) > 0.01 || abs(p.w.tgt - r.width) > 0.01 || abs(p.h.tgt - r.height) > 0.01 || abs(p.ty.tgt - ty) > 0.01 { changed = true }
+            p.x.tgt = r.minX; p.w.tgt = r.width; p.h.tgt = r.height; p.ty.tgt = ty; p.fullW = r.width
+            return changed
+        }
+        guard p.active else { return false }
+        p.active = false; p.x.tgt = anchorX; p.w.tgt = 0
+        return true
     }
 
     @objc func animTick(_ l: CADisplayLink) {
         let dt = min(max(l.targetTimestamp - l.timestamp, 1.0 / 240), 1.0 / 30)
         let steps = Int((dt * 240).rounded(.up)); let h = dt / CGFloat(steps)
-        for _ in 0..<steps {
-            velW += (-stiffness * (curW - tgtW) - damping * velW) * h
-            velH += (-stiffness * (curH - tgtH) - damping * velH) * h
-            curW += velW * h; curH += velH * h
+        var allSettled = true
+        for p in [mainP!, sideP!, pillP!] where p.active || p.visible {
+            let isMain = p === mainP
+            let k: CGFloat = isMain ? stiffness : 300, cd: CGFloat = isMain ? damping : 28
+            for _ in 0..<steps { p.x.step(h, k, cd); p.w.step(h, k, cd); p.h.step(h, k, cd); p.ty.step(h, k, cd) }
+            if isMain {
+                // Momentum from an interrupted move must never uncover the hardware notch.
+                if p.x.cur > notchLeft { p.x.cur = notchLeft; if p.x.vel > 0 { p.x.vel = 0 } }
+                if p.x.cur + p.w.cur < notchRight { p.w.cur = notchRight - p.x.cur; if p.w.vel < 0 { p.w.vel = 0 } }
+                if p.h.cur < notchH { p.h.cur = notchH; if p.h.vel < 0 { p.h.vel = 0 } }
+            }
+            if p.settled { p.snap() } else { allSettled = false }
+            if !p.active && p.settled && p.w.cur < 1.5 {          // shrunk away: take the window off screen
+                p.panel.orderOut(nil); p.visible = false; p.w.jump(0)
+                continue
+            }
+            if !isMain { p.panel.alphaValue = p.fullW > 0 ? min(1, max(0, p.w.cur / p.fullW)) : 0 }
+            p.panel.setFrame(NSRect(x: p.x.cur, y: screen.frame.maxY - p.ty.cur - p.h.cur, width: max(p.w.cur, 1), height: max(p.h.cur, 1)), display: true)
         }
-        // Momentum from an interrupted expansion must never carry either edge inside the hardware notch.
-        if curW < notchW { curW = notchW; if velW < 0 { velW = 0 } }
-        if curH < notchH { curH = notchH; if velH < 0 { velH = 0 } }
-        if abs(curW - tgtW) < 0.1 && abs(curH - tgtH) < 0.1 && abs(velW) < 2 && abs(velH) < 2 {
-            curW = tgtW; curH = tgtH; velW = 0; velH = 0; l.isPaused = true; atRest = true
-        }
-        panel.setFrame(NSRect(x: screen.frame.midX - curW / 2, y: screen.frame.maxY - curH, width: curW, height: curH), display: true)
+        atRest = mainP.settled
+        if allSettled { l.isPaused = true }
     }
 }
 
