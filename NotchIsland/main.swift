@@ -1583,6 +1583,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var battery: Battery?
     var banner: BannerKind?
     // live activities, oldest first; at most 5 are shown (the oldest are dropped first)
+    var chargeShownUntil = Date.distantPast       // the charging activity shows for 3s after the charger is connected, then goes
     var actOrder: [ActKind] = []
     var selected: ActKind?                     // which activity the expanded card shows
     var pressKind: ActKind?
@@ -1640,7 +1641,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         switch k {
         case .media: return media != nil
         case .timer: return timer.started
-        case .charging:   return demoActsN != nil ? demoKinds.contains(k) : (battery?.plugged == true && battery?.charging == true)
+        case .charging:   return demoActsN != nil ? demoKinds.contains(k) : (battery?.plugged == true && battery?.charging == true && Date() < chargeShownUntil)   // only the first 3s after plugging in
         case .lowBattery: return demoActsN != nil ? demoKinds.contains(k) : (battery?.plugged == false && (battery?.level ?? 100) <= 20)
         case .airpods:    return demoActsN != nil && demoKinds.contains(k)       // real AirPods only show a banner when they connect
         case .file(let u): return files.contains(u)
@@ -2020,7 +2021,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let dropped: ([URL]) -> Void = { [weak self] urls in
             guard let s = self else { return }
             s.fileAdd(urls)
-            if let last = urls.last(where: { s.files.contains($0) }) { s.selected = .file(last); s.pinned = true }   // show what was dropped
+            if let last = urls.last(where: { s.files.contains($0) }) { s.selected = .file(last) }   // the new file activity appears quietly
         }
         view.onDrop = dropped
         view.onScroll = { [weak self] e in self?.handleScroll(e) }
@@ -2492,7 +2493,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
            now.timeIntervalSince(lastPlayingAt) > 4 { media = nil }     // paused for a while: let it go
         if tick % 360 == 211 { pollAirPods() }     // 6s
 
-        if timer.started && !prevTimerStarted { selected = .timer; pinned = true; haptic(.levelChange) }   // stopwatch started: open it
+        
         prevTimerStarted = timer.started
         if timer.finished {                        // countdown just hit zero
             timer.reset()
@@ -2509,15 +2510,16 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         defer { battery = b }
         guard let old = battery else { return }
         if b.plugged != old.plugged {
-            showBanner(.battery(title: b.plugged ? "충전 중" : "충전 해제", level: b.level, color: b.plugged ? bannerGreen : .white))
+            if b.plugged { chargeShownUntil = Date().addingTimeInterval(3) }
+            if !b.plugged { showBanner(.battery(title: "충전 해제", level: b.level, color: .white)) }     // plugging in: the charging activity just appears, quietly
             notifiedFull = false
         }
         if b.plugged {
             warned20 = false; warned10 = false
             if isFull(b) && !notifiedFull { notifiedFull = true; showBanner(.battery(title: "충전 완료", level: b.level, color: bannerGreen)) }
         } else {
-            if b.level <= 10 && !warned10 { warned10 = true; warned20 = true; showBanner(.battery(title: "배터리 부족", level: b.level, color: bannerRed)) }
-            else if b.level <= 20 && !warned20 { warned20 = true; showBanner(.battery(title: "배터리 부족", level: b.level, color: accent)) }
+            if b.level <= 10 && !warned10 { warned10 = true; warned20 = true }          // the low-battery activity appears by itself, quietly
+            else if b.level <= 20 && !warned20 { warned20 = true }
         }
     }
 
@@ -2566,11 +2568,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let started = media == nil                   // playback just started (a track change alone never opens the card)
         media = r
         loadArtwork(for: r.storeID)
-        if mediaBaseline && r.playing && started {   // playback just started: open the card at once
-            selected = .media
-            pinned = true
-            haptic(.levelChange)
-        }
+        _ = started                                  // a new music activity appears quietly: it never opens the card by itself
     }
 
     func loadArtwork(for id: String) {
