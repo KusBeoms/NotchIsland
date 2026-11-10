@@ -1,4 +1,5 @@
 import AppKit
+import Accelerate
 import AudioToolbox
 import CoreAudio
 import IOKit.ps
@@ -226,6 +227,19 @@ func sendMediaCommand(_ cmd: Int) {
         ObjC.import("Foundation");
         $.NSBundle.bundleWithPath("/System/Library/PrivateFrameworks/MediaRemote.framework/").load;
         $.NSClassFromString("MRNowPlayingController").localRouteController.sendCommandOptionsCompletion(\(cmd), $(), null);
+        delay(0.2);
+        "";
+        """)
+    }
+}
+
+/// Jumps the playing track to `seconds` (MediaRemote command 24, "seek to playback position").
+func sendMediaSeek(_ seconds: Double) {
+    DispatchQueue.global(qos: .userInitiated).async {
+        _ = runJXA("""
+        ObjC.import("Foundation");
+        $.NSBundle.bundleWithPath("/System/Library/PrivateFrameworks/MediaRemote.framework/").load;
+        $.NSClassFromString("MRNowPlayingController").localRouteController.sendCommandOptionsCompletion(24, $({kMRMediaRemoteOptionPlaybackPosition: \(seconds)}), null);
         delay(0.2);
         "";
         """)
@@ -490,29 +504,171 @@ final class ArtView: NSView {
     }
 }
 
-/// Four animated bars (the "now playing" equalizer).
+/// Real-time spectrum of whatever the Mac is playing: a global Core Audio process tap (macOS 14.2+; needs the
+/// "system audio recording" permission, NOT screen recording) feeds a 1024-point FFT, folded into four bands.
+final class AudioLevels {
+    static let shared = AudioLevels()
+    private(set) var bands = [Float](repeating: 0, count: 5)
+    private(set) var failed = false               // the tap could not be set up at all (permission missing / unsupported)
+    private var watchdog: DispatchSourceTimer?
+    private var outputListener: AudioObjectPropertyListenerBlock?
+    private(set) var live = false                 // true once audio blocks actually arrive
+    private var lastBlock = CFAbsoluteTimeGetCurrent() - 100
+    private var tap = AudioObjectID(kAudioObjectUnknown), agg = AudioObjectID(kAudioObjectUnknown)
+    private var proc: AudioDeviceIOProcID?
+    private let n = 1024
+    private var ring = [Float](repeating: 0, count: 1024), fill = 0
+    private var peaks = [Float](repeating: 0.0001, count: 5)
+    private lazy var fft = vDSP.FFT(log2n: 10, radix: .radix2, ofType: DSPSplitComplex.self)
+    private let q = DispatchQueue(label: "ni.audio", qos: .userInteractive)
+    private var nap: NSObjectProtocol?                  // keeps macOS from throttling the app (App Nap) while the island is collapsed
+    private var users = 0
+    private let debugAudio = ProcessInfo.processInfo.environment["NI_DEBUG"] != nil
+    private var lastPrint = 0.0
+
+    var fresh: Bool { CFAbsoluteTimeGetCurrent() - lastBlock < 1.0 }
+
+    func retain() { q.async { self.users += 1; if self.users == 1 { self.begin() } } }
+    func release() { q.async { self.users -= 1; if self.users == 0 { self.end() } } }
+
+    /// The tap is tied to the output device it was built on: when the output changes (AirPods connect, a Bluetooth profile switch,
+    /// the sample rate changes...) it goes silent. So rebuild it on every change, and whenever blocks stop arriving.
+    private func begin() {
+        start()
+        var a = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultSystemOutputDevice,
+                                           mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        let l: AudioObjectPropertyListenerBlock = { [weak self] _, _ in self?.restart() }
+        outputListener = l
+        AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &a, q, l)
+        let t = DispatchSource.makeTimerSource(queue: q)
+        t.schedule(deadline: .now() + 2, repeating: 1.0)
+        t.setEventHandler { [weak self] in
+            guard let s = self, s.users > 0, !s.failed, CFAbsoluteTimeGetCurrent() - s.lastBlock > 2.0, CFAbsoluteTimeGetCurrent() - s.startedAt > 2.0 else { return }
+            s.restart()
+        }
+        t.resume(); watchdog = t
+    }
+    private func end() {
+        watchdog?.cancel(); watchdog = nil
+        if let l = outputListener {
+            var a = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultSystemOutputDevice,
+                                               mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+            AudioObjectRemovePropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &a, q, l); outputListener = nil
+        }
+        stop()
+    }
+    func debugStall() { q.async { if let p = self.proc { AudioDeviceStop(self.agg, p) } } }     // test hook: the tap silently dies
+    private func restart() { guard users > 0 else { return }; stop(); start() }
+    private var startedAt = CFAbsoluteTimeGetCurrent()
+
+    private func start() {
+        nap = ProcessInfo.processInfo.beginActivity(options: [.userInitiatedAllowingIdleSystemSleep, .latencyCritical], reason: "audio equalizer")
+        guard #available(macOS 14.2, *), ProcessInfo.processInfo.environment["NI_NOAUDIO"] == nil else { return }
+        startedAt = CFAbsoluteTimeGetCurrent(); lastBlock = startedAt
+        failed = false
+        let desc = CATapDescription(monoGlobalTapButExcludeProcesses: [])
+        desc.uuid = UUID(); desc.muteBehavior = .unmuted; desc.isPrivate = true
+        guard AudioHardwareCreateProcessTap(desc, &tap) == noErr else { failed = true; return }
+        var outUID: String?
+        var dev = AudioObjectID(kAudioObjectUnknown), sz = UInt32(MemoryLayout<AudioObjectID>.size)
+        var a = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultSystemOutputDevice,
+                                           mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        if AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &a, 0, nil, &sz, &dev) == noErr {
+            var uid: Unmanaged<CFString>?; var s2 = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+            var b = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyDeviceUID,
+                                               mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+            if AudioObjectGetPropertyData(dev, &b, 0, nil, &s2, &uid) == noErr { outUID = uid?.takeRetainedValue() as String? }
+        }
+        var d: [String: Any] = [
+            kAudioAggregateDeviceNameKey: "NotchIsland tap",
+            kAudioAggregateDeviceUIDKey: "com.kusbeoms.notchisland.tap.\(desc.uuid.uuidString)",
+            kAudioAggregateDeviceIsPrivateKey: true,
+            kAudioAggregateDeviceTapAutoStartKey: true,
+            kAudioAggregateDeviceTapListKey: [[kAudioSubTapUIDKey: desc.uuid.uuidString, kAudioSubTapDriftCompensationKey: true]]]
+        if let u = outUID { d[kAudioAggregateDeviceMainSubDeviceKey] = u; d[kAudioAggregateDeviceSubDeviceListKey] = [[kAudioSubDeviceUIDKey: u]] }
+        guard AudioHardwareCreateAggregateDevice(d as CFDictionary, &agg) == noErr else { stop(); failed = true; return }
+        let st = AudioDeviceCreateIOProcIDWithBlock(&proc, agg, q) { [weak self] _, inData, _, _, _ in
+            self?.consume(inData)
+        }
+        guard st == noErr, let p = proc, AudioDeviceStart(agg, p) == noErr else { stop(); failed = true; return }
+    }
+
+    private func stop() {
+        if let n = nap { ProcessInfo.processInfo.endActivity(n); nap = nil }
+        if let p = proc { AudioDeviceStop(agg, p); AudioDeviceDestroyIOProcID(agg, p); proc = nil }
+        if agg != kAudioObjectUnknown { AudioHardwareDestroyAggregateDevice(agg); agg = AudioObjectID(kAudioObjectUnknown) }
+        if tap != kAudioObjectUnknown, #available(macOS 14.2, *) { AudioHardwareDestroyProcessTap(tap); tap = AudioObjectID(kAudioObjectUnknown) }
+        bands = [0, 0, 0, 0, 0]; live = false; fill = 0
+    }
+
+    private func consume(_ list: UnsafePointer<AudioBufferList>) {
+        let abl = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: list))
+        guard let b = abl.first, let raw = b.mData else { return }
+        let ch = max(1, Int(b.mNumberChannels)), frames = Int(b.mDataByteSize) / (4 * ch)
+        let x = raw.assumingMemoryBound(to: Float.self)
+        for i in 0..<frames {
+            var v: Float = 0
+            for c in 0..<ch { v += x[i * ch + c] }
+            ring.removeFirst(); ring.append(v / Float(ch))
+        }
+        fill = min(n, fill + frames)
+        lastBlock = CFAbsoluteTimeGetCurrent(); live = true
+        analyse()
+    }
+
+    private func analyse() {
+        guard let fft else { return }
+        var win = [Float](repeating: 0, count: n)
+        vDSP.multiply(ring, vDSP.window(ofType: Float.self, usingSequence: .hanningDenormalized, count: n, isHalfWindow: false), result: &win)
+        var re = [Float](repeating: 0, count: n / 2), im = [Float](repeating: 0, count: n / 2)
+        var mags = [Float](repeating: 0, count: n / 2)
+        re.withUnsafeMutableBufferPointer { rp in im.withUnsafeMutableBufferPointer { ip in
+            var sp = DSPSplitComplex(realp: rp.baseAddress!, imagp: ip.baseAddress!)
+            win.withUnsafeBufferPointer { w in
+                w.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: n / 2) { vDSP_ctoz($0, 2, &sp, 1, vDSP_Length(n / 2)) }
+            }
+            fft.forward(input: sp, output: &sp)
+            vDSP.absolute(sp, result: &mags)
+        } }
+        let hz = Float(48000) / Float(n)                       // good enough: 44.1k/48k differ by under 9%
+        let edges: [Float] = [40, 150, 500, 1600, 5000, 13000]
+        var out = [Float](repeating: 0, count: 5)
+        for k in 0..<5 {
+            let lo = max(1, Int(edges[k] / hz)), hi = min(n / 2 - 1, Int(edges[k + 1] / hz))
+            guard hi > lo else { continue }
+            let e = vDSP.mean(Array(mags[lo...hi]))
+            peaks[k] = max(e, peaks[k] * 0.995)                // slow auto-gain: lively at any volume
+            out[k] = peaks[k] > 0.001 ? min(1, pow(e / peaks[k], 0.8)) : 0
+        }
+        bands = out
+        if debugAudio, CFAbsoluteTimeGetCurrent() - lastPrint > 0.5 { lastPrint = CFAbsoluteTimeGetCurrent(); FileHandle.standardError.write("bands \(out)\n".data(using: .utf8)!) }
+    }
+}
+
+/// Five bars that dance to the real audio (falls back to a canned loop when no audio can be tapped).
 final class EqView: NSView {
     private var bars: [CALayer] = []
-    private var animating = false
+    private var animating = false, fake = false
+    private var timer: Timer?, quietSince: CFAbsoluteTime?
+    private var levels: [CGFloat] = [CGFloat](repeating: 0.3, count: 5)
     var color: NSColor = accent { didSet { bars.forEach { $0.backgroundColor = color.cgColor } } }
     init() {
         super.init(frame: .zero)
         wantsLayer = true
-        for _ in 0..<4 {
+        for _ in 0..<5 {
             let l = CALayer()
             l.backgroundColor = color.cgColor
-            l.cornerRadius = 1.5
+            l.cornerRadius = 1
             l.anchorPoint = CGPoint(x: 0.5, y: 0)
             l.transform = CATransform3DMakeScale(1, 0.3, 1)
             layer?.addSublayer(l)
             bars.append(l)
         }
-        setPlaying(false)
     }
     required init?(coder: NSCoder) { fatalError() }
     override func layout() {
         super.layout()
-        let bw: CGFloat = 3, gap = (bounds.width - bw * 4) / 3
+        let bw: CGFloat = 2.5, gap = (bounds.width - bw * 5) / 4
         CATransaction.begin(); CATransaction.setDisableActions(true)
         for (i, l) in bars.enumerated() {
             l.bounds = CGRect(x: 0, y: 0, width: bw, height: bounds.height)
@@ -520,33 +676,73 @@ final class EqView: NSView {
         }
         CATransaction.commit()
     }
+    deinit { if animating { AudioLevels.shared.release() }; timer?.invalidate() }
+
     func setPlaying(_ p: Bool) {
-        guard p != animating || bars.first?.animationKeys() == nil && p else { return }
+        if p == animating { return }
+        dlog("EQ \(ObjectIdentifier(self).hashValue % 9973) setPlaying(\(p))")
         animating = p
+        if p {
+            AudioLevels.shared.retain()
+            let t = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in self?.tick() }
+            RunLoop.main.add(t, forMode: .common); timer = t
+        } else {
+            AudioLevels.shared.release()
+            timer?.invalidate(); timer = nil
+            setFake(false)
+            glide(to: [CGFloat](repeating: 0.3, count: 5), rate: 0.25)
+        }
+    }
+
+    private func tick() {
+        guard animating else { return }
+        let a = AudioLevels.shared
+        if a.fresh {
+            setFake(false)
+            glide(to: a.bands.map { 0.18 + 0.82 * CGFloat($0) }, rate: 0.55)
+            quietSince = nil
+        } else {
+            let now = CFAbsoluteTimeGetCurrent()
+            if quietSince == nil { quietSince = now }
+            if a.failed, now - quietSince! > 1.0 { setFake(true) }
+            else if !a.failed { glide(to: [CGFloat](repeating: 0.18, count: 5), rate: 0.3) }     // restarting the tap: rest, never a canned loop       // still no audio tap after a while (permission missing / unsupported): canned bounce
+        }
+    }
+
+    /// Eases the bars to `target`; fast on the way up and slower on the way down, like a real meter.
+    private func glide(to target: [CGFloat], rate: CGFloat) {
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        for i in 0..<5 {
+            let up = target[i] > levels[i]
+            levels[i] += (target[i] - levels[i]) * (up ? rate : rate * 0.45)
+            bars[i].transform = CATransform3DMakeScale(1, max(0.12, min(1, levels[i])), 1)
+        }
+        CATransaction.commit()
+    }
+
+    private func setFake(_ on: Bool) {
+        guard on != fake else { return }
+        fake = on
+        dlog("EQ \(ObjectIdentifier(self).hashValue % 9973) setFake(\(on))")
         for (i, l) in bars.enumerated() {
-            let current = (l.presentation()?.value(forKeyPath: "transform.scale.y") as? NSNumber)?.doubleValue ?? 0.3
             l.removeAllAnimations()
-            if p {
-                let a = CABasicAnimation(keyPath: "transform.scale.y")
-                a.fromValue = current; a.toValue = 1.0
-                a.duration = 0.42 + Double(i) * 0.11
-                a.autoreverses = true; a.repeatCount = .infinity
-                a.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-                a.timeOffset = Double(i) * 0.13
-                l.add(a, forKey: "eq")
-            } else {
-                l.transform = CATransform3DMakeScale(1, 0.3, 1)
-                let a = CABasicAnimation(keyPath: "transform.scale.y")
-                a.fromValue = current; a.toValue = 0.3
-                a.duration = 0.25; a.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-                l.add(a, forKey: "settle")
-            }
+            guard on else { continue }
+            let a = CABasicAnimation(keyPath: "transform.scale.y")
+            a.fromValue = 0.3; a.toValue = 1.0
+            a.duration = 0.42 + Double(i) * 0.11
+            a.autoreverses = true; a.repeatCount = .infinity
+            a.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            a.timeOffset = Double(i) * 0.13
+            l.add(a, forKey: "eq")
         }
     }
 }
 
 final class ProgressBar: NSView {
-    private let fill = CALayer()
+    private let track = CALayer(), fill = CALayer()
+    private static let lineH: CGFloat = 4
+    /// Called while the pointer scrubs (final == false) and when it lets go (final == true), with the position 0...1.
+    var onScrub: ((CGFloat, Bool) -> Void)?
     var fraction: CGFloat = 0 {
         didSet {
             guard fraction != oldValue else { return }
@@ -561,19 +757,30 @@ final class ProgressBar: NSView {
     init() {
         super.init(frame: .zero)
         wantsLayer = true
-        layer?.backgroundColor = NSColor(white: 1, alpha: 0.2).cgColor
-        layer?.cornerRadius = 2.5
+        track.backgroundColor = NSColor(white: 1, alpha: 0.2).cgColor
+        track.cornerRadius = ProgressBar.lineH / 2
         fill.backgroundColor = NSColor(white: 1, alpha: 0.9).cgColor
-        fill.cornerRadius = 2.5
-        layer?.addSublayer(fill)
+        fill.cornerRadius = ProgressBar.lineH / 2
+        layer?.addSublayer(track); layer?.addSublayer(fill)
     }
     required init?(coder: NSCoder) { fatalError() }
     override func layout() { super.layout(); relayout() }
     private func relayout() {
         CATransaction.begin(); CATransaction.setDisableActions(true)
-        fill.frame = CGRect(x: 0, y: 0, width: bounds.width * min(max(fraction, 0), 1), height: bounds.height)
+        let y = (bounds.height - ProgressBar.lineH) / 2
+        track.frame = CGRect(x: 0, y: y, width: bounds.width, height: ProgressBar.lineH)
+        fill.frame = CGRect(x: 0, y: y, width: bounds.width * min(max(fraction, 0), 1), height: ProgressBar.lineH)
         CATransaction.commit()
     }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    private func scrub(_ e: NSEvent, final: Bool) {
+        let f = min(max(convert(e.locationInWindow, from: nil).x / max(bounds.width, 1), 0), 1)
+        fraction = f
+        onScrub?(f, final)
+    }
+    override func mouseDown(with event: NSEvent) { scrub(event, final: false) }
+    override func mouseDragged(with event: NSEvent) { scrub(event, final: false) }
+    override func mouseUp(with event: NSEvent) { scrub(event, final: true) }
 }
 
 /// Pill-shaped battery with a coloured fill (like the iPhone charging banner).
@@ -802,6 +1009,23 @@ final class DialView: NSView {
     }
     required init?(coder: NSCoder) { fatalError() }
     override func layout() { super.layout(); relayout() }
+
+    /// Click and drag on the ticks turns the wheel: (pointer movement in points, phase 0 = down, 1 = move, 2 = up).
+    var onDrag: ((CGFloat, Int) -> Void)?
+    override func hitTest(_ p: NSPoint) -> NSView? {
+        let b = geometry.body
+        guard alphaValue > 0.3, !isHidden, p.y < b.minY + 2, p.y > b.minY - DialView.bulge - 14,
+              p.x > b.minX - 24, p.x < b.maxX + 24 else { return nil }
+        return self
+    }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    private var lastX: CGFloat = 0
+    override func mouseDown(with event: NSEvent) { lastX = event.locationInWindow.x; onDrag?(0, 0) }
+    override func mouseDragged(with event: NSEvent) {
+        let x = event.locationInWindow.x
+        onDrag?(x - lastX, 1); lastX = x
+    }
+    override func mouseUp(with event: NSEvent) { onDrag?(0, 2) }
 
     /// Moves the wheel to `t` (in activities). A finger turning it sets it directly; otherwise it springs there.
     func set(_ t: CGFloat, animated: Bool) {
@@ -1142,7 +1366,7 @@ final class Content: Flip {
         titleL.frame = NSRect(x: tx, y: top + 4, width: tw, height: 20)
         artistL.frame = NSRect(x: tx, y: top + 25, width: tw, height: 18)
         bodyEq.frame = NSRect(x: w - pad - 20, y: top + 6, width: 20, height: 20)
-        progress.frame = NSRect(x: pad, y: top + 56, width: w - 2 * pad, height: 4)
+        progress.frame = NSRect(x: pad, y: top + 50, width: w - 2 * pad, height: 16)      // a taller hit area around the 4pt line
         elapsedL.frame = NSRect(x: pad, y: top + 62, width: 60, height: 14)
         remainL.frame = NSRect(x: w - pad - 60, y: top + 62, width: 60, height: 14)
         let cy = top + 76
@@ -1289,9 +1513,9 @@ final class IslandView: FileDragView {
         let here = convert(point, from: sv)
         let strip = NSRect(x: 0, y: 0, width: bounds.width, height: bottomInset + 6)      // the dial, just under the island
         guard bodyRect.contains(here) || (bottomInset > 0 && strip.contains(here)) else { return nil }
-        guard bodyRect.contains(here) else { return self }
+        guard bodyRect.contains(here) else { return dial.hitTest(here) ?? self }
         let p = content.convert(here, from: self)
-        for v in content.subviews.reversed() where (v is NSButton || v is LevelBar) && !v.isHidden && v.alphaValue > 0.3 {
+        for v in content.subviews.reversed() where (v is NSButton || v is LevelBar || v is ProgressBar) && !v.isHidden && v.alphaValue > 0.3 {
             if v.frame.contains(p) { return v }
         }
         return self
@@ -1466,20 +1690,76 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// is a little magnet, the long ticks (the running activities) also tap the trackpad, and when it stops it settles on the
     /// nearest activity.
     func handleScroll(_ e: NSEvent) {
-        guard shape == .expanded, dialShown, e.hasPreciseScrollingDeltas,
-              e.locationInWindow.y < view.bottomInset + 66 else { return }               // over the dial, or the foot of the card
+        guard e.hasPreciseScrollingDeltas, abs(e.scrollingDeltaX) > abs(e.scrollingDeltaY) else { return }   // sideways swipes only
+        let finger = e.isDirectionInvertedFromDevice ? e.scrollingDeltaX : -e.scrollingDeltaX     // fingers moving left < 0
+        if hudActive {                                                       // volume / brightness HUD: sideways = the slider
+            hudDragged(min(1, max(0, hudValue + Float(finger) / 400)))
+            return
+        }
+        guard shape == .expanded else { return }
+        guard dialShown, e.locationInWindow.y < view.bottomInset + 66 else {           // on the card itself
+            if cardKind == .media, let m = media, m.duration > 0 { scrubBy(finger / 450, m) }
+            return
+        }
         let now = Date()
         let fresh = e.phase == .began || e.phase == .mayBegin || now.timeIntervalSince(lastScrollAt) > 0.3
         if fresh { dialPos = view.dial.position; dialLastTick = Int((dialPos * CGFloat(DialView.perMajor)).rounded()) }
         lastScrollAt = now
         holdH = max(holdH, mainP.h.cur, mainP.h.tgt)
-        let finger = e.isDirectionInvertedFromDevice ? e.scrollingDeltaX : -e.scrollingDeltaX     // fingers moving left < 0
         let unit = DialView.gap * CGFloat(DialView.perMajor)
-        dialPos -= finger / (unit * 0.9)                                                       // fingers left: on to the next (and round again)
+        dialPos -= finger / (unit * 1.9)                                                       // fingers left: on to the next (and round again); a gentle ratio
         turnDial()
         dialSettle?.invalidate()
         let t = Timer(timeInterval: 0.14, repeats: false) { [weak self] _ in self?.settleDial() }   // no more events (or momentum): settle
         RunLoop.main.add(t, forMode: .common); dialSettle = t
+    }
+
+    /// Click and drag on the dial's ticks: the ticks follow the pointer one to one.
+    func dialDragged(_ dx: CGFloat, _ phase: Int) {
+        guard shape == .expanded, dialShown else { return }
+        lastScrollAt = Date()
+        switch phase {
+        case 0:
+            dialSettle?.invalidate()
+            dialPos = view.dial.position; dialLastTick = Int((dialPos * CGFloat(DialView.perMajor)).rounded())
+            holdH = max(holdH, mainP.h.cur, mainP.h.tgt)
+        case 1:
+            dialPos -= dx / (DialView.gap * CGFloat(DialView.perMajor))
+            turnDial()
+        default:
+            settleDial()
+        }
+    }
+
+    // MARK: seeking (progress bar drag, or sideways scrolling on the music card)
+    var seekFraction: CGFloat?                  // where the user has put the playhead, until it is committed
+    var seekHoldUntil = Date.distantPast        // right after a seek the poll still reports the old position: ignore it
+    var seekTimer: Timer?
+
+    func scrubBy(_ d: CGFloat, _ m: Media) {
+        let base = seekFraction ?? CGFloat(m.elapsedNow / m.duration)
+        seekFraction = min(1, max(0, base + d))
+        refreshUI()
+        seekTimer?.invalidate()
+        let t = Timer(timeInterval: 0.3, repeats: false) { [weak self] _ in self?.commitSeek() }
+        RunLoop.main.add(t, forMode: .common); seekTimer = t
+    }
+
+    func scrubbed(_ f: CGFloat, final: Bool) {
+        seekTimer?.invalidate()
+        seekFraction = f
+        if final { commitSeek() } else { refreshUI() }
+    }
+
+    func commitSeek() {
+        seekTimer?.invalidate()
+        guard let f = seekFraction, var m = media, m.duration > 0 else { seekFraction = nil; return }
+        let pos = Double(f) * m.duration
+        sendMediaSeek(pos)
+        m.elapsed = pos; m.readAt = Date(); media = m
+        seekFraction = nil
+        seekHoldUntil = Date().addingTimeInterval(1.5)
+        refreshUI()
     }
 
     /// Shows the wheel where the fingers have it, pulled towards the nearest tick like a detent, and follows it with the card.
@@ -1714,6 +1994,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if ProcessInfo.processInfo.environment["NI_TEST_SIGNALS"] != nil {     // test hook: simulate the sensor
             signal(SIGUSR1, SIG_IGN); signal(SIGUSR2, SIG_IGN); signal(SIGWINCH, SIG_IGN); signal(SIGURG, SIG_IGN)
+            signal(SIGHUP, SIG_IGN)
+            let stallSrc = DispatchSource.makeSignalSource(signal: SIGHUP, queue: .main)     // SIGHUP = kill the audio tap silently (test hook)
+            stallSrc.setEventHandler { AudioLevels.shared.debugStall() }
+            stallSrc.resume(); signalSources.append(stallSrc)
             let hudSrc = DispatchSource.makeSignalSource(signal: SIGURG, queue: .main)     // SIGURG = pop a brightness HUD (test hook)
             hudSrc.setEventHandler { [weak self] in self?.showHUD(.brightness, 0.6, seconds: 1.8) }
             hudSrc.resume(); signalSources.append(hudSrc)
@@ -1748,6 +2032,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         c.fRevealB.target = self; c.fRevealB.action = #selector(revealFileTapped)
         c.fRemoveB.target = self; c.fRemoveB.action = #selector(removeFileTapped)
         c.hBar.onChange = { [weak self] v in self?.hudDragged(v) }
+        c.progress.onScrub = { [weak self] f, final in self?.scrubbed(f, final: final) }
+        view.dial.onDrag = { [weak self] dx, ph in self?.dialDragged(dx, ph) }
         view.onOpenSource = { [weak self] in self?.openSourceApp() }
         setupStatusItem()
         keyTap.onKey = { [weak self] code, down, fine in self?.handleMediaKey(code, down, fine) ?? false }
@@ -2269,6 +2555,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .media(let m): r = m
         }
         defer { mediaBaseline = true }
+        if Date() < seekHoldUntil, case .media(let n) = result, media != nil, n.title == media?.title { return }   // stale position right after a seek
         if r.playing { lastPlayingAt = Date() }
         // keep a paused track around for a while so it can be resumed from the island
         // A paused track is only KEPT while it is already showing (so it can be resumed from the island).
@@ -2399,7 +2686,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             setText(c.titleL, m.title)
             setText(c.artistL, m.artist)
             c.art.setImage(artwork)
-            let e = m.elapsedNow
+            let e = seekFraction.map { Double($0) * m.duration } ?? m.elapsedNow
             setText(c.elapsedL, mmss(e))
             setText(c.remainL, m.duration > 0 ? "-" + mmss(m.duration - e) : "")
             c.progress.fraction = m.duration > 0 ? CGFloat(e / m.duration) : 0
