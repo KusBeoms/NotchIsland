@@ -221,8 +221,9 @@ func queryNowPlaying() -> PollResult {
 }
 
 /// MediaRemote command ids: 2 toggle play/pause, 4 next, 5 previous.
+private let mediaCommandQueue = DispatchQueue(label: "ni.mediacmd", qos: .userInitiated)   // serial: quick taps never run osascript in parallel
 func sendMediaCommand(_ cmd: Int) {
-    DispatchQueue.global(qos: .userInitiated).async {
+    mediaCommandQueue.async {
         _ = runJXA("""
         ObjC.import("Foundation");
         $.NSBundle.bundleWithPath("/System/Library/PrivateFrameworks/MediaRemote.framework/").load;
@@ -235,7 +236,7 @@ func sendMediaCommand(_ cmd: Int) {
 
 /// Jumps the playing track to `seconds` (MediaRemote command 24, "seek to playback position").
 func sendMediaSeek(_ seconds: Double) {
-    DispatchQueue.global(qos: .userInitiated).async {
+    mediaCommandQueue.async {
         _ = runJXA("""
         ObjC.import("Foundation");
         $.NSBundle.bundleWithPath("/System/Library/PrivateFrameworks/MediaRemote.framework/").load;
@@ -281,7 +282,7 @@ enum BannerKind {
 // MARK: - Volume / brightness (read, set) and the media keys that drive them
 
 enum SystemLevels {
-    private static func outputDevice() -> AudioObjectID? {
+    static func outputDevice() -> AudioObjectID? {
         var dev = AudioObjectID(0); var sz = UInt32(MemoryLayout<AudioObjectID>.size)
         var a = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
                                            mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
@@ -410,16 +411,42 @@ func averageColor(_ img: NSImage) -> NSColor {
     return NSColor(hue: h, saturation: max(s, 0.45), brightness: max(b, 0.9), alpha: 1)   // keep it readable on black
 }
 
+private let artworkScript = """
+ObjC.import("Foundation");
+$.NSBundle.bundleWithPath("/System/Library/PrivateFrameworks/MediaRemote.framework/").load;
+var out = "";
+var req = $.NSClassFromString("MRNowPlayingRequest");
+if (req) {
+  var item = req.localNowPlayingItem;
+  if (item && !item.isNil()) {
+    try {
+      var d = item.nowPlayingInfo.objectForKey("kMRMediaRemoteNowPlayingInfoArtworkData");
+      if (d && !d.isNil()) out = ObjC.unwrap(d.base64EncodedStringWithOptions(0));
+    } catch (e) {}
+  }
+}
+out;
+"""
+
+/// The cover art of whatever is playing, as the player itself hands it over (no store id needed).
+func queryArtworkData() -> NSImage? {
+    let s = runJXA(artworkScript)
+    guard !s.isEmpty, let d = Data(base64Encoded: s, options: .ignoreUnknownCharacters) else { return nil }
+    return NSImage(data: d)
+}
+
 func fetchArtwork(storeID: String, completion: @escaping (NSImage?) -> Void) {
     let region = Locale.current.region?.identifier ?? "US"
     guard let url = URL(string: "https://itunes.apple.com/lookup?id=\(storeID)&country=\(region)") else { completion(nil); return }
-    URLSession.shared.dataTask(with: url) { data, _, _ in
+    var req = URLRequest(url: url); req.timeoutInterval = 8
+    URLSession.shared.dataTask(with: req) { data, _, _ in
         guard let data = data,
               let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let r = (j["results"] as? [[String: Any]])?.first,
               let u100 = r["artworkUrl100"] as? String,
               let imgURL = URL(string: u100.replacingOccurrences(of: "100x100bb", with: "300x300bb")) else { completion(nil); return }
-        URLSession.shared.dataTask(with: imgURL) { d2, _, _ in completion(d2.flatMap { NSImage(data: $0) }) }.resume()
+        var r2 = URLRequest(url: imgURL); r2.timeoutInterval = 8
+        URLSession.shared.dataTask(with: r2) { d2, _, _ in completion(d2.flatMap { NSImage(data: $0) }) }.resume()
     }.resume()
 }
 
@@ -524,7 +551,10 @@ final class AudioLevels {
     private var tap = AudioObjectID(kAudioObjectUnknown), agg = AudioObjectID(kAudioObjectUnknown)
     private var proc: AudioDeviceIOProcID?
     private let n = 1024
-    private var ring = [Float](repeating: 0, count: 1024), fill = 0
+    private var ring = [Float](repeating: 0, count: 1024), fill = 0, ringPos = 0     // ring: circular, oldest sample at ringPos
+    private var ordered = [Float](repeating: 0, count: 1024)                      // scratch: the ring in time order
+    private let window = vDSP.window(ofType: Float.self, usingSequence: .hanningDenormalized, count: 1024, isHalfWindow: false)
+    private var lastAnalysis = 0.0
     private var peaks = [Float](repeating: 0.0001, count: 5)
     private lazy var fft = vDSP.FFT(log2n: 10, radix: .radix2, ofType: DSPSplitComplex.self)
     private let q = DispatchQueue(label: "ni.audio", qos: .userInteractive)
@@ -548,7 +578,7 @@ final class AudioLevels {
         outputListener = l
         AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &a, q, l)
         let t = DispatchSource.makeTimerSource(queue: q)
-        t.schedule(deadline: .now() + 2, repeating: 1.0)
+        t.schedule(deadline: .now() + 2, repeating: 1.0, leeway: .milliseconds(500))
         t.setEventHandler { [weak self] in
             guard let s = self, s.users > 0, !s.failed, CFAbsoluteTimeGetCurrent() - s.lastBlock > 2.0, CFAbsoluteTimeGetCurrent() - s.startedAt > 2.0 else { return }
             s.restart()
@@ -569,7 +599,7 @@ final class AudioLevels {
     private var startedAt = CFAbsoluteTimeGetCurrent()
 
     private func start() {
-        nap = ProcessInfo.processInfo.beginActivity(options: [.userInitiatedAllowingIdleSystemSleep, .latencyCritical], reason: "audio equalizer")
+        nap = ProcessInfo.processInfo.beginActivity(options: [.userInitiatedAllowingIdleSystemSleep], reason: "audio equalizer")
         guard #available(macOS 14.2, *), ProcessInfo.processInfo.environment["NI_NOAUDIO"] == nil else { return }
         startedAt = CFAbsoluteTimeGetCurrent(); lastBlock = startedAt
         failed = false
@@ -605,7 +635,7 @@ final class AudioLevels {
         if let p = proc { AudioDeviceStop(agg, p); AudioDeviceDestroyIOProcID(agg, p); proc = nil }
         if agg != kAudioObjectUnknown { AudioHardwareDestroyAggregateDevice(agg); agg = AudioObjectID(kAudioObjectUnknown) }
         if tap != kAudioObjectUnknown, #available(macOS 14.2, *) { AudioHardwareDestroyProcessTap(tap); tap = AudioObjectID(kAudioObjectUnknown) }
-        bands = [0, 0, 0, 0, 0]; live = false; fill = 0
+        bands = [0, 0, 0, 0, 0]; live = false; fill = 0; ringPos = 0
     }
 
     private func consume(_ list: UnsafePointer<AudioBufferList>) {
@@ -616,17 +646,22 @@ final class AudioLevels {
         for i in 0..<frames {
             var v: Float = 0
             for c in 0..<ch { v += x[i * ch + c] }
-            ring.removeFirst(); ring.append(v / Float(ch))
+            ring[ringPos] = v / Float(ch); ringPos = (ringPos + 1) % n
         }
         fill = min(n, fill + frames)
-        lastBlock = CFAbsoluteTimeGetCurrent(); live = true
+        let now = CFAbsoluteTimeGetCurrent()
+        lastBlock = now; live = true
+        guard now - lastAnalysis >= 1.0 / 40 else { return }       // the bars only redraw at 30Hz: no need for a FFT per audio block
+        lastAnalysis = now
         analyse()
     }
 
     private func analyse() {
         guard let fft else { return }
         var win = [Float](repeating: 0, count: n)
-        vDSP.multiply(ring, vDSP.window(ofType: Float.self, usingSequence: .hanningDenormalized, count: n, isHalfWindow: false), result: &win)
+        ordered.replaceSubrange(0..<(n - ringPos), with: ring[ringPos...])
+        ordered.replaceSubrange((n - ringPos)..<n, with: ring[..<ringPos])
+        vDSP.multiply(ordered, window, result: &win)
         var re = [Float](repeating: 0, count: n / 2), im = [Float](repeating: 0, count: n / 2)
         var mags = [Float](repeating: 0, count: n / 2)
         re.withUnsafeMutableBufferPointer { rp in im.withUnsafeMutableBufferPointer { ip in
@@ -692,6 +727,7 @@ final class EqView: NSView {
         if p {
             AudioLevels.shared.retain()
             let t = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in self?.tick() }
+            t.tolerance = 0.01
             RunLoop.main.add(t, forMode: .common); timer = t
         } else {
             AudioLevels.shared.release()
@@ -1574,7 +1610,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var panel: NSPanel!
     var view: IslandView!
     var c: Content { view.content }
-    let screen: NSScreen = NSScreen.screens.first(where: { $0.safeAreaInsets.top > 0 }) ?? NSScreen.main!
+    static func pickScreen() -> NSScreen { NSScreen.screens.first(where: { $0.safeAreaInsets.top > 0 }) ?? NSScreen.main ?? NSScreen.screens[0] }
+    var screen: NSScreen = App.pickScreen()
     let timer = TimerModel()
     var shape: Shape = .collapsed
 
@@ -1628,6 +1665,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var warned20 = false, warned10 = false, notifiedFull = false
     var tick = 0
     var musicBusy = false
+    var fullSince: Date?
+    var ambient = -1.0               // slow average of the light while uncovered: the touch threshold follows it
+    var nothingPolls = 0             // consecutive 'nothing is playing' answers
+    var idleRefreshed = false
     var darkLatched = false          // dark state with hysteresis: set below threshold, cleared above 1.2x
     var sensorMisses = 0
 
@@ -2048,8 +2089,146 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         keyTap.onKey = { [weak self] code, down, fine in self?.handleMediaKey(code, down, fine) ?? false }
         setupKeyTap()
         refreshUI()
-        let stepTimer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in self?.step() }
-        RunLoop.main.add(stepTimer, forMode: .common)       // .common: also runs while a menu is open or a drag is in progress
+        scheduleStep(busy: true)
+        watchOutputDevice()
+        watchSleep()
+        watchVolume()
+        watchBattery()
+        watchMusicApps()
+        watchScreens()
+        watchEscape()
+        accessibilityLabels()
+        let n0 = CFAbsoluteTimeGetCurrent()          // stagger the first polls so launch does not run every helper at once
+        tMusic = n0 - 4; tAirPods = n0 - 25; tFiles = n0; tVolume = n0; tBattery = n0
+    }
+
+    // MARK: screen changes
+
+    /// Display plugged / unplugged, resolution or arrangement changed: follow the notch screen and rebuild what is tied to it.
+    func watchScreens() {
+        NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let s = self else { return }
+            let ns = App.pickScreen()
+            s.screen = ns
+            s.view.content.notchH = s.notchH
+            s.link?.invalidate()
+            s.link = ns.displayLink(target: s, selector: #selector(App.animTick(_:)))
+            s.link?.add(to: .main, forMode: .common)
+            s.link?.isPaused = false
+            let r = s.frame(for: s.shape)
+            s.mainP.x.jump(r.minX); s.mainP.w.jump(r.width); s.mainP.h.jump(r.height)
+            s.mainP.x.tgt = r.minX; s.mainP.w.tgt = r.width; s.mainP.h.tgt = r.height
+            s.pillP.x.jump(s.pillP.x.cur)
+            s.atRest = false
+            s.refreshUI()
+        }
+    }
+
+    // MARK: Esc closes the open island
+
+    func watchEscape() {
+        NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] e in
+            guard e.keyCode == 53, let s = self, s.pinned else { return }      // 53 = Esc (needs the Accessibility permission, like the key tap)
+            if s.hudActive { s.hudUntil = .distantPast }
+            s.pinned = false; s.alertText = nil; s.banner = nil
+        }
+    }
+
+    func accessibilityLabels() {
+        let labels: [(NSButton, String)] = [(c.prevB, "이전 곡"), (c.playB, "재생 / 일시정지"), (c.nextB, "다음 곡"),
+                                            (c.pauseB, "타이머 일시정지 / 계속"), (c.cancelB, "타이머 취소"),
+                                            (c.fRevealB, "Finder에서 보기"), (c.fRemoveB, "주머니에서 빼기")]
+        for (b, t) in labels { b.setAccessibilityLabel(t); b.toolTip = t }
+        c.hBar.setAccessibilityLabel("볼륨 / 밝기")
+        c.progress.setAccessibilityLabel("재생 위치")
+    }
+
+    // MARK: event sources (instead of polling)
+
+    private var volDev = AudioObjectID(0)
+    private var volBlock: AudioObjectPropertyListenerBlock?
+    private var batteryRL: CFRunLoopSource?
+    private var musicDebounce: Timer?
+
+    private func volAddresses() -> [AudioObjectPropertyAddress] {
+        [kAudioHardwareServiceDeviceProperty_VirtualMainVolume, kAudioDevicePropertyMute].map {
+            AudioObjectPropertyAddress(mSelector: $0, mScope: kAudioDevicePropertyScopeOutput, mElement: kAudioObjectPropertyElementMain)
+        }
+    }
+    /// Volume / mute changes of the current output device arrive as events; the slow poll is only a safety net.
+    func watchVolume() {
+        if let b = volBlock, volDev != 0 { for var a in volAddresses() { AudioObjectRemovePropertyListenerBlock(volDev, &a, .main, b) } }
+        volBlock = nil; volDev = 0
+        guard let d = SystemLevels.outputDevice() else { return }
+        let b: AudioObjectPropertyListenerBlock = { [weak self] _, _ in self?.pollVolume() }
+        for var a in volAddresses() { AudioObjectAddPropertyListenerBlock(d, &a, .main, b) }
+        volDev = d; volBlock = b
+    }
+
+    /// Plugging / unplugging and level changes arrive from IOKit: the banner shows at once and nothing polls.
+    func watchBattery() {
+        let cb: IOPowerSourceCallbackType = { ctx in
+            guard let ctx = ctx else { return }
+            let app = Unmanaged<App>.fromOpaque(ctx).takeUnretainedValue()
+            DispatchQueue.main.async { app.pollBattery(); app.tBattery = CFAbsoluteTimeGetCurrent() }
+        }
+        if let src = IOPSNotificationCreateRunLoopSource(cb, Unmanaged.passUnretained(self).toOpaque())?.takeRetainedValue() {
+            CFRunLoopAddSource(CFRunLoopGetMain(), src, .commonModes); batteryRL = src
+        }
+    }
+
+    /// Music and Spotify announce every play / pause / track change: look up what is playing right then.
+    func watchMusicApps() {
+        let dc = DistributedNotificationCenter.default()
+        for name in ["com.apple.Music.playerInfo", "com.apple.iTunes.playerInfo", "com.spotify.client.PlaybackStateChanged"] {
+            dc.addObserver(forName: Notification.Name(name), object: nil, queue: .main) { [weak self] _ in
+                guard let s = self else { return }
+                s.musicDebounce?.invalidate()
+                let t = Timer(timeInterval: 0.35, repeats: false) { [weak s] _ in s?.pollMusic(); s?.tMusic = CFAbsoluteTimeGetCurrent() }
+                RunLoop.main.add(t, forMode: .common); s.musicDebounce = t
+            }
+        }
+    }
+
+    /// A new output device (AirPods connecting, ...) is the moment to look at the Bluetooth report, instead of polling it often.
+    func watchOutputDevice() {
+        var a = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                                           mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &a, .main) { [weak self] _, _ in
+            self?.watchVolume()                      // the volume now belongs to another device
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self?.pollAirPods(); self?.tAirPods = CFAbsoluteTimeGetCurrent() }
+        }
+    }
+
+    /// Asleep or screen off: nothing is visible, so stop the main loop entirely until the Mac wakes.
+    func watchSleep() {
+        let nc = NSWorkspace.shared.notificationCenter
+        for n in [NSWorkspace.willSleepNotification, NSWorkspace.screensDidSleepNotification] {
+            nc.addObserver(forName: n, object: nil, queue: .main) { [weak self] _ in self?.stepTimer?.invalidate(); self?.stepTimer = nil }
+        }
+        for n in [NSWorkspace.didWakeNotification, NSWorkspace.screensDidWakeNotification] {
+            nc.addObserver(forName: n, object: nil, queue: .main) { [weak self] _ in
+                guard let s = self, s.stepTimer == nil else { return }
+                s.scheduleStep(busy: true)
+            }
+        }
+    }
+
+    /// The main loop runs at 60Hz only while something is on screen or moving; when the island rests it drops to 30Hz
+    /// (the light sensor's own rate), with a little tolerance so the system can coalesce the wakeups.
+    var stepTimer: Timer?, stepBusy = false
+    func scheduleStep(busy: Bool) {
+        stepTimer?.invalidate()
+        stepBusy = busy
+        let t = Timer(timeInterval: busy ? 1.0 / 60 : 1.0 / 30, repeats: true) { [weak self] _ in self?.step() }
+        t.tolerance = busy ? 0.002 : 0.006
+        RunLoop.main.add(t, forMode: .common)       // .common: also runs while a menu is open or a drag is in progress
+        stepTimer = t
+    }
+
+    /// Something is visible, moving, pressed or dragged: needs the full frame rate.
+    var stepNeedsFullRate: Bool {
+        shape != .collapsed || !atRest || hudActive || pressing || dragActive || dropping || scrollHolding || alertText != nil || banner != nil
     }
 
     func makePanel(_ frame: NSRect) -> NSPanel {
@@ -2324,10 +2503,11 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Called every frame: is a file drag (from Finder...) in progress, and is it near the notch?
     func trackFileDrag(_ m: NSPoint) {
         let down = NSEvent.pressedMouseButtons & 1 != 0
-        let pb = NSPasteboard(name: .drag)
-        if down && !wasBtn { downChange = pb.changeCount; dragActive = false }
-        if down, !dragActive, pb.changeCount != downChange,
-           pb.canReadObject(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) { dragActive = true }
+        if down && !wasBtn { downChange = NSPasteboard(name: .drag).changeCount; dragActive = false }
+        if down, !dragActive {                          // the drag pasteboard is only looked at while the button is held
+            let pb = NSPasteboard(name: .drag)
+            if pb.changeCount != downChange, pb.canReadObject(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) { dragActive = true }
+        }
         if !down { dragActive = false; dragEntered = false }
         wasBtn = down
         let zone = dropping ? frame(for: .expanded).insetBy(dx: -30, dy: -30)
@@ -2432,7 +2612,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
         tryInstall()
-        let kt = Timer(timeInterval: 3, repeats: true) { _ in tryInstall() }   // picks up a later grant
+        let kt = Timer(timeInterval: 5, repeats: true) { _ in tryInstall() }   // picks up a later grant
+        kt.tolerance = 2
         RunLoop.main.add(kt, forMode: .common); keyTapTimer = kt
     }
 
@@ -2453,6 +2634,14 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: periodic work
 
+    var tAppearance = 0.0, tFiles = 0.0, tVolume = 0.0, tBattery = 0.0, tMusic = 0.0, tAirPods = 0.0
+    /// True (and re-arms `last`) when `every` seconds have passed since it last was.
+    func due(_ last: inout Double, _ every: Double) -> Bool {
+        let n = CFAbsoluteTimeGetCurrent()
+        guard n - last >= every else { return false }
+        last = n; return true
+    }
+
     func step() {
         tick += 1
         let now = Date()
@@ -2469,13 +2658,16 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let overHUD = hudActive && probe.contains(m)
         if c.hBar.sliderMode != overHUD { c.hBar.sliderMode = overHUD }              // cells melt into a slider under the pointer
 
-        if tick % 2 == 0 {                         // 30Hz: the ambient light sensor is the touch sensor
+        if !stepBusy || tick % 2 == 0 {            // 30Hz in both modes: the ambient light sensor is the touch sensor
             let v = simLux ?? als_read()              // simLux is only set by the test hook below
             if v >= 0 { lux = v; sensorMisses = 0 }   // raw value, no smoothing; hysteresis below prevents flicker
             else { sensorMisses += 1; if sensorMisses >= 60 { lux = -1 } }   // ~2s of silence: stop trusting old data
             let wasCovered = darkLatched
-            if lux >= 0 && lux < threshold { darkLatched = true }            // covered  = finger down
-            else if lux < 0 || lux > threshold * 1.2 { darkLatched = false } // uncovered = finger up
+            // in a dim room covering the sensor hardly changes the reading: the bar follows the room's own light (but never above `threshold`)
+            let thr = max(2, ambient > 0 ? min(threshold, ambient * 0.3) : threshold)
+            if lux >= 0 && lux < thr { darkLatched = true }                  // covered  = finger down
+            else if lux < 0 || lux > thr * 1.2 { darkLatched = false }       // uncovered = finger up
+            if !darkLatched && lux >= 0 { ambient = ambient < 0 ? lux : ambient * 0.98 + lux * 0.02 }
             if darkLatched && !wasCovered { sensorTouchBegan() }
             else if !darkLatched && wasCovered { sensorTouchEnded() }
         }
@@ -2487,19 +2679,21 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let pf = panel.frame, mp = NSEvent.mouseLocation
             let bodyR = NSRect(x: pf.minX, y: pf.minY + mainP.m.cur, width: pf.width, height: pf.height - mainP.m.cur)
             let stripR = NSRect(x: pf.minX, y: pf.minY, width: pf.width, height: mainP.m.cur + 8)
-            panel.ignoresMouseEvents = !(bodyR.contains(mp) || stripR.contains(mp) || (scrollHolding && pf.contains(mp)))
+            let ign = !(bodyR.contains(mp) || stripR.contains(mp) || (scrollHolding && pf.contains(mp)))
+            if panel.ignoresMouseEvents != ign { panel.ignoresMouseEvents = ign }
         } else if panel.ignoresMouseEvents { panel.ignoresMouseEvents = false }
-        if tick % 30 == 3 { view.dial.lightAppearance = NSApp.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .aqua }   // tick colour follows light / dark mode
+        if due(&tAppearance, 2) { view.dial.lightAppearance = NSApp.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .aqua }   // tick colour follows light / dark mode
         trackFileDrag(NSEvent.mouseLocation)
-        if tick % 120 == 7, files.contains(where: { !FileManager.default.fileExists(atPath: $0.path) }) {       // deleted elsewhere
+        if due(&tFiles, 5), files.contains(where: { !FileManager.default.fileExists(atPath: $0.path) }) {       // deleted elsewhere
             files = files.filter { FileManager.default.fileExists(atPath: $0.path) }; fileSave()
         }
-        if tick % 4 == 0 { pollVolume() }          // 15Hz: volume changes from anywhere (keys, menu bar, headphones)
-        if tick % 120 == 0 { pollBattery() }       // 2s
-        if tick % 120 == 47 { pollMusic() }        // 2s, offset from battery
+        if due(&tVolume, 2) { pollVolume() }       // safety net only: volume changes normally arrive as events (watchVolume)
+        if due(&tBattery, 5) { pollBattery() }     // safety net + the 'fully charged' timer; plug events arrive from IOKit (watchBattery)
+        // each lookup spawns osascript: poll faster only while a track is playing or the card is open
+        if due(&tMusic, shape == .expanded ? 2 : (media?.playing == true ? 3 : 5)) { pollMusic() }
         if let m = media, !m.playing, !demoMedia, demoActsN == nil, shape != .expanded,
            now.timeIntervalSince(lastPlayingAt) > 4 { media = nil }     // paused for a while: let it go
-        if tick % 360 == 211 { pollAirPods() }     // 6s
+        if due(&tAirPods, 30) { pollAirPods() }    // system_profiler is heavy; a new output device triggers it sooner (see watchOutputDevice)
 
         
         prevTimerStarted = timer.started
@@ -2509,8 +2703,14 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             showAlert("타이머 종료", seconds: 6)
         }
 
-        if tick % 6 == 0 { refreshUI() }           // content at 10Hz; shape/hover/press every frame
+        if !liveActivity && shape == .collapsed && atRest && !pinned && !stepBusy {
+            if !idleRefreshed { idleRefreshed = true; refreshUI() }     // resting and empty: one last refresh, then nothing to redraw
+        } else {
+            idleRefreshed = false
+            if tick % (stepBusy ? 6 : 3) == 0 { refreshUI() }           // content at 10Hz; shape/hover/press every frame
+        }
         applyShape()
+        if stepNeedsFullRate != stepBusy { scheduleStep(busy: !stepBusy) }
     }
 
     func pollBattery() {
@@ -2520,11 +2720,15 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if b.plugged != old.plugged {
             if b.plugged { chargeShownUntil = Date().addingTimeInterval(3) }
             if !b.plugged { showBanner(.battery(title: "충전 해제", level: b.level, color: .white)) }     // plugging in: the charging activity just appears, quietly
-            notifiedFull = false
+            notifiedFull = false; fullSince = nil
         }
         if b.plugged {
             warned20 = false; warned10 = false
-            if isFull(b) && !notifiedFull { notifiedFull = true; showBanner(.battery(title: "충전 완료", level: b.level, color: bannerGreen)) }
+            if isFull(b) {
+                if fullSince == nil { fullSince = Date() }
+                // right after plugging in, `charging` can read false for a moment: only trust "full" once it has held for a while
+                if !notifiedFull, Date().timeIntervalSince(fullSince!) >= 8 { notifiedFull = true; showBanner(.battery(title: "충전 완료", level: b.level, color: bannerGreen)) }
+            } else { fullSince = nil }
         } else {
             if b.level <= 10 && !warned10 { warned10 = true; warned20 = true }          // the low-battery activity appears by itself, quietly
             else if b.level <= 20 && !warned20 { warned20 = true }
@@ -2561,8 +2765,11 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let r: Media
         switch result {
         case .failed: return                         // a failed lookup must not make the island vanish
-        case .nothing: media = nil; mediaBaseline = true; return
-        case .media(let m): r = m
+        case .nothing:
+            nothingPolls += 1                            // a track change can answer 'nothing' for a moment: wait for a second answer
+            if nothingPolls >= 2 || media?.playing == false { media = nil }
+            mediaBaseline = true; return
+        case .media(let m): r = m; nothingPolls = 0
         }
         defer { mediaBaseline = true }
         if Date() < seekHoldUntil, case .media(let n) = result, media != nil, n.title == media?.title { return }   // stale position right after a seek
@@ -2575,24 +2782,45 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         let started = media == nil                   // playback just started (a track change alone never opens the card)
         media = r
-        loadArtwork(for: r.storeID)
+        loadArtwork(for: r)
         _ = started                                  // a new music activity appears quietly: it never opens the card by itself
     }
 
-    func loadArtwork(for id: String) {
+    var artRetryAt: [String: Date] = [:], artTries: [String: Int] = [:]
+    func artworkKey(_ m: Media) -> String { m.storeID.isEmpty ? "t:\(m.title)|\(m.artist)" : m.storeID }
+
+    func loadArtwork(for m: Media) {
+        let id = artworkKey(m)
         guard id != artworkFor else { return }
+        if let t = artRetryAt[id], Date() < t { return }              // a failed lookup is retried later, not on every poll
         artworkFor = id
-        guard !id.isEmpty else { artwork = nil; artColor = accent; return }     // no cover to look up: show the placeholder
         // keep showing the previous cover until the new one has arrived, so it fades once instead of flashing
         if let hit = artCache[id] { artwork = hit.0; artColor = hit.1; return }
-        fetchArtwork(storeID: id) { [weak self] img in
-            guard let img = img else { return }
+        let tries = artTries[id, default: 0]
+        artTries[id] = tries + 1
+        let done: (NSImage?) -> Void = { [weak self] img in
+            guard let s = self else { return }
+            guard let img = img else {
+                DispatchQueue.main.async {
+                    guard s.artworkFor == id else { return }
+                    if m.storeID.isEmpty && tries >= 1 { return }      // no cover to be had for this track (at most two tries)
+                    s.artworkFor = ""; s.artRetryAt[id] = Date().addingTimeInterval(30)
+                    if m.storeID.isEmpty { s.artwork = nil; s.artColor = accent }
+                }
+                return
+            }
             let col = averageColor(img)
             DispatchQueue.main.async {
-                guard let s = self else { return }
                 s.artCache[id] = (img, col)
+                if s.artCache.count > 40 { s.artCache.removeValue(forKey: s.artCache.keys.first!) }
                 if s.artworkFor == id { s.artwork = img; s.artColor = col }
             }
+        }
+        if m.storeID.isEmpty {                                        // Spotify, browsers...: the cover comes with the now-playing info
+            artwork = nil; artColor = accent
+            DispatchQueue.global(qos: .utility).async { done(queryArtworkData()) }
+        } else {
+            fetchArtwork(storeID: m.storeID, completion: done)
         }
     }
 
@@ -2698,14 +2926,14 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             c.progress.fraction = m.duration > 0 ? CGFloat(e / m.duration) : 0
             c.progress.isHidden = m.duration <= 0
             setSymbol(c.playB, m.playing ? "pause.fill" : "play.fill", 30)
-            c.bodyEq.color = artColor; c.bodyEq.setPlaying(m.playing)
+            c.bodyEq.color = artColor; c.bodyEq.setPlaying(m.playing && shape == .expanded && body == .media)    // hidden bars do not animate
         }
     }
 
     /// Updates what the small slot views show.
     func refreshSlots() {
         if let m = media, let it = slotItem(.media), let art = it.icon as? ArtView, let eq = it.detail as? EqView {
-            art.setImage(artwork); eq.color = artColor; eq.setPlaying(m.playing)
+            art.setImage(artwork); eq.color = artColor; eq.setPlaying(m.playing && usedViews.contains(where: { $0 === eq }))
         }
         if let it = slotItem(.timer), let l = it.detail as? NSTextField {
             setText(l, timer.text())
@@ -2790,6 +3018,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if target != shape {
             if target == .peek && shape != .pressed { haptic(.alignment) }   // light tick when the pointer arrives
             shape = target
+            if target == .expanded { fileInfo.removeAll(); c.fileShown = nil }   // size / folder may have changed since it was last opened
             refreshUI()                                // wings/body change with the shape
             switch target {
             case .pressed:  stiffness = 520; damping = 42
