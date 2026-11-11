@@ -508,7 +508,14 @@ final class ArtView: NSView {
 /// "system audio recording" permission, NOT screen recording) feeds a 1024-point FFT, folded into four bands.
 final class AudioLevels {
     static let shared = AudioLevels()
-    private(set) var bands = [Float](repeating: 0, count: 5)
+    /// Written on the audio queue, read 30 times a second on the main thread: guarded, because an unsynchronised Swift array
+    /// that is replaced while another thread reads it can hand out a torn buffer (that was the crash after hours of uptime).
+    private let bandLock = NSLock()
+    private var _bands = [Float](repeating: 0, count: 5)
+    var bands: [Float] {
+        get { bandLock.lock(); defer { bandLock.unlock() }; return _bands }
+        set { bandLock.lock(); _bands = newValue; bandLock.unlock() }
+    }
     private(set) var failed = false               // the tap could not be set up at all (permission missing / unsupported)
     private var watchdog: DispatchSourceTimer?
     private var outputListener: AudioObjectPropertyListenerBlock?
@@ -711,6 +718,7 @@ final class EqView: NSView {
 
     /// Eases the bars to `target`; fast on the way up and slower on the way down, like a real meter.
     private func glide(to target: [CGFloat], rate: CGFloat) {
+        guard target.count >= bars.count, levels.count >= bars.count else { return }
         CATransaction.begin(); CATransaction.setDisableActions(true)
         for i in 0..<5 {
             let up = target[i] > levels[i]
