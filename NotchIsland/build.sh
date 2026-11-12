@@ -1,9 +1,13 @@
 #!/bin/bash
-# Builds build/NotchIsland.app (ad-hoc signed, menu-bar-less "agent" app: no Dock icon).
+# Builds and signs build/NotchIsland.app, then packages build/NotchIsland-arm64.zip.
 set -euo pipefail
 cd "$(dirname "$0")"
 
 APP=build/NotchIsland.app
+ARCHIVE=build/NotchIsland-arm64.zip
+ARCHIVE_TMP=build/NotchIsland-arm64.tmp.zip
+trap 'rm -f "$ARCHIVE_TMP"' EXIT
+rm -f "$ARCHIVE" "$ARCHIVE_TMP"
 rm -rf "$APP"
 mkdir -p build "$APP/Contents/MacOS" "$APP/Contents/Resources"
 ICONSET=build/NotchIsland.iconset
@@ -60,3 +64,8 @@ else
 fi
 codesign --verify --strict "$APP"
 echo "built $APP"
+
+# Preserve the complete app bundle, resource forks and macOS metadata for distribution.
+ditto -c -k --sequesterRsrc --keepParent "$APP" "$ARCHIVE_TMP"
+mv "$ARCHIVE_TMP" "$ARCHIVE"
+echo "packaged $ARCHIVE"
