@@ -17,7 +17,7 @@ iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/NotchIsland.icns"
 TARGET=arm64-apple-macos14.0     # NSScreen.displayLink needs macOS 14
 
 clang -O2 -target "$TARGET" -c als_bridge.c -o build/als_bridge.o
-swiftc -O -target "$TARGET" main.swift build/als_bridge.o -import-objc-header als_bridge.h \
+swiftc -O -target "$TARGET" ./*.swift build/als_bridge.o -import-objc-header als_bridge.h \
     -o "$APP/Contents/MacOS/NotchIsland"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
