@@ -176,6 +176,16 @@ final class ProgressBar: NSView {
     override func accessibilityPerformIncrement() -> Bool { adjust(0.05); return true }
     override func accessibilityPerformDecrement() -> Bool { adjust(-0.05); return true }
     override var acceptsFirstResponder: Bool { true }
+    override func becomeFirstResponder() -> Bool { needsDisplay = true; return true }
+    override func resignFirstResponder() -> Bool { needsDisplay = true; return true }
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        if window?.isKeyWindow == true && window?.firstResponder === self {
+            NSColor.keyboardFocusIndicatorColor.setStroke()
+            let ring = NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 5, yRadius: 5)
+            ring.lineWidth = 2; ring.stroke()
+        }
+    }
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 123 { adjust(-0.05) }
         else if event.keyCode == 124 { adjust(0.05) }
@@ -301,6 +311,16 @@ final class LevelBar: NSView {
     override func accessibilityPerformIncrement() -> Bool { adjust(1.0 / 16); return true }
     override func accessibilityPerformDecrement() -> Bool { adjust(-1.0 / 16); return true }
     override var acceptsFirstResponder: Bool { true }
+    override func becomeFirstResponder() -> Bool { needsDisplay = true; return true }
+    override func resignFirstResponder() -> Bool { needsDisplay = true; return true }
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        if window?.isKeyWindow == true && window?.firstResponder === self {
+            NSColor.keyboardFocusIndicatorColor.setStroke()
+            let ring = NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 5, yRadius: 5)
+            ring.lineWidth = 2; ring.stroke()
+        }
+    }
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 123 { adjust(-1.0 / 16) }
         else if event.keyCode == 124 { adjust(1.0 / 16) }
@@ -535,6 +555,9 @@ func setSymbol(_ b: NSButton, _ name: String, _ pt: CGFloat) {
 final class FeedbackButton: NSButton {
     private var hoverArea: NSTrackingArea?
     private var hovering = false
+    override var acceptsFirstResponder: Bool { isEnabled }
+    override func becomeFirstResponder() -> Bool { needsDisplay = true; return true }
+    override func resignFirstResponder() -> Bool { needsDisplay = true; return true }
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         if let hoverArea { removeTrackingArea(hoverArea) }
@@ -549,6 +572,11 @@ final class FeedbackButton: NSButton {
             NSBezierPath(roundedRect: bounds.insetBy(dx: 2, dy: 2), xRadius: 10, yRadius: 10).fill()
         }
         super.draw(dirtyRect)
+        if window?.isKeyWindow == true && window?.firstResponder === self {
+            NSColor.keyboardFocusIndicatorColor.setStroke()
+            let ring = NSBezierPath(roundedRect: bounds.insetBy(dx: 2, dy: 2), xRadius: 10, yRadius: 10)
+            ring.lineWidth = 2; ring.stroke()
+        }
     }
     override func highlight(_ flag: Bool) {
         super.highlight(flag); needsDisplay = true

@@ -89,6 +89,9 @@ final class IslandView: FileDragView {
         guard bodyRect.contains(here) || (bottomInset > 0 && strip.contains(here)) else { return nil }
         guard bodyRect.contains(here) else { return dial.hitTest(here) ?? self }
         let p = content.convert(here, from: self)
+        if !content.activityRow.isHidden, content.activityRow.frame.contains(p) {
+            return content.activityRow.hitTest(p)
+        }
         for v in content.subviews.reversed() where (v is NSButton || v is LevelBar || v is ProgressBar) && !v.isHidden && v.alphaValue > 0.3 {
             if v.frame.contains(p) { return v }
         }

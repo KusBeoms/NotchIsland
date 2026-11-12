@@ -6,7 +6,7 @@ import IOKit.ps
 
 enum BannerKind {
     case battery(title: String, level: Int, color: NSColor)
-    case airpods(symbol: String, level: Int?)
+    case airpods(symbol: String, level: Int?, name: String = "AirPods", connected: Bool = true)
 }
 
 // MARK: - Volume / brightness (read, set) and the media keys that drive them
@@ -27,24 +27,33 @@ enum SystemLevels {
         return AudioObjectHasProperty(d, &a) && AudioObjectIsPropertySettable(d, &a, &ok) == noErr && ok.boolValue
     }
 
+    private static func volumeAddresses() -> [AudioObjectPropertyAddress] {
+        [addr(kAudioHardwareServiceDeviceProperty_VirtualMainVolume), addr(kAudioDevicePropertyVolumeScalar)] + [1, 2].map {
+            AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyVolumeScalar, mScope: kAudioDevicePropertyScopeOutput, mElement: UInt32($0))
+        }
+    }
     static var volumeControllable: Bool {
-        guard let d = outputDevice() else { return false }
-        var a = addr(kAudioHardwareServiceDeviceProperty_VirtualMainVolume)
-        return settable(d, &a)
+        guard let device = outputDevice() else { return false }
+        return volumeAddresses().contains { address in var a = address; return settable(device, &a) }
     }
     static func volume() -> Float? {
-        guard let d = outputDevice() else { return nil }
-        var a = addr(kAudioHardwareServiceDeviceProperty_VirtualMainVolume)
-        guard AudioObjectHasProperty(d, &a) else { return nil }
-        var v: Float32 = 0; var sz = UInt32(4)
-        return AudioObjectGetPropertyData(d, &a, 0, nil, &sz, &v) == noErr ? v : nil
+        guard let device = outputDevice() else { return nil }
+        for var address in volumeAddresses() {
+            var value: Float32 = 0; var size = UInt32(MemoryLayout<Float32>.size)
+            if AudioObjectHasProperty(device, &address), AudioObjectGetPropertyData(device, &address, 0, nil, &size, &value) == noErr { return value }
+        }
+        return nil
     }
-    @discardableResult static func setVolume(_ v: Float) -> Bool {
-        guard let d = outputDevice() else { return false }
-        var a = addr(kAudioHardwareServiceDeviceProperty_VirtualMainVolume)
-        guard settable(d, &a) else { return false }
-        var x = Float32(min(max(v, 0), 1))
-        return AudioObjectSetPropertyData(d, &a, 0, nil, 4, &x) == noErr
+    @discardableResult static func setVolume(_ value: Float) -> Bool {
+        guard let device = outputDevice() else { return false }
+        var succeeded = false
+        for (index, address) in volumeAddresses().enumerated() {
+            var a = address; var v = min(1, max(0, value))
+            guard settable(device, &a), AudioObjectSetPropertyData(device, &a, 0, nil, UInt32(MemoryLayout<Float32>.size), &v) == noErr else { continue }
+            succeeded = true
+            if index < 2 { return true } // Set both channels only when no master control exists.
+        }
+        return succeeded
     }
     static func muted() -> Bool? {
         guard let d = outputDevice() else { return nil }
@@ -91,18 +100,20 @@ enum SystemLevels {
 final class MediaKeyTap {
     var onKey: ((_ code: Int, _ down: Bool, _ fine: Bool) -> Bool)?   // true = handled (swallow the event)
     private(set) var tap: CFMachPort?
-    var isActive: Bool { tap != nil }
+    var isActive: Bool { tap.map { CFMachPortIsValid($0) && CGEvent.tapIsEnabled(tap: $0) } ?? false }
 
     @discardableResult func install() -> Bool {
-        if tap != nil { return true }
+        if let tap, CFMachPortIsValid(tap) { CGEvent.tapEnable(tap: tap, enable: true); return isActive }
         let mask = CGEventMask(1) << 14                      // NX_SYSDEFINED: media / function keys
         let callback: CGEventTapCallBack = { _, type, event, refcon in
             guard let refcon = refcon else { return Unmanaged.passUnretained(event) }
             return Unmanaged<MediaKeyTap>.fromOpaque(refcon).takeUnretainedValue().handle(type, event)
         }
-        guard let t = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
-                                        eventsOfInterest: mask, callback: callback,
-                                        userInfo: Unmanaged.passUnretained(self).toOpaque()) else { return false }
+        let context = Unmanaged.passUnretained(self).toOpaque()
+        guard let t = CGEvent.tapCreate(tap: .cghidEventTap, place: .headInsertEventTap, options: .defaultTap,
+                                        eventsOfInterest: mask, callback: callback, userInfo: context)
+            ?? CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
+                                 eventsOfInterest: mask, callback: callback, userInfo: context) else { return false }
         tap = t
         CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(kCFAllocatorDefault, t, 0), .commonModes)
         CGEvent.tapEnable(tap: t, enable: true)

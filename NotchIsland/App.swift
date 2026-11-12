@@ -16,8 +16,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // spring-driven window size (smooth, interruptible, velocity-preserving)
     var link: CADisplayLink?
-    var mainP: Piece!, pillP: Piece!
-    var pillView: PillView!
+    var mainP: Piece!
+    var rowView: ActivityRowView { c.activityRow }
     var stiffness: CGFloat = 400, damping: CGFloat = 30     // the island's own spring (changes with the shape)
     var signalSources: [DispatchSourceSignal] = []
     var simLux: Double?
@@ -68,16 +68,23 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var hudUntil = Date.distantPast
     var lastVol: Float?, lastMute: Bool?
     let keyTap = MediaKeyTap()
+    let islandShortcut = IslandShortcut()
+    var keyboardReturnApp: NSRunningApplication?
     var brightTarget: Float?
     var brightCur: Float = 0
     var brightTimer: Timer?
     var keyTapTimer: Timer?
     var statusItem: NSStatusItem?
     var bannerSymbol = ""
-    var airBusy = false, airBaseline = false
+    var airBusy = false
     var mediaBaseline = false            // first poll only records what was already playing
     var prevTimerStarted = false
-    var airKnown = Set<String>()
+    let airMonitor = AirPodsMonitor()
+    var airConnections = AirPodsConnections()
+    var airRefreshWork: DispatchWorkItem?
+    var airRefreshPending = false
+    var airFailures = 0
+    var lastAudibleVolume: Float = 0.5
     var alertText: String?
     var alertUntil = Date.distantPast
     var warned20 = false, warned10 = false, notifiedFull = false
@@ -309,8 +316,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     func slotWing(_ k: ActKind) -> CGFloat { showsPercent(k) ? 58 : iconWing }     // room beside the notch for that slot
     var bannerWing: CGFloat { if case .airpods? = displayBanner { return 42 }; return 110 }       // AirPods: just the icon and the ring
-    var navigationVisible: Bool { acts.count > 1 && [.media, .timer, .file].contains(body) }
-    var expandedExtra: CGFloat { expandedExtraFor(body) + (navigationVisible ? 38 : 0) }
+    var expandedExtra: CGFloat { expandedExtraFor(body) }
     func expandedExtraFor(_ b: Body) -> CGFloat {
         switch b {
         case .media:  return 122
@@ -328,7 +334,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var left: ActKind?
         var right: ActKind?
         var rightDetail = false         // right slot shows the detail of the same activity (single activity)
-        var pill: [ActKind] = []        // the pill under the notch (3...5 activities)
+        var row: [ActKind] = []         // additional activities inside the extended notch
     }
 
     func makePlan() -> Plan {
@@ -347,7 +353,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         switch a.count {
         case 0:  return Plan()
         case 1:  return Plan(left: a[0], right: a[0], rightDetail: true)
-        default: return Plan(left: a[0], right: a[1], pill: Array(a.dropFirst(2)))
+        default: return Plan(left: a[0], right: a[1], row: Array(a.dropFirst(2)))
         }
     }
 
@@ -366,7 +372,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             switch n {
             case 0: let w = notchW + extra; return r(mid - w / 2, w, h)
             case 1: let w = notchW + 2 * wingWidth(a[0]) + extra; return r(mid - w / 2, w, h)
-            default: let wl = max(slotWing(a[0]), slotWing(a[1])); let w = notchW + 2 * wl + extra; return r(mid - w / 2, w, h)
+            default:
+                let wl = max(slotWing(a[0]), slotWing(a[1]))
+                let w = max(notchW + 2 * wl, compactRowWidth + 36) + extra
+                return r(mid - w / 2, w, h + compactRowHeight)
             }
         }
         switch s {
@@ -378,21 +387,20 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let w: CGFloat, h: CGFloat
             switch body {
             case .hud:    (w, h) = (284, notchH + 40)                     // dropped below the notch
-            case .banner: (w, h) = (notchW + 2 * bannerWing, notchH)
+            case .banner:
+                if case .airpods? = displayBanner { (w, h) = (332, notchH + 64) }
+                else { (w, h) = (notchW + 2 * bannerWing, notchH) }
             default:      (w, h) = (332, notchH + expandedExtra)
             }
             return r(mid - w / 2, w, h)
         }
     }
 
-    let pillH: CGFloat = 34, pillGap: CGFloat = 6
-    /// The pill under the notch (3...5 activities): returns its rect and its distance from the top of the screen.
-    func pillRect() -> (NSRect, CGFloat)? {
-        guard shape != .expanded, acts.count >= 3 else { return nil }
+    var compactRowHeight: CGFloat { acts.count >= 3 ? 42 : 0 }
+    var compactRowWidth: CGFloat {
         let items = acts.dropFirst(2).compactMap { slotItem($0) }
-        let w = 28 + items.reduce(0) { $0 + $1.pillWidth } + 16 * CGFloat(max(items.count - 1, 0))
-        let ty = compactH + pillGap
-        return (NSRect(x: screen.frame.midX - w / 2, y: screen.frame.maxY - ty - pillH, width: w, height: pillH), ty)
+        guard !items.isEmpty else { return 0 }
+        return 28 + items.reduce(0) { $0 + $1.pillWidth } + 16 * CGFloat(max(items.count - 1, 0))
     }
 
     func applicationDidFinishLaunching(_ n: Notification) {
@@ -409,19 +417,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let r0 = frame(for: .collapsed)
         mainP = Piece(panel: panel); mainP.active = true; mainP.visible = true
         mainP.x.jump(r0.minX); mainP.w.jump(r0.width); mainP.h.jump(r0.height)
-        pillView = PillView(frame: .zero); pillView.withDetail = true
-        let pillPanel = makePanel(.zero)
-        pillPanel.contentView = pillView
-        pillP = Piece(panel: pillPanel)
-        pillView.onPress = { [weak self] in self?.pressBegan() }
-        pillView.onRelease = { [weak self] inside in self?.pressEnded(inside: inside) }
+        rowView.onPress = { [weak self] in self?.pressBegan() }
+        rowView.onRelease = { [weak self] inside in self?.pressEnded(inside: inside) }
         wire(c.prevB, #selector(prevTapped)); wire(c.playB, #selector(playPauseTapped)); wire(c.nextB, #selector(nextTapped))
-        wire(c.activityPrevious, #selector(menuPreviousActivity)); wire(c.activityNext, #selector(menuNextActivity))
         wire(c.pauseB, #selector(timerToggleTapped)); wire(c.cancelB, #selector(timerCancelTapped))
         attachShadow(to: mainP) { [weak self] size in
             notchPath(size.width, size.height, earL: self?.view.earLeft ?? true, earR: self?.view.earRight ?? true)
         }
-        attachShadow(to: pillP) { size in CGPath(roundedRect: CGRect(origin: .zero, size: size), cornerWidth: size.height / 2, cornerHeight: size.height / 2, transform: nil) }
         mainP.shadow?.orderFrontRegardless(); mainP.shadow.map { makeSticky($0) }
         makeSlotItems()
         link = screen.displayLink(target: self, selector: #selector(animTick(_:)))
@@ -495,7 +497,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         view.onDrop = dropped
         view.onScroll = { [weak self] e in self?.handleScroll(e) }
-        for v in [view as FileDragView, pillView as FileDragView] {   // dragging a file out of the island
+        for v in [view as FileDragView, rowView as FileDragView] {   // dragging a file out of the island
             v.fileForDrag = { [weak self] e in self?.fileForDrag(e) }
             v.onDragBegan = { [weak self] in self?.cancelPress() }
             v.onDragFinished = { [weak self] u, taken in if taken { self?.fileRemove(u) } }   // taken out: it leaves the pocket
@@ -514,6 +516,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         refreshUI()
         scheduleStep(busy: true)
+        airMonitor.onChange = { [weak self] in self?.scheduleAirPodsRefresh() }
+        airMonitor.start()
         watchOutputDevice()
         watchSleep()
         watchVolume()
@@ -521,6 +525,11 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         watchMusicApps()
         watchScreens()
         watchEscape()
+        islandShortcut.onToggle = { [weak self] in
+            guard NSApp.modalWindow == nil else { return }
+            self?.menuToggleIsland()
+        }
+        islandShortcut.start()
         accessibilityLabels()
         let n0 = CFAbsoluteTimeGetCurrent()          // stagger the first polls so launch does not run every helper at once
         tMusic = n0 - 4; tAirPods = n0 - 25; tFiles = n0; tVolume = n0; tBattery = n0
@@ -542,7 +551,6 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let r = s.frame(for: s.shape)
             s.mainP.x.jump(r.minX); s.mainP.w.jump(r.width); s.mainP.h.jump(r.height)
             s.mainP.x.tgt = r.minX; s.mainP.w.tgt = r.width; s.mainP.h.tgt = r.height
-            s.pillP.x.jump(s.pillP.x.cur)
             s.atRest = false
             s.refreshUI()
         }
@@ -552,9 +560,20 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func watchEscape() {
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
-            guard e.keyCode == 53, let s = self, s.pinned else { return e }
-            s.pinned = false; s.alertText = nil; s.banner = nil
-            return nil
+            guard let s = self, NSApp.modalWindow == nil else { return e }
+            if e.keyCode == 53 && (s.pinned || s.hudActive) {
+                s.pinned = false; s.hudUntil = .distantPast; s.alertText = nil; s.banner = nil
+                s.releaseKeyboardFocus(); return nil
+            }
+            guard s.panel.isKeyWindow, s.shape == .expanded else { return e }
+            let modifiers = e.modifierFlags.intersection([.command, .control, .option])
+            guard modifiers.isEmpty else { return e }
+            if e.keyCode == 48 { s.advanceKeyboardSelection(backwards: e.modifierFlags.contains(.shift)); return nil }
+            if [36, 76, 49].contains(e.keyCode), let button = s.panel.firstResponder as? NSButton {
+                if !e.isARepeat && button.isEnabled { button.performClick(nil) }
+                return nil
+            }
+            return e
         }
         NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] e in
             guard e.keyCode == 53, let s = self, s.pinned else { return }      // 53 = Esc (needs the Accessibility permission, like the key tap)
@@ -564,7 +583,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func accessibilityLabels() {
-        let labels: [(NSButton, String)] = [(c.activityPrevious, "이전 활동"), (c.activityNext, "다음 활동"), (c.prevB, "이전 곡"), (c.playB, "재생 / 일시정지"), (c.nextB, "다음 곡"),
+        let labels: [(NSButton, String)] = [(c.prevB, "이전 곡"), (c.playB, "재생 / 일시정지"), (c.nextB, "다음 곡"),
                                             (c.pauseB, "타이머 일시정지 / 계속"), (c.cancelB, "타이머 취소"),
                                             (c.fRevealB, "Finder에서 보기"), (c.fRemoveB, "주머니에서 빼기")]
         for (b, t) in labels { b.setAccessibilityLabel(t); b.toolTip = t }
@@ -626,8 +645,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var a = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
                                            mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
         AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &a, .main) { [weak self] _, _ in
-            self?.watchVolume()                      // the volume now belongs to another device
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self?.pollAirPods(); self?.tAirPods = CFAbsoluteTimeGetCurrent() }
+            self?.hudUntil = .distantPast
+            self?.lastVol = nil; self?.lastMute = nil
+            self?.watchVolume()
+            self?.scheduleAirPodsRefresh()
         }
     }
 
@@ -698,9 +719,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func slotItem(_ k: ActKind) -> SlotItem? {
         if let it = slotItems[k] { return it }
         guard case .file(let u) = k else { return nil }
-        let icon = NSImageView()
-        icon.image = NSWorkspace.shared.icon(forFile: u.path)
-        icon.imageScaling = .scaleProportionallyUpOrDown
+        let icon = FilePreviewView()
+        icon.setFile(u)
         let it = SlotItem(icon: icon, detail: NSView(), detailSize: .zero)
         slotItems[k] = it
         return it
@@ -780,7 +800,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             parent.submenu = sub; menu.addItem(parent)
         }
         if !actOrder.isEmpty {
-            add(pinned ? "활동 닫기" : "활동 열기", #selector(menuToggleIsland), key: "o")
+            add(pinned ? "활동 닫기" : "활동 열기", #selector(menuToggleIsland), key: ".")
             if actOrder.count > 1 {
                 add("이전 활동", #selector(menuPreviousActivity), key: "[")
                 add("다음 활동", #selector(menuNextActivity), key: "]")
@@ -817,25 +837,49 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func menuToggleIsland() {
-        if pinned { pinned = false; selected = nil; alertText = nil; banner = nil }
-        else if let kind = acts.first { selected = kind; pinned = true }
+        if pinned || hudActive {
+            pinned = false; hudUntil = .distantPast; selected = nil; alertText = nil; banner = nil
+            releaseKeyboardFocus()
+        } else if let kind = acts.first { selected = kind; pinned = true }
+        else { showAlert("실행 중인 활동이 없습니다", seconds: 4) }
         refreshUI(); applyShape()
         if pinned { focusIsland() }
     }
-    func focusIsland() {
-        NSApp.activate(ignoringOtherApps: true)
-        panel.makeKey()
+    var keyboardControls: [NSView] {
         let controls: [NSView]
         switch body {
-        case .media: controls = [c.playB, c.prevB, c.nextB, c.progress]
+        case .media: controls = [c.prevB, c.playB, c.nextB, c.progress]
         case .timer: controls = [c.pauseB, c.cancelB]
         case .file: controls = [c.fRevealB, c.fRemoveB]
         case .hud: controls = [c.hBar]
         default: controls = []
         }
-        let visible = controls.filter { !$0.isHidden } + (navigationVisible ? [c.activityPrevious, c.activityNext] : [])
-        for (index, control) in visible.enumerated() { control.nextKeyView = visible[(index + 1) % visible.count] }
-        panel.makeFirstResponder(visible.first)
+        return controls.filter { !$0.isHidden && (($0 as? NSControl)?.isEnabled ?? true) }
+    }
+    func releaseKeyboardFocus() {
+        panel.resignKey()
+        let previous = keyboardReturnApp
+        keyboardReturnApp = nil
+        if let previous, !previous.isTerminated { previous.activate(options: []) }
+    }
+    func focusIsland() {
+        if let previous = NSWorkspace.shared.frontmostApplication, previous.processIdentifier != ProcessInfo.processInfo.processIdentifier {
+            keyboardReturnApp = previous
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKey()
+        let controls = keyboardControls
+        for (index, control) in controls.enumerated() { control.nextKeyView = controls[(index + 1) % controls.count] }
+        panel.makeFirstResponder(controls.first ?? view)
+    }
+    func advanceKeyboardSelection(backwards: Bool) {
+        let controls = keyboardControls
+        guard !controls.isEmpty else { return }
+        let current = controls.firstIndex { $0 === panel.firstResponder }
+        let index = current.map { ($0 + (backwards ? -1 : 1) + controls.count) % controls.count } ?? (backwards ? controls.count - 1 : 0)
+        let previous = panel.firstResponder as? NSView
+        panel.makeFirstResponder(controls[index])
+        previous?.needsDisplay = true; controls[index].needsDisplay = true
     }
     func moveActivity(_ offset: Int) {
         guard !actOrder.isEmpty else { return }
@@ -859,7 +903,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         UserDefaults.standard.set(true, forKey: "hasSeenGuide")
         let alert = NSAlert()
         alert.messageText = "NotchIsland 사용법"
-        alert.informativeText = "노치를 클릭하면 활동을 열거나 닫습니다. 여러 활동은 아래 다이얼을 드래그하거나 가로로 스크롤해 전환합니다. 음악 카드에서 가로 스크롤하면 재생 위치가 이동합니다. 파일을 노치로 드래그해 보관하고, 메뉴 막대의 활동 목록에서 모든 항목을 열 수 있습니다.\n\n미디어 키와 Esc로 닫기에는 접근성 권한이 필요합니다. 권한 없이도 나머지 기능을 사용할 수 있습니다."
+        alert.informativeText = "노치를 클릭하거나 Command + .으로 열고 닫습니다. 펼친 상태에서 Tab / Shift + Tab으로 선택하고 Enter 또는 Space로 실행합니다. 슬라이더는 좌우 방향키로 조절합니다. 여러 활동은 아래 다이얼을 드래그하거나 가로로 스크롤해 전환합니다. 음악 카드에서 가로 스크롤하면 재생 위치가 이동합니다. 파일을 노치로 드래그해 보관하고, 메뉴 막대의 활동 목록에서 모든 항목을 열 수 있습니다.\n\n미디어 키와 Esc로 닫기에는 접근성 권한이 필요합니다. 권한 없이도 나머지 기능을 사용할 수 있습니다."
         alert.addButton(withTitle: "확인")
         if !AXIsProcessTrusted() { alert.addButton(withTitle: "접근성 권한 설정") }
         NSApp.activate(ignoringOtherApps: true)
@@ -919,11 +963,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let a = acts
         guard !a.isEmpty else { return nil }
         let m = NSEvent.mouseLocation
-        if pillP.active, a.count >= 3, pillP.panel.frame.insetBy(dx: -6, dy: -6).contains(m) {
-            let items = Array(a.dropFirst(2))
-            let point = pillView.convert(pillP.panel.convertPoint(fromScreen: m), from: nil)
-            if let index = pillView.itemFrames.firstIndex(where: { $0.contains(point) }), items.indices.contains(index) { return items[index] }
-            return nil
+        if !rowView.isHidden, a.count >= 3 {
+            let point = rowView.convert(panel.convertPoint(fromScreen: m), from: nil)
+            if rowView.bounds.contains(point) {
+                let items = Array(a.dropFirst(2))
+                if let index = rowView.itemFrames.firstIndex(where: { $0.contains(point) }), items.indices.contains(index) { return items[index] }
+                return nil
+            }
         }
         if shape == .expanded {
             let point = c.convert(panel.convertPoint(fromScreen: m), from: nil)
@@ -1083,10 +1129,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Volume changed by something else (menu bar slider, headphones, another app): show it too.
     func pollVolume() {
-        guard let v = SystemLevels.volume(), let m = SystemLevels.muted() else { return }
-        defer { lastVol = v; lastMute = m }
-        guard let lv = lastVol, let lm = lastMute else { return }              // first read is the baseline
-        if abs(v - lv) > 0.004 || m != lm { showHUD(.volume, v, muted: m || v < 0.001) }
+        guard let v = SystemLevels.volume() else { return }
+        let muted = SystemLevels.muted() ?? false
+        lastVol = v; lastMute = muted
+        // Core Audio reports a value change, not whether a human or adaptive audio caused it.
+        // Only refresh an existing HUD; new HUDs require an intercepted key or our slider.
+        if hudActive && hudKind == .volume { hudValue = v; hudMuted = muted || v < 0.001 }
     }
 
     /// Media keys, once the Accessibility permission has been granted. Returns true when the key was handled.
@@ -1101,13 +1149,19 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let cur = SystemLevels.volume() ?? 0
             if code == 7 {
                 let now = !wasMuted
-                SystemLevels.setMuted(now)
-                showHUD(.volume, cur, muted: now || cur < 0.001)
+                if SystemLevels.setMuted(now) {
+                    showHUD(.volume, cur, muted: now || cur < 0.001)
+                } else {
+                    if cur > 0.001 { lastAudibleVolume = cur }
+                    let value: Float = cur > 0.001 ? 0 : lastAudibleVolume
+                    guard SystemLevels.setVolume(value) else { return false }
+                    showHUD(.volume, value, muted: value < 0.001)
+                }
                 return true
             }
             if wasMuted { SystemLevels.setMuted(false) }
             let nv = min(1, max(0, snap(cur) + (code == 0 ? step : -step)))
-            SystemLevels.setVolume(nv)
+            guard SystemLevels.setVolume(nv) else { return false }
             showHUD(.volume, nv, muted: nv < 0.001)
             return true
         case 2, 3:                                                             // brightness up / down
@@ -1206,6 +1260,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let probe = NSRect(x: hit.minX, y: hit.minY, width: hit.width, height: hit.height + 4) // include the screen's top edge
         if probe.contains(m) {
             hoverUntil = now.addingTimeInterval(0.25)
+            if case .airpods? = banner, let expires = bannerHideAt { bannerHideAt = max(expires, now.addingTimeInterval(1.2)) }
             if hudActive { hudUntil = max(hudUntil, now.addingTimeInterval(0.9)) }   // pointer on the HUD: keep it
         }
         let overHUD = hudActive && probe.contains(m)
@@ -1248,7 +1303,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if due(&tMusic, shape == .expanded ? 2 : (media?.playing == true ? 3 : 5)) { pollMusic() }
         if let m = media, !m.playing, !demoMedia, demoActsN == nil, shape != .expanded,
            now.timeIntervalSince(lastPlayingAt) > 4 { media = nil }     // paused for a while: let it go
-        if due(&tAirPods, 30) { pollAirPods() }    // system_profiler is heavy; a new output device triggers it sooner (see watchOutputDevice)
+        if due(&tAirPods, 12) { pollAirPods() }    // system_profiler is heavy; a new output device triggers it sooner (see watchOutputDevice)
 
         
         prevTimerStarted = timer.started
@@ -1290,21 +1345,47 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    func scheduleAirPodsRefresh(after delay: TimeInterval = 0.6) {
+        airRefreshWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.pollAirPods() }
+        airRefreshWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
     func pollAirPods() {
-        guard !airBusy else { return }
+        guard !airBusy else { airRefreshPending = true; return }
         airBusy = true
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let list = queryAirPods()
-            DispatchQueue.main.async { self?.airBusy = false; self?.applyAirPods(list) }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.airBusy = false
+                self.applyAirPods(list)
+                if self.airRefreshPending { self.airRefreshPending = false; self.scheduleAirPodsRefresh() }
+            }
         }
     }
 
-    func applyAirPods(_ list: [AirPodsInfo]) {
-        airList = list
-        if airBaseline {                             // the first poll only records what is already connected
-            for d in list where !airKnown.contains(d.name) { showBanner(.airpods(symbol: d.symbol, level: d.level), autoHide: 4) }   // only at the moment of connecting
+    func applyAirPods(_ list: [AirPodsInfo]?) {
+        let previousIDs = Set(airConnections.devices.keys)
+        let changes = airConnections.update(list)
+        airList = Array(airConnections.devices.values)
+        for (device, connected) in changes {
+            showBanner(.airpods(symbol: device.symbol, level: connected ? device.level : nil,
+                                name: device.name, connected: connected), autoHide: connected ? 7 : 5)
         }
-        airKnown = Set(list.map { $0.name }); airBaseline = true
+        // Confirm absences with a second successful report; transient errors preserve the baseline.
+        if let list, !previousIDs.subtracting(Set(list.map { $0.id })).isEmpty {
+            scheduleAirPodsRefresh()
+        }
+        if list == nil {
+            airFailures += 1
+            scheduleAirPodsRefresh(after: min(30, pow(2, Double(min(airFailures, 5)))))
+        } else { airFailures = 0 }
+        if case .airpods(_, _, let name, true)? = banner,
+           let device = airList.first(where: { $0.name == name }) {
+            banner = .airpods(symbol: device.symbol, level: device.level, name: device.name)
+        }
     }
 
     func pollMusic() {
@@ -1391,10 +1472,6 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         c.ending = b == .none && acts.isEmpty
         c.bandH = (shape == .expanded || (shape == .collapsed && atRest)) ? notchH : compactH
 
-        c.navigationVisible = navigationVisible
-        if let kind = cardKind, let index = actOrder.firstIndex(of: kind) {
-            setText(c.activityPosition, "\(index + 1) / \(actOrder.count) · " + activityName(kind))
-        }
         c.transition(to: String(describing: cardKind) + String(describing: b))
         populate(c, bn: displayBanner, kind: cardKind)
         if let k = cardKind, let i = acts.firstIndex(of: k) {           // the wheel follows the shown activity (and a finger on it)
@@ -1440,6 +1517,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if plan != lastPlan { lastPlan = plan; placeSlots(plan) }
         c.needsLayout = true
         c.applyVisibility(expanded: shape == .expanded)
+        if panel.isKeyWindow, shape == .expanded,
+           !keyboardControls.contains(where: { $0 === panel.firstResponder }) {
+            panel.makeFirstResponder(keyboardControls.first ?? view)
+        }
     }
 
     /// Fills the card of one island (the main one or the second notch) with the data of the activity it shows.
@@ -1459,7 +1540,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 setText(c.bTitle, title); setText(c.bPct, "\(level)%")
                 c.bPct.textColor = color
                 c.bGlyph.fraction = CGFloat(level) / 100; c.bGlyph.color = color
-            case .airpods(let symbol, let level):
+            case .airpods(let symbol, let level, let name, let connected):
                 c.bannerIsAir = true
                 if symbol != c.bannerSymbol {
                     c.bannerSymbol = symbol
@@ -1467,14 +1548,19 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         .withSymbolConfiguration(.init(pointSize: 21, weight: .regular))
                     c.bAir.contentTintColor = .white
                 }
+                setText(c.aTitle, name)
+                setText(c.aState, connected ? "연결됨" : "연결 해제됨")
+                c.aState.textColor = connected ? bannerGreen : NSColor(white: 1, alpha: 0.6)
+                setText(c.aBattery, connected ? level.map { "\($0)%" } ?? "배터리 정보 없음" : "")
                 c.bRing.fraction = CGFloat(level ?? 0) / 100
+                c.bRing.isHidden = !connected || level == nil
             }
         }
 
         // file card
         if case .file(let u)? = kind, c.fileShown != u {
             c.fileShown = u
-            c.fIcon.image = NSWorkspace.shared.icon(forFile: u.path)
+            c.fIcon.setFile(u)
             setText(c.fName, u.lastPathComponent)
             setText(c.fSub, fileSubtitle(u))
             c.fRevealB.isEnabled = FileManager.default.fileExists(atPath: u.path)
@@ -1498,6 +1584,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Updates what the small slot views show.
     func refreshSlots() {
+        for (kind, item) in slotItems {
+            if case .file(let url) = kind { (item.icon as? FilePreviewView)?.setFile(url) }
+        }
         if let m = media, let it = slotItem(.media), let art = it.icon as? ArtView, let eq = it.detail as? EqView {
             art.setImage(artwork); eq.color = artColor; eq.setPlaying(m.playing && usedViews.contains(where: { $0 === eq }))
         }
@@ -1552,9 +1641,16 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             c.rightView = v.view; c.rightSize = v.size
             use(v.view, in: c)
         } else { c.rightView = nil }
-        let pitems = plan.pill.compactMap { slotItem($0) }
-        for it in pitems { use(it.icon, in: pillView); use(it.detail, in: pillView) }
-        pillView.items = pitems
+        let pitems = plan.row.compactMap { slotItem($0) }
+        for it in pitems { use(it.icon, in: rowView); use(it.detail, in: rowView) }
+        let wasHidden = rowView.isHidden
+        rowView.items = pitems
+        rowView.isHidden = pitems.isEmpty
+        if wasHidden && !pitems.isEmpty {
+            rowView.alphaValue = 0
+            fade(rowView, to: 1)
+        }
+        c.needsLayout = true
         let nowIDs = Set(now.map { ObjectIdentifier($0) })
         let stale = usedViews.filter { !nowIDs.contains(ObjectIdentifier($0)) }
         for v in stale { fade(v, to: 0) }
@@ -1584,6 +1680,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if target != shape {
             if target == .peek && shape != .pressed { haptic(.alignment) }   // light tick when the pointer arrives
             shape = target
+            if target != .expanded && panel.isKeyWindow { releaseKeyboardFocus() }
             if target == .expanded { fileInfo.removeAll(); c.fileShown = nil }   // size / folder may have changed since it was last opened
             refreshUI()                                // wings/body change with the shape
             switch target {
@@ -1605,36 +1702,14 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             mainP.x.tgt = r.minX; mainP.w.tgt = r.width; mainP.h.tgt = r.height
             wake = true
         }
-        let pr = pillRect()
-        if setTarget(pillP, pr?.0, ty: pr?.1 ?? compactH + pillGap, anchorX: screen.frame.midX) { wake = true }
         if wake { atRest = false; link?.isPaused = false }
-    }
-
-    /// Points an auxiliary window at a rect, or (nil) makes it shrink back into its anchor. Returns true if anything changed.
-    func setTarget(_ p: Piece, _ r: NSRect?, ty: CGFloat, anchorX: CGFloat) -> Bool {
-        if let r = r {
-            var changed = false
-            if !p.active {                                    // appears: grows out of its anchor
-                p.active = true; changed = true
-                p.x.jump(anchorX); p.w.jump(0); p.h.jump(r.height); p.ty.jump(ty)
-                p.panel.alphaValue = 0
-                p.panel.orderFrontRegardless(); makeSticky(p.panel); p.visible = true
-                if let sh = p.shadow { sh.orderFrontRegardless(); makeSticky(sh) }
-            }
-            if abs(p.x.tgt - r.minX) > 0.01 || abs(p.w.tgt - r.width) > 0.01 || abs(p.h.tgt - r.height) > 0.01 || abs(p.ty.tgt - ty) > 0.01 { changed = true }
-            p.x.tgt = r.minX; p.w.tgt = r.width; p.h.tgt = r.height; p.ty.tgt = ty; p.fullW = r.width
-            return changed
-        }
-        guard p.active else { return false }
-        p.active = false; p.x.tgt = anchorX; p.w.tgt = 0
-        return true
     }
 
     @objc func animTick(_ l: CADisplayLink) {
         let dt = min(max(l.targetTimestamp - l.timestamp, 1.0 / 240), 1.0 / 30)
         let steps = Int((dt * 240).rounded(.up)); let h = dt / CGFloat(steps)
         var allSettled = true
-        for p in [mainP!, pillP!] where p.active || p.visible {
+        for p in [mainP!] where p.active || p.visible {
             let isMain = p === mainP
             let k: CGFloat = isMain ? stiffness : 300, cd: CGFloat = isMain ? damping : 28
             if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion { p.snap() }

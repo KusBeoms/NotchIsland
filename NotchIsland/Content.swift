@@ -21,7 +21,7 @@ class FileDragView: NSView, NSDraggingSource {
         downPoint = nil; draggingURL = u
         onDragBegan?()
         let item = NSDraggingItem(pasteboardWriter: u as NSURL)
-        let img = NSWorkspace.shared.icon(forFile: u.path)
+        let img = (FilePreviews.shared.cached(for: u) ?? NSWorkspace.shared.icon(forFile: u.path)).copy() as! NSImage
         img.size = NSSize(width: 48, height: 48)
         let at = convert(event.locationInWindow, from: nil)
         item.setDraggingFrame(NSRect(x: at.x - 24, y: at.y - 24, width: 48, height: 48), contents: img)
@@ -105,8 +105,8 @@ final class Piece {
     func snap() { x.snap(); w.snap(); h.snap(); ty.snap(); m.snap() }
 }
 
-/// The detached icon circle and the pill under the notch: black capsules holding slot views, centred.
-final class PillView: FileDragView {
+/// A second activity row embedded in the notch body.
+final class ActivityRowView: FileDragView {
     var onPress: (() -> Void)?
     var onRelease: ((Bool) -> Void)?
     var items: [SlotItem] = [] { didSet { needsLayout = true } }
@@ -154,6 +154,7 @@ final class PillView: FileDragView {
 }
 
 final class Content: Flip {
+    let activityRow = ActivityRowView(frame: .zero)
     var notchH: CGFloat = 32
     var bandH: CGFloat = 32          // height of the top band the wings live in (taller while compact)
     var body: Body = .none
@@ -166,11 +167,6 @@ final class Content: Flip {
     var leftSize = CGSize(width: 24, height: 24)
     private var lastAlpha: [ObjectIdentifier: CGFloat] = [:]
 
-    var navigationVisible = false
-    let activityPrevious = makeSymbolButton("chevron.left", 12, .white)
-    let activityNext = makeSymbolButton("chevron.right", 12, .white)
-    let activityPosition = makeLabel(11, .medium, NSColor(white: 1, alpha: 0.65), align: .center)
-    private let navigationLine = NSBox()
     private var transitionKey = ""
 
     func transition(to key: String) {
@@ -213,6 +209,9 @@ final class Content: Flip {
     let bGlyph = BatteryGlyph()
     let bAir = NSImageView()
     let bRing = RingView()
+    let aTitle = makeLabel(14, .semibold, .white)
+    let aState = makeLabel(12, .medium, .white)
+    let aBattery = makeLabel(11, .medium, NSColor(white: 1, alpha: 0.6), align: .right)
     // volume / brightness HUD: icon on the left of the notch, level bar on the right
     let hIcon = NSImageView()
     let hBar = LevelBar()
@@ -220,7 +219,7 @@ final class Content: Flip {
     // alert body
     let alertL = makeLabel(15, .semibold, .white, align: .center)
     // file body: the file's icon, name and where it lives; buttons to show it in Finder / let it go
-    let fIcon = NSImageView()
+    let fIcon = FilePreviewView()
     let fName = makeLabel(15, .semibold, .white)
     let fSub = makeLabel(12, .regular, NSColor(white: 1, alpha: 0.55))
     let fRevealB = makeSymbolButton("magnifyingglass", 15, .white)
@@ -234,11 +233,13 @@ final class Content: Flip {
         for b in [pauseB, cancelB] { b.wantsLayer = true; b.layer?.cornerRadius = 22 }
         pauseB.layer?.backgroundColor = accent.withAlphaComponent(0.28).cgColor
         cancelB.layer?.backgroundColor = NSColor(white: 1, alpha: 0.2).cgColor
-        navigationLine.boxType = .separator
         hIcon.contentTintColor = .white
         dropIcon.image = NSImage(systemSymbolName: "tray.and.arrow.down.fill", accessibilityDescription: nil)?.withSymbolConfiguration(.init(pointSize: 26, weight: .semibold))
         dropIcon.contentTintColor = NSColor(red: 0.45, green: 0.72, blue: 1.0, alpha: 1)
         dropHint.stringValue = "여기에 놓으세요"
+        activityRow.withDetail = true
+        activityRow.isHidden = true
+        addSubview(activityRow)
         fIcon.imageScaling = .scaleProportionallyUpOrDown
         for v in all { addSubview(v); v.alphaValue = 0 }
     }
@@ -246,8 +247,8 @@ final class Content: Flip {
 
     var all: [NSView] {
         [art, titleL, artistL, bodyEq, progress, elapsedL, remainL,
-         prevB, playB, nextB, pauseB, cancelB, tLabel, tTime, alertL, bTitle, bPct, bGlyph, bAir, bRing, hIcon, hBar]
-            + [fIcon, fName, fSub, fRevealB, fRemoveB, dropIcon, dropHint, activityPrevious, activityNext, activityPosition, navigationLine]
+         prevB, playB, nextB, pauseB, cancelB, tLabel, tTime, alertL, bTitle, bPct, bGlyph, bAir, bRing, aTitle, aState, aBattery, hIcon, hBar]
+            + [fIcon, fName, fSub, fRevealB, fRemoveB, dropIcon, dropHint]
     }
 
     /// Cover + title + artist: tapping it opens the app that is playing.
@@ -264,11 +265,7 @@ final class Content: Flip {
         leftView?.frame = NSRect(x: leftInset, y: (bandH - leftSize.height) / 2, width: leftSize.width, height: leftSize.height)
         rightView?.frame = NSRect(x: w - rightInset - rightSize.width, y: (bandH - rightSize.height) / 2,
                                   width: rightSize.width, height: rightSize.height)
-        let footerY = bounds.height - 38
-        navigationLine.frame = NSRect(x: pad, y: footerY, width: max(0, w - pad * 2), height: 1)
-        activityPrevious.frame = NSRect(x: pad, y: footerY + 2, width: 36, height: 32)
-        activityNext.frame = NSRect(x: w - pad - 36, y: footerY + 2, width: 36, height: 32)
-        activityPosition.frame = NSRect(x: pad + 40, y: footerY + 10, width: max(0, w - 2 * pad - 80), height: 16)
+        activityRow.frame = NSRect(x: 8, y: bandH + 1, width: max(0, w - 16), height: 34)
         // media
         art.frame = NSRect(x: pad, y: top, width: 48, height: 48)
         let tx = pad + 48 + 12, tw = max(0, w - tx - pad - 26)
@@ -293,6 +290,13 @@ final class Content: Flip {
         bGlyph.frame = NSRect(x: w - 14 - 34, y: (notchH - 15) / 2, width: 34, height: 15)
         bPct.frame = NSRect(x: w - 14 - 34 - 8 - 56, y: (notchH - 20) / 2, width: 56, height: 20)
         bRing.frame = NSRect(x: w - 6 - 26, y: (notchH - 26) / 2, width: 26, height: 26)
+        if bannerIsAir {
+            bAir.frame = NSRect(x: pad, y: top + 9, width: 32, height: 32)
+            aTitle.frame = NSRect(x: pad + 44, y: top + 7, width: max(0, w - pad * 2 - 102), height: 18)
+            aState.frame = NSRect(x: pad + 44, y: top + 29, width: max(0, w - pad * 2 - 102), height: 16)
+            bRing.frame = NSRect(x: w - pad - 28, y: top + 5, width: 28, height: 28)
+            aBattery.frame = NSRect(x: w - pad - 70, y: top + 36, width: 70, height: 16)
+        }
         // HUD
         hIcon.frame = NSRect(x: pad, y: top + 6, width: 24, height: 24)          // below the notch, icon on the left
         hBar.frame = NSRect(x: pad + 24 + 14, y: top + 7, width: max(0, w - pad - 24 - 14 - pad), height: 22)
@@ -313,9 +317,7 @@ final class Content: Flip {
     /// Cross-fade every element to what the current shape/body/wings need.
     func applyVisibility(expanded: Bool) {
         let b = body
-        let navigation = expanded && navigationVisible
         let want: [(NSView, Bool)] = [
-            (activityPrevious, navigation), (activityNext, navigation), (activityPosition, navigation), (navigationLine, navigation),
             (art, expanded && b == .media), (titleL, expanded && b == .media), (artistL, expanded && b == .media),
             (bodyEq, expanded && b == .media), (progress, expanded && b == .media),
             (elapsedL, expanded && b == .media), (remainL, expanded && b == .media),
@@ -326,6 +328,9 @@ final class Content: Flip {
             (bTitle, expanded && b == .banner && !bannerIsAir), (bPct, expanded && b == .banner && !bannerIsAir),
             (bGlyph, expanded && b == .banner && !bannerIsAir),
             (bAir, expanded && b == .banner && bannerIsAir), (bRing, expanded && b == .banner && bannerIsAir),
+            (aTitle, expanded && b == .banner && bannerIsAir),
+            (aState, expanded && b == .banner && bannerIsAir),
+            (aBattery, expanded && b == .banner && bannerIsAir),
             (hIcon, expanded && b == .hud), (hBar, expanded && b == .hud),
             (fIcon, expanded && b == .file), (fName, expanded && b == .file), (fSub, expanded && b == .file),
             (fRevealB, expanded && b == .file), (fRemoveB, expanded && b == .file),

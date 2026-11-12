@@ -40,6 +40,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>LSUIElement</key><true/>
     <key>NSHighResolutionCapable</key><true/>
+    <key>NSBluetoothAlwaysUsageDescription</key><string>에어팟의 연결 및 연결 해제 상태를 표시합니다.</string>
     <key>NSAudioCaptureUsageDescription</key><string>노치의 이퀄라이저를 실제 재생 중인 소리에 맞춰 움직이기 위해 시스템 오디오를 분석합니다. 소리는 저장되거나 전송되지 않습니다.</string>
 </dict>
 </plist>
