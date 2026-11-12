@@ -110,6 +110,7 @@ final class PillView: FileDragView {
     var onPress: (() -> Void)?
     var onRelease: ((Bool) -> Void)?
     var items: [SlotItem] = [] { didSet { needsLayout = true } }
+    private(set) var itemFrames: [NSRect] = []
     var withDetail = false { didSet { needsLayout = true } }
     private let shapeMask = CAShapeLayer()
 
@@ -131,7 +132,9 @@ final class PillView: FileDragView {
         let widths = items.map { withDetail ? $0.pillWidth : 24 }
         let total = widths.reduce(0, +) + 16 * CGFloat(max(items.count - 1, 0))
         var x = (bounds.width - total) / 2
+        itemFrames = []
         for (it, wd) in zip(items, widths) {
+            itemFrames.append(NSRect(x: x - 8, y: 0, width: wd + 16, height: bounds.height))
             it.icon.frame = NSRect(x: x, y: (bounds.height - 24) / 2, width: 24, height: 24)
             if withDetail {
                 it.detail.frame = NSRect(x: x + 30, y: (bounds.height - it.detailSize.height) / 2,
@@ -163,6 +166,30 @@ final class Content: Flip {
     var leftSize = CGSize(width: 24, height: 24)
     private var lastAlpha: [ObjectIdentifier: CGFloat] = [:]
 
+    var navigationVisible = false
+    let activityPrevious = makeSymbolButton("chevron.left", 12, .white)
+    let activityNext = makeSymbolButton("chevron.right", 12, .white)
+    let activityPosition = makeLabel(11, .medium, NSColor(white: 1, alpha: 0.65), align: .center)
+    private let navigationLine = NSBox()
+    private var transitionKey = ""
+
+    func transition(to key: String) {
+        guard transitionKey != key else { return }
+        let hadContent = !transitionKey.isEmpty
+        transitionKey = key
+        guard hadContent, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
+        for v in [art, titleL, artistL, fIcon, fName, fSub, tTime, tLabel] where v.alphaValue > 0.3 {
+            v.wantsLayer = true
+            let fade = CABasicAnimation(keyPath: "opacity")
+            fade.fromValue = 0.25; fade.toValue = 1; fade.duration = 0.22
+            v.layer?.add(fade, forKey: "activityChange")
+            let slide = CABasicAnimation(keyPath: "transform.translation.y")
+            slide.fromValue = 5; slide.toValue = 0; slide.duration = 0.24
+            slide.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            v.layer?.add(slide, forKey: "activitySlide")
+        }
+    }
+
     // media body
     let art = ArtView(radius: 10)
     let titleL = makeLabel(15, .semibold, .white)
@@ -178,7 +205,7 @@ final class Content: Flip {
     let pauseB = makeSymbolButton("pause.fill", 20, accent)
     let cancelB = makeSymbolButton("xmark", 18, .white)
     let tLabel = makeLabel(13, .semibold, accent, align: .right)
-    let tTime = makeLabel(34, .semibold, accent, mono: true, align: .right)
+    let tTime = makeLabel(30, .semibold, accent, mono: true, align: .right)
     // banner body (charging / AirPods): a pill as tall as the notch, content on both sides of it
     var bannerIsAir = false
     let bTitle = makeLabel(16, .semibold, .white)
@@ -207,6 +234,7 @@ final class Content: Flip {
         for b in [pauseB, cancelB] { b.wantsLayer = true; b.layer?.cornerRadius = 22 }
         pauseB.layer?.backgroundColor = accent.withAlphaComponent(0.28).cgColor
         cancelB.layer?.backgroundColor = NSColor(white: 1, alpha: 0.2).cgColor
+        navigationLine.boxType = .separator
         hIcon.contentTintColor = .white
         dropIcon.image = NSImage(systemSymbolName: "tray.and.arrow.down.fill", accessibilityDescription: nil)?.withSymbolConfiguration(.init(pointSize: 26, weight: .semibold))
         dropIcon.contentTintColor = NSColor(red: 0.45, green: 0.72, blue: 1.0, alpha: 1)
@@ -219,7 +247,7 @@ final class Content: Flip {
     var all: [NSView] {
         [art, titleL, artistL, bodyEq, progress, elapsedL, remainL,
          prevB, playB, nextB, pauseB, cancelB, tLabel, tTime, alertL, bTitle, bPct, bGlyph, bAir, bRing, hIcon, hBar]
-            + [fIcon, fName, fSub, fRevealB, fRemoveB, dropIcon, dropHint]
+            + [fIcon, fName, fSub, fRevealB, fRemoveB, dropIcon, dropHint, activityPrevious, activityNext, activityPosition, navigationLine]
     }
 
     /// Cover + title + artist: tapping it opens the app that is playing.
@@ -236,24 +264,29 @@ final class Content: Flip {
         leftView?.frame = NSRect(x: leftInset, y: (bandH - leftSize.height) / 2, width: leftSize.width, height: leftSize.height)
         rightView?.frame = NSRect(x: w - rightInset - rightSize.width, y: (bandH - rightSize.height) / 2,
                                   width: rightSize.width, height: rightSize.height)
+        let footerY = bounds.height - 38
+        navigationLine.frame = NSRect(x: pad, y: footerY, width: max(0, w - pad * 2), height: 1)
+        activityPrevious.frame = NSRect(x: pad, y: footerY + 2, width: 36, height: 32)
+        activityNext.frame = NSRect(x: w - pad - 36, y: footerY + 2, width: 36, height: 32)
+        activityPosition.frame = NSRect(x: pad + 40, y: footerY + 10, width: max(0, w - 2 * pad - 80), height: 16)
         // media
         art.frame = NSRect(x: pad, y: top, width: 48, height: 48)
         let tx = pad + 48 + 12, tw = max(0, w - tx - pad - 26)
         titleL.frame = NSRect(x: tx, y: top + 4, width: tw, height: 20)
         artistL.frame = NSRect(x: tx, y: top + 25, width: tw, height: 18)
         bodyEq.frame = NSRect(x: w - pad - 20, y: top + 6, width: 20, height: 20)
-        progress.frame = NSRect(x: pad, y: top + 50, width: w - 2 * pad, height: 16)      // a taller hit area around the 4pt line
+        progress.frame = NSRect(x: pad, y: top + 50, width: w - 2 * pad, height: 22)      // a taller hit area around the 4pt line
         elapsedL.frame = NSRect(x: pad, y: top + 62, width: 60, height: 14)
         remainL.frame = NSRect(x: w - pad - 60, y: top + 62, width: 60, height: 14)
         let cy = top + 76
-        playB.frame = NSRect(x: w / 2 - 25, y: cy, width: 50, height: 32)
-        prevB.frame = NSRect(x: w / 2 - 25 - 70, y: cy, width: 50, height: 32)
-        nextB.frame = NSRect(x: w / 2 - 25 + 70, y: cy, width: 50, height: 32)
+        playB.frame = NSRect(x: w / 2 - 25, y: cy, width: 50, height: 40)
+        prevB.frame = NSRect(x: w / 2 - 25 - 70, y: cy, width: 50, height: 40)
+        nextB.frame = NSRect(x: w / 2 - 25 + 70, y: cy, width: 50, height: 40)
         // timer
         pauseB.frame = NSRect(x: pad, y: top + 2, width: 44, height: 44)
         cancelB.frame = NSRect(x: pad + 52, y: top + 2, width: 44, height: 44)
         tLabel.frame = NSRect(x: w - pad - 150, y: top - 2, width: 150, height: 16)
-        tTime.frame = NSRect(x: w - pad - 150, y: top + 10, width: 150, height: 42)
+        tTime.frame = NSRect(x: w - pad - 158, y: top + 10, width: 158, height: 42)
         // banner (left/right inset 14 inside the body)
         bTitle.frame = NSRect(x: 14, y: (notchH - 20) / 2, width: 100, height: 20)
         bAir.frame = NSRect(x: 6, y: (notchH - 26) / 2, width: 28, height: 26)
@@ -267,11 +300,11 @@ final class Content: Flip {
         alertL.frame = NSRect(x: pad, y: notchH + 6, width: w - 2 * pad, height: 22)
         // file
         fIcon.frame = NSRect(x: pad, y: top, width: 48, height: 48)
-        let fx = pad + 48 + 12, fw = max(0, w - fx - pad - 76)
+        let fx = pad + 48 + 12, fw = max(0, w - fx - pad)
         fName.frame = NSRect(x: fx, y: top + 4, width: fw, height: 20)
         fSub.frame = NSRect(x: fx, y: top + 25, width: fw, height: 16)
-        fRevealB.frame = NSRect(x: w - pad - 72, y: top + 8, width: 34, height: 32)
-        fRemoveB.frame = NSRect(x: w - pad - 36, y: top + 8, width: 34, height: 32)
+        fRevealB.frame = NSRect(x: w - pad - 88, y: top + 52, width: 40, height: 40)
+        fRemoveB.frame = NSRect(x: w - pad - 40, y: top + 52, width: 40, height: 40)
         // drop hint
         dropIcon.frame = NSRect(x: pad, y: top + 6, width: 36, height: 36)
         dropHint.frame = NSRect(x: pad + 46, y: top + 14, width: max(0, w - pad * 2 - 46), height: 20)
@@ -280,7 +313,9 @@ final class Content: Flip {
     /// Cross-fade every element to what the current shape/body/wings need.
     func applyVisibility(expanded: Bool) {
         let b = body
+        let navigation = expanded && navigationVisible
         let want: [(NSView, Bool)] = [
+            (activityPrevious, navigation), (activityNext, navigation), (activityPosition, navigation), (navigationLine, navigation),
             (art, expanded && b == .media), (titleL, expanded && b == .media), (artistL, expanded && b == .media),
             (bodyEq, expanded && b == .media), (progress, expanded && b == .media),
             (elapsedL, expanded && b == .media), (remainL, expanded && b == .media),
@@ -302,7 +337,7 @@ final class Content: Flip {
             if lastAlpha[key] == a { continue }
             lastAlpha[key] = a
             NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = on ? 0.3 : (ending ? 0.5 : 0.22)
+                ctx.duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : (on ? 0.22 : (ending ? 0.3 : 0.16))
                 ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
                 v.animator().alphaValue = a
             }

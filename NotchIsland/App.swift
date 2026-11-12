@@ -52,6 +52,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var airList: [AirPodsInfo] = []
     var bannerHideAt: Date?
     // the pocket: every file dropped on the notch is an activity of its own (paths only, nothing is copied)
+    var clearedFiles: [URL] = []
     var files: [URL] = []
     var fileShown: URL?
     var fileInfo: [URL: String] = [:]
@@ -123,14 +124,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for u in files where !actOrder.contains(.file(u)) { actOrder.append(.file(u)) }
         func gone(_ k: ActKind) -> Bool { if case .file(let u) = k { return !files.contains(u) }; return false }
         actOrder.removeAll(where: gone)
-        // more than five activities: the oldest are not shown, and a file that falls off is discarded
-        if actOrder.count > 5 {
-            for k in actOrder.dropLast(5) { if case .file(let u) = k { files.removeAll { $0 == u }; slotItems.removeValue(forKey: k) } }
-            actOrder.removeAll(where: gone)
-            fileSave()
-        }
+
     }
-    var acts: [ActKind] { Array(actOrder.suffix(5)) }
+    var acts: [ActKind] {
+        var visible = Array(actOrder.suffix(5))
+        if let selected, actOrder.contains(selected), !visible.contains(selected), !visible.isEmpty { visible[0] = selected }
+        return visible
+    }
 
     func bodyFor(_ k: ActKind) -> Body {
         switch k {
@@ -283,6 +283,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var body: Body {
         if hudActive { return .hud }
         if dropping { return .drop }
+        if timer.finished, cardKind == .timer { return .timer }
         if banner != nil { return .banner }
         if alertText != nil { return .alert }
         switch cardKind {
@@ -308,11 +309,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     func slotWing(_ k: ActKind) -> CGFloat { showsPercent(k) ? 58 : iconWing }     // room beside the notch for that slot
     var bannerWing: CGFloat { if case .airpods? = displayBanner { return 42 }; return 110 }       // AirPods: just the icon and the ring
-    var expandedExtra: CGFloat { expandedExtraFor(body) }
+    var navigationVisible: Bool { acts.count > 1 && [.media, .timer, .file].contains(body) }
+    var expandedExtra: CGFloat { expandedExtraFor(body) + (navigationVisible ? 38 : 0) }
     func expandedExtraFor(_ b: Body) -> CGFloat {
         switch b {
         case .media:  return 122
-        case .file, .drop: return 62
+        case .file: return 104
+        case .drop: return 62
         case .timer:  return 62
         case .banner, .hud: return 0
         default:      return 38
@@ -413,6 +416,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         pillView.onPress = { [weak self] in self?.pressBegan() }
         pillView.onRelease = { [weak self] inside in self?.pressEnded(inside: inside) }
         wire(c.prevB, #selector(prevTapped)); wire(c.playB, #selector(playPauseTapped)); wire(c.nextB, #selector(nextTapped))
+        wire(c.activityPrevious, #selector(menuPreviousActivity)); wire(c.activityNext, #selector(menuNextActivity))
         wire(c.pauseB, #selector(timerToggleTapped)); wire(c.cancelB, #selector(timerCancelTapped))
         attachShadow(to: mainP) { [weak self] size in
             notchPath(size.width, size.height, earL: self?.view.earLeft ?? true, earR: self?.view.earRight ?? true)
@@ -505,6 +509,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setupStatusItem()
         keyTap.onKey = { [weak self] code, down, fine in self?.handleMediaKey(code, down, fine) ?? false }
         setupKeyTap()
+        if !UserDefaults.standard.bool(forKey: "hasSeenGuide") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in self?.showGuide() }
+        }
         refreshUI()
         scheduleStep(busy: true)
         watchOutputDevice()
@@ -544,6 +551,11 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: Esc closes the open island
 
     func watchEscape() {
+        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
+            guard e.keyCode == 53, let s = self, s.pinned else { return e }
+            s.pinned = false; s.alertText = nil; s.banner = nil
+            return nil
+        }
         NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] e in
             guard e.keyCode == 53, let s = self, s.pinned else { return }      // 53 = Esc (needs the Accessibility permission, like the key tap)
             if s.hudActive { s.hudUntil = .distantPast }
@@ -552,10 +564,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func accessibilityLabels() {
-        let labels: [(NSButton, String)] = [(c.prevB, "이전 곡"), (c.playB, "재생 / 일시정지"), (c.nextB, "다음 곡"),
+        let labels: [(NSButton, String)] = [(c.activityPrevious, "이전 활동"), (c.activityNext, "다음 활동"), (c.prevB, "이전 곡"), (c.playB, "재생 / 일시정지"), (c.nextB, "다음 곡"),
                                             (c.pauseB, "타이머 일시정지 / 계속"), (c.cancelB, "타이머 취소"),
                                             (c.fRevealB, "Finder에서 보기"), (c.fRemoveB, "주머니에서 빼기")]
         for (b, t) in labels { b.setAccessibilityLabel(t); b.toolTip = t }
+        view.dial.setAccessibilityLabel("활동 전환")
+        view.dial.toolTip = "드래그하거나 가로로 스크롤하여 활동 전환"
         c.hBar.setAccessibilityLabel("볼륨 / 밝기")
         c.progress.setAccessibilityLabel("재생 위치")
     }
@@ -649,7 +663,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func makePanel(_ frame: NSRect) -> NSPanel {
-        let p = NSPanel(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        let p = IslandPanel(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         // Windows above the dragging level (500) cannot be drop targets, so stay just below it: still above menus and the Dock.
         p.level = NSWindow.Level(rawValue: 400)
         p.backgroundColor = .clear
@@ -750,7 +764,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if timer.started {
             menu.addItem(withTitle: (timer.mode == .stopwatch ? "스톱워치 " : "타이머 ") + timer.text(), action: nil, keyEquivalent: "").isEnabled = false
-            add(timer.running ? "일시정지" : "계속", #selector(menuToggleTimer))
+            add(timer.finished ? "다시 시작" : (timer.running ? "일시정지" : "계속"), #selector(menuToggleTimer))
             add("취소", #selector(menuCancelTimer))
         } else {
             add("스톱워치 시작", #selector(menuStopwatch))
@@ -759,13 +773,123 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let i = NSMenuItem(title: "\(m)분", action: #selector(menuCountdown(_:)), keyEquivalent: "")
                 i.target = self; i.tag = m; sub.addItem(i)
             }
+            sub.addItem(.separator())
+            let custom = NSMenuItem(title: "직접 입력…", action: #selector(menuCustomTimer), keyEquivalent: "")
+            custom.target = self; sub.addItem(custom)
             let parent = NSMenuItem(title: "타이머", action: nil, keyEquivalent: "")
             parent.submenu = sub; menu.addItem(parent)
         }
+        if !actOrder.isEmpty {
+            add(pinned ? "활동 닫기" : "활동 열기", #selector(menuToggleIsland), key: "o")
+            if actOrder.count > 1 {
+                add("이전 활동", #selector(menuPreviousActivity), key: "[")
+                add("다음 활동", #selector(menuNextActivity), key: "]")
+            }
+            let activities = NSMenu()
+            for (index, kind) in actOrder.enumerated() {
+                let item = NSMenuItem(title: activityName(kind), action: #selector(menuSelectActivity(_:)), keyEquivalent: "")
+                item.target = self; item.tag = index
+                item.state = kind == cardKind && pinned ? .on : .off
+                activities.addItem(item)
+            }
+            let parent = NSMenuItem(title: "활동 목록 (\(actOrder.count))", action: nil, keyEquivalent: "")
+            parent.submenu = activities; menu.addItem(parent)
+        }
         if !files.isEmpty { add("주머니 비우기 (\(files.count))", #selector(filesClear)) }
+        if !clearedFiles.isEmpty { add("주머니 비우기 취소", #selector(restoreClearedFiles), key: "z") }
+        menu.addItem(.separator())
+        add("사용법", #selector(menuGuide))
+        add(AXIsProcessTrusted() ? "접근성 권한 허용됨" : "접근성 권한 설정…", #selector(menuAccessibility))
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "NotchIsland 종료", action: #selector(menuQuit), keyEquivalent: "q")
         quit.target = self; menu.addItem(quit)
+    }
+
+    func activityName(_ kind: ActKind) -> String {
+        switch kind {
+        case .media: return "미디어: \(media?.title ?? "재생 중")"
+        case .timer: return timer.finished ? "타이머 완료" : "타이머: \(timer.text())"
+        case .charging: return "충전 중"
+        case .lowBattery: return "배터리 부족"
+        case .airpods: return "AirPods"
+        case .file(let url): return "파일: \(url.lastPathComponent)"
+        }
+    }
+
+    @objc func menuToggleIsland() {
+        if pinned { pinned = false; selected = nil; alertText = nil; banner = nil }
+        else if let kind = acts.first { selected = kind; pinned = true }
+        refreshUI(); applyShape()
+        if pinned { focusIsland() }
+    }
+    func focusIsland() {
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKey()
+        let controls: [NSView]
+        switch body {
+        case .media: controls = [c.playB, c.prevB, c.nextB, c.progress]
+        case .timer: controls = [c.pauseB, c.cancelB]
+        case .file: controls = [c.fRevealB, c.fRemoveB]
+        case .hud: controls = [c.hBar]
+        default: controls = []
+        }
+        let visible = controls.filter { !$0.isHidden } + (navigationVisible ? [c.activityPrevious, c.activityNext] : [])
+        for (index, control) in visible.enumerated() { control.nextKeyView = visible[(index + 1) % visible.count] }
+        panel.makeFirstResponder(visible.first)
+    }
+    func moveActivity(_ offset: Int) {
+        guard !actOrder.isEmpty else { return }
+        let current = cardKind.flatMap { actOrder.firstIndex(of: $0) } ?? 0
+        let index = (current + offset + actOrder.count) % actOrder.count
+        let item = NSMenuItem(); item.tag = index; menuSelectActivity(item)
+    }
+    @objc func menuPreviousActivity() { moveActivity(-1) }
+    @objc func menuNextActivity() { moveActivity(1) }
+
+    @objc func menuSelectActivity(_ sender: NSMenuItem) {
+        guard actOrder.indices.contains(sender.tag) else { return }
+        let kind = actOrder[sender.tag]
+        selected = kind; banner = nil; alertText = nil; pinned = true
+        refreshUI(); applyShape()
+        focusIsland()
+    }
+
+    @objc func menuGuide() { showGuide() }
+    func showGuide() {
+        UserDefaults.standard.set(true, forKey: "hasSeenGuide")
+        let alert = NSAlert()
+        alert.messageText = "NotchIsland 사용법"
+        alert.informativeText = "노치를 클릭하면 활동을 열거나 닫습니다. 여러 활동은 아래 다이얼을 드래그하거나 가로로 스크롤해 전환합니다. 음악 카드에서 가로 스크롤하면 재생 위치가 이동합니다. 파일을 노치로 드래그해 보관하고, 메뉴 막대의 활동 목록에서 모든 항목을 열 수 있습니다.\n\n미디어 키와 Esc로 닫기에는 접근성 권한이 필요합니다. 권한 없이도 나머지 기능을 사용할 수 있습니다."
+        alert.addButton(withTitle: "확인")
+        if !AXIsProcessTrusted() { alert.addButton(withTitle: "접근성 권한 설정") }
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertSecondButtonReturn { requestAccessibility() }
+    }
+
+    func requestAccessibility() {
+        if AXIsProcessTrusted() { return }
+        _ = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+    @objc func menuAccessibility() { requestAccessibility() }
+
+    @objc func menuCustomTimer() {
+        let alert = NSAlert()
+        alert.messageText = "타이머 직접 설정"
+        alert.informativeText = "시간을 분 단위로 입력하세요 (1~1440분)."
+        alert.addButton(withTitle: "시작"); alert.addButton(withTitle: "취소")
+        let input = NSTextField(string: "5")
+        input.frame = NSRect(x: 0, y: 0, width: 180, height: 24)
+        alert.accessoryView = input
+        NSApp.activate(ignoringOtherApps: true)
+        while alert.runModal() == .alertFirstButtonReturn {
+            if let minutes = Int(input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)), (1...1440).contains(minutes) {
+                timer.startCountdown(minutes: minutes); refreshUI(); return
+            }
+            alert.informativeText = "1부터 1440까지의 정수를 입력하세요."
+        }
     }
 
     @objc func menuStopwatch() { timer.startStopwatch(); refreshUI() }
@@ -796,8 +920,16 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard !a.isEmpty else { return nil }
         let m = NSEvent.mouseLocation
         if pillP.active, a.count >= 3, pillP.panel.frame.insetBy(dx: -6, dy: -6).contains(m) {
-            let items = Array(a.dropFirst(2)), f = pillP.panel.frame
-            return items[min(items.count - 1, max(0, Int((m.x - f.minX) / max(f.width, 1) * CGFloat(items.count))))]
+            let items = Array(a.dropFirst(2))
+            let point = pillView.convert(pillP.panel.convertPoint(fromScreen: m), from: nil)
+            if let index = pillView.itemFrames.firstIndex(where: { $0.contains(point) }), items.indices.contains(index) { return items[index] }
+            return nil
+        }
+        if shape == .expanded {
+            let point = c.convert(panel.convertPoint(fromScreen: m), from: nil)
+            if let left = lastPlan?.left, c.leftView?.frame.contains(point) == true { return left }
+            if let right = lastPlan?.right, c.rightView?.frame.contains(point) == true { return right }
+            return nil
         }
         if a.count >= 2, m.x > notchRight { return a[1] }
         return a[0]
@@ -835,7 +967,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             selected = pressKind
             pinned = true
         }
-        if pressedWhileExpanded && inside {          // tapping the open island shrinks it back
+        if pressedWhileExpanded && inside {
+            if let kind = pressKind, kind != cardKind {
+                selected = kind; pinned = true; refreshUI(); return
+            }
             if hudActive { hudUntil = .distantPast }
             else { pinned = false; alertText = nil; banner = nil }
         }
@@ -884,8 +1019,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         syncActivities(); fileSave(); refreshUI()
     }
     @objc func filesClear() {
+        clearedFiles = files
         for u in files { slotItems.removeValue(forKey: .file(u)) }
         files.removeAll(); syncActivities(); fileSave(); refreshUI()
+    }
+    @objc func restoreClearedFiles() {
+        fileAdd(clearedFiles); clearedFiles = []
     }
     func fileSave() {
         guard demoShelf == nil else { return }
@@ -893,12 +1032,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     func fileLoad() {
         let paths = demoShelf ?? UserDefaults.standard.stringArray(forKey: "pocketFiles") ?? []
-        files = Array(paths.filter { FileManager.default.fileExists(atPath: $0) }.map { URL(fileURLWithPath: $0) }.suffix(5))
+        files = paths.map { URL(fileURLWithPath: $0) }
     }
     @objc func revealFileTapped() { if case .file(let u)? = cardKind { NSWorkspace.shared.activateFileViewerSelecting([u]) } }
     @objc func removeFileTapped() { if case .file(let u)? = cardKind { fileRemove(u); pinned = false } }
 
     func fileSubtitle(_ u: URL) -> String {
+        guard FileManager.default.fileExists(atPath: u.path) else { return "연결을 확인하세요 · 파일에 접근할 수 없음" }
         if let c = fileInfo[u] { return c }
         let size = (try? u.resourceValues(forKeys: [.fileSizeKey]).fileSize).flatMap { $0 }.map { ByteCountFormatter.string(fromByteCount: Int64($0), countStyle: .file) }
         let info = [u.deletingLastPathComponent().lastPathComponent, size].compactMap { $0 }.joined(separator: " · ")
@@ -1018,10 +1158,6 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func setupKeyTap() {
         guard ProcessInfo.processInfo.environment["NI_NOKEYTAP"] == nil else { return }     // test hook
-        if !AXIsProcessTrusted() {
-            // Prompt on launch whenever access is missing, including after permission is revoked.
-            _ = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
-        }
         func tryInstall() {
             if !keyTap.isActive, AXIsProcessTrusted(), keyTap.install(),
                ProcessInfo.processInfo.environment["NI_DEBUG"] != nil {
@@ -1036,7 +1172,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func showBanner(_ k: BannerKind, autoHide: TimeInterval? = nil) {
         banner = k
-        bannerHideAt = autoHide.map { Date().addingTimeInterval($0) }      // nil: stays until you click somewhere else
+        bannerHideAt = Date().addingTimeInterval(autoHide ?? 4)
         pinned = true
         haptic(.levelChange)
     }
@@ -1090,7 +1226,11 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if let t = bannerHideAt, now > t {                      // a timed banner (AirPods connecting) goes away by itself
             bannerHideAt = nil
-            if case .airpods? = banner { banner = nil; if selected == nil { pinned = false } }
+            banner = nil; if selected == nil && alertText == nil { pinned = false }
+        }
+        if alertText != nil && now >= alertUntil {
+            alertText = nil
+            if selected == nil && banner == nil { pinned = false }
         }
         if mainP.m.cur > 0.5 || mainP.m.tgt > 0 {             // only the island and the dial take the pointer; the margin is click-through
             let pf = panel.frame, mp = NSEvent.mouseLocation
@@ -1101,9 +1241,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else if panel.ignoresMouseEvents { panel.ignoresMouseEvents = false }
         if due(&tAppearance, 2) { view.dial.lightAppearance = NSApp.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .aqua }   // tick colour follows light / dark mode
         trackFileDrag(NSEvent.mouseLocation)
-        if due(&tFiles, 5), files.contains(where: { !FileManager.default.fileExists(atPath: $0.path) }) {       // deleted elsewhere
-            files = files.filter { FileManager.default.fileExists(atPath: $0.path) }; fileSave()
-        }
+        if due(&tFiles, 5) { fileInfo.removeAll(); c.fileShown = nil }
         if due(&tVolume, 2) { pollVolume() }       // safety net only: volume changes normally arrive as events (watchVolume)
         if due(&tBattery, 5) { pollBattery() }     // safety net + the 'fully charged' timer; plug events arrive from IOKit (watchBattery)
         // each lookup spawns osascript: poll faster only while a track is playing or the card is open
@@ -1114,10 +1252,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         
         prevTimerStarted = timer.started
-        if timer.finished {                        // countdown just hit zero
-            timer.reset()
-            NSSound.beep()
-            showAlert("타이머 종료", seconds: 6)
+        if timer.running && timer.finished {
+            timer.toggle() // Keep the completed activity until it is dismissed or restarted.
+            selected = .timer; pinned = true; banner = nil
+            NSSound.beep(); haptic(.levelChange); refreshUI()
         }
 
         if !liveActivity && shape == .collapsed && atRest && !pinned && !stepBusy {
@@ -1220,6 +1358,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard let img = img else {
                 DispatchQueue.main.async {
                     guard s.artworkFor == id else { return }
+                    s.artwork = nil; s.artColor = accent
                     if m.storeID.isEmpty && tries >= 1 { return }      // no cover to be had for this track (at most two tries)
                     s.artworkFor = ""; s.artRetryAt[id] = Date().addingTimeInterval(30)
                     if m.storeID.isEmpty { s.artwork = nil; s.artColor = accent }
@@ -1243,7 +1382,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: rendering
 
-    func setText(_ f: NSTextField, _ s: String) { if f.stringValue != s { f.stringValue = s } }
+    func setText(_ f: NSTextField, _ s: String) { if f.stringValue != s { f.stringValue = s; f.toolTip = s.isEmpty ? nil : s } }
 
     func refreshUI() {
         syncActivities()
@@ -1252,6 +1391,11 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         c.ending = b == .none && acts.isEmpty
         c.bandH = (shape == .expanded || (shape == .collapsed && atRest)) ? notchH : compactH
 
+        c.navigationVisible = navigationVisible
+        if let kind = cardKind, let index = actOrder.firstIndex(of: kind) {
+            setText(c.activityPosition, "\(index + 1) / \(actOrder.count) · " + activityName(kind))
+        }
+        c.transition(to: String(describing: cardKind) + String(describing: b))
         populate(c, bn: displayBanner, kind: cardKind)
         if let k = cardKind, let i = acts.firstIndex(of: k) {           // the wheel follows the shown activity (and a finger on it)
             view.dial.count = acts.count
@@ -1284,6 +1428,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 c.hIcon.image = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
                     .withSymbolConfiguration(.init(pointSize: 19, weight: .semibold))
             }
+            c.hBar.setAccessibilityLabel(hudKind == .volume ? "볼륨" : "밝기")
             c.hBar.set(level, animated: true)
         }
 
@@ -1301,8 +1446,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func populate(_ c: Content, bn: BannerKind?, kind: ActKind?) {
         // timer pieces
         setText(c.tTime, timer.text())
-        setText(c.tLabel, timer.mode == .stopwatch ? "스톱워치" : "타이머")
-        setSymbol(c.pauseB, timer.running ? "pause.fill" : "play.fill", 20)
+        setText(c.tLabel, timer.finished ? "타이머 완료" : (!timer.running && timer.started ? "일시정지됨" : (timer.mode == .stopwatch ? "스톱워치" : "남은 시간")))
+        setSymbol(c.pauseB, timer.finished ? "arrow.clockwise" : (timer.running ? "pause.fill" : "play.fill"), 20)
+        c.pauseB.setAccessibilityLabel(timer.finished ? "타이머 다시 시작" : (timer.running ? "타이머 일시정지" : "타이머 계속"))
+        c.pauseB.toolTip = timer.finished ? "타이머 다시 시작" : (timer.running ? "타이머 일시정지" : "타이머 계속")
 
         // banner (charging / low battery / AirPods)
         if let bn = bn {
@@ -1330,6 +1477,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             c.fIcon.image = NSWorkspace.shared.icon(forFile: u.path)
             setText(c.fName, u.lastPathComponent)
             setText(c.fSub, fileSubtitle(u))
+            c.fRevealB.isEnabled = FileManager.default.fileExists(atPath: u.path)
+            c.fRevealB.alphaValue = c.fRevealB.isEnabled ? 1 : 0.35
         }
 
         // media pieces
@@ -1488,6 +1637,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for p in [mainP!, pillP!] where p.active || p.visible {
             let isMain = p === mainP
             let k: CGFloat = isMain ? stiffness : 300, cd: CGFloat = isMain ? damping : 28
+            if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion { p.snap() }
             for _ in 0..<steps { p.x.step(h, k, cd); p.w.step(h, k, cd); p.h.step(h, k, cd); p.ty.step(h, k, cd); p.m.step(h, k, cd) }
             if isMain {
                 // Momentum from an interrupted move must never uncover the hardware notch.

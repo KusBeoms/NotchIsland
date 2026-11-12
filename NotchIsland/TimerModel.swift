@@ -27,7 +27,7 @@ final class TimerModel {
 
     func toggle() {
         if running { accumulated = elapsed; running = false; startedAt = nil }
-        else { if finished { reset() }; startedAt = hardwareSeconds(); running = true }
+        else { if finished { let duration = target; reset(); target = duration }; startedAt = hardwareSeconds(); running = true }
     }
     var started: Bool { running || accumulated > 0 }
     func reset() { running = false; accumulated = 0; startedAt = nil; target = 300 }

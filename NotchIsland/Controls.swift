@@ -30,7 +30,7 @@ final class ArtView: NSView {
         guard img !== shown else { return }                  // called every refresh: only react when the picture changes
         let first = shown == nil && layer?.contents == nil
         shown = img
-        if !first {                                          // cross-fade to the new cover instead of cutting
+        if !first && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion { // cross-fade to the new cover instead of cutting
             let t = CATransition(); t.type = .fade; t.duration = 0.4
             t.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
             layer?.add(t, forKey: "cover")
@@ -168,13 +168,29 @@ final class ProgressBar: NSView {
         fill.frame = CGRect(x: 0, y: y, width: bounds.width * min(max(fraction, 0), 1), height: ProgressBar.lineH)
         CATransaction.commit()
     }
+    override func isAccessibilityElement() -> Bool { true }
+    override func accessibilityRole() -> NSAccessibility.Role? { .slider }
+    override func accessibilityValue() -> Any? { Double(fraction) }
+    override func accessibilityMinValue() -> Any? { 0.0 }
+    override func accessibilityMaxValue() -> Any? { 1.0 }
+    override func accessibilityPerformIncrement() -> Bool { adjust(0.05); return true }
+    override func accessibilityPerformDecrement() -> Bool { adjust(-0.05); return true }
+    override var acceptsFirstResponder: Bool { true }
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 123 { adjust(-0.05) }
+        else if event.keyCode == 124 { adjust(0.05) }
+        else { super.keyDown(with: event) }
+    }
+    private func adjust(_ delta: CGFloat) {
+        fraction = min(1, max(0, fraction + delta)); onScrub?(fraction, true)
+    }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     private func scrub(_ e: NSEvent, final: Bool) {
         let f = min(max(convert(e.locationInWindow, from: nil).x / max(bounds.width, 1), 0), 1)
         fraction = f
         onScrub?(f, final)
     }
-    override func mouseDown(with event: NSEvent) { scrub(event, final: false) }
+    override func mouseDown(with event: NSEvent) { window?.makeFirstResponder(self); scrub(event, final: false) }
     override func mouseDragged(with event: NSEvent) { scrub(event, final: false) }
     override func mouseUp(with event: NSEvent) { scrub(event, final: true) }
 }
@@ -277,6 +293,22 @@ final class LevelBar: NSView {
         slider.opacity = 0
     }
     required init?(coder: NSCoder) { fatalError() }
+    override func isAccessibilityElement() -> Bool { true }
+    override func accessibilityRole() -> NSAccessibility.Role? { .slider }
+    override func accessibilityValue() -> Any? { Double(target) }
+    override func accessibilityMinValue() -> Any? { 0.0 }
+    override func accessibilityMaxValue() -> Any? { 1.0 }
+    override func accessibilityPerformIncrement() -> Bool { adjust(1.0 / 16); return true }
+    override func accessibilityPerformDecrement() -> Bool { adjust(-1.0 / 16); return true }
+    override var acceptsFirstResponder: Bool { true }
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 123 { adjust(-1.0 / 16) }
+        else if event.keyCode == 124 { adjust(1.0 / 16) }
+        else { super.keyDown(with: event) }
+    }
+    private func adjust(_ delta: Float) {
+        let value = min(1, max(0, target + delta)); set(value, animated: false); onChange?(value)
+    }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override func layout() { super.layout(); render() }
@@ -302,7 +334,7 @@ final class LevelBar: NSView {
     /// Eased towards the new value; `animated: false` jumps (used while the pointer drags).
     func set(_ v: Float, animated: Bool) {
         target = min(max(v, 0), 1)
-        if !animated { shown = target; timer?.invalidate(); timer = nil; render(); return }
+        if !animated || NSWorkspace.shared.accessibilityDisplayShouldReduceMotion { shown = target; timer?.invalidate(); timer = nil; render(); return }
         guard timer == nil, abs(shown - target) > 0.002 else { return }
         let t = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] tm in
             guard let s = self else { tm.invalidate(); return }
@@ -320,7 +352,7 @@ final class LevelBar: NSView {
         set(v, animated: false)
         onChange?(min(max(v, 0), 1))
     }
-    override func mouseDown(with event: NSEvent) { pick(event) }
+    override func mouseDown(with event: NSEvent) { window?.makeFirstResponder(self); pick(event) }
     override func mouseDragged(with event: NSEvent) { pick(event) }
 }
 
@@ -426,7 +458,7 @@ final class DialView: NSView {
     /// Moves the wheel to `t` (in activities). A finger turning it sets it directly; otherwise it springs there.
     func set(_ t: CGFloat, animated: Bool) {
         target = t
-        if !animated { position = t; velocity = 0; timer?.invalidate(); timer = nil; relayout(); return }
+        if !animated || NSWorkspace.shared.accessibilityDisplayShouldReduceMotion { position = t; velocity = 0; timer?.invalidate(); timer = nil; relayout(); return }
         guard timer == nil, abs(position - target) > 0.0008 || abs(velocity) > 0.01 else { return }
         let dt: CGFloat = 1.0 / 60
         let tm = Timer(timeInterval: Double(dt), repeats: true) { [weak self] tm in
@@ -483,7 +515,7 @@ func makeLabel(_ size: CGFloat, _ weight: NSFont.Weight, _ color: NSColor, mono:
 }
 
 func makeSymbolButton(_ name: String, _ pt: CGFloat, _ tint: NSColor) -> NSButton {
-    let b = NSButton()
+    let b = FeedbackButton()
     b.isBordered = false
     b.imagePosition = .imageOnly
     b.imageScaling = .scaleNone
@@ -498,3 +530,33 @@ func setSymbol(_ b: NSButton, _ name: String, _ pt: CGFloat) {
         .withSymbolConfiguration(.init(pointSize: pt, weight: .bold))
 }
 
+
+/// A subtle hover surface and a short press response keep icon-only controls discoverable.
+final class FeedbackButton: NSButton {
+    private var hoverArea: NSTrackingArea?
+    private var hovering = false
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hoverArea { removeTrackingArea(hoverArea) }
+        let area = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self)
+        addTrackingArea(area); hoverArea = area
+    }
+    override func mouseEntered(with event: NSEvent) { hovering = true; needsDisplay = true }
+    override func mouseExited(with event: NSEvent) { hovering = false; needsDisplay = true }
+    override func draw(_ dirtyRect: NSRect) {
+        if isEnabled && (hovering || isHighlighted) {
+            NSColor(white: 1, alpha: isHighlighted ? 0.22 : 0.1).setFill()
+            NSBezierPath(roundedRect: bounds.insetBy(dx: 2, dy: 2), xRadius: 10, yRadius: 10).fill()
+        }
+        super.draw(dirtyRect)
+    }
+    override func highlight(_ flag: Bool) {
+        super.highlight(flag); needsDisplay = true
+        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
+        wantsLayer = true
+        let animation = CABasicAnimation(keyPath: "transform.scale")
+        animation.fromValue = flag ? 1 : 0.94; animation.toValue = flag ? 0.94 : 1
+        animation.duration = 0.12
+        layer?.add(animation, forKey: "buttonPress")
+    }
+}

@@ -4,6 +4,10 @@ import AudioToolbox
 import CoreAudio
 import IOKit.ps
 
+final class IslandPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+}
+
 // MARK: - Island (black body; presses outside buttons go to the app)
 
 final class IslandView: FileDragView {
