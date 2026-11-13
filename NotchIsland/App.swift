@@ -640,11 +640,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// A new output device (AirPods connecting, ...) is the moment to look at the Bluetooth report, instead of polling it often.
+    /// Start every new output at zero volume, and refresh the Bluetooth report when the output changes.
     func watchOutputDevice() {
         var a = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
                                            mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
         AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &a, .main) { [weak self] _, _ in
+            SystemLevels.setVolume(0)
             self?.hudUntil = .distantPast
             self?.lastVol = nil; self?.lastMute = nil
             self?.watchVolume()
