@@ -10,6 +10,12 @@ swiftc Battery.swift Tests/BatteryTests.swift -o "$TEST_DIR/battery-tests"
 swiftc AirPods.swift Tests/AirPodsTests.swift -o "$TEST_DIR/airpods-tests"
 "$TEST_DIR/airpods-tests"
 
+swiftc Media.swift Tests/MediaTests.swift -o "$TEST_DIR/media-tests"
+"$TEST_DIR/media-tests"
+
+swiftc Lyrics.swift Tests/LyricsTests.swift -o "$TEST_DIR/lyrics-tests"
+"$TEST_DIR/lyrics-tests"
+
 # Reuse the actual configuration globals while omitting startup and its instance lock.
 sed '/^\/\/ One island at a time:/,$d' main.swift > "$TEST_DIR/main.swift"
 cat Tests/AppTests.swift >> "$TEST_DIR/main.swift"

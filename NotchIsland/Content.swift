@@ -186,6 +186,12 @@ final class Content: Flip {
         }
     }
 
+    var lyricsVisible = false
+    var mediaCardWidth: CGFloat?
+    var lyricsPanelWidth: CGFloat = 300
+    let lyricsB = makeSymbolButton("quote.bubble", 14, .white)
+    let lyricsPane = LyricsPanelView(frame: .zero)
+
     // media body
     let art = ArtView(radius: 10)
     let titleL = makeLabel(15, .semibold, .white)
@@ -248,7 +254,7 @@ final class Content: Flip {
     var all: [NSView] {
         [art, titleL, artistL, bodyEq, progress, elapsedL, remainL,
          prevB, playB, nextB, pauseB, cancelB, tLabel, tTime, alertL, bTitle, bPct, bGlyph, bAir, bRing, aTitle, aState, aBattery, hIcon, hBar]
-            + [fIcon, fName, fSub, fRevealB, fRemoveB, dropIcon, dropHint]
+            + [fIcon, fName, fSub, fRevealB, fRemoveB, lyricsB, lyricsPane, dropIcon, dropHint]
     }
 
     /// Cover + title + artist: tapping it opens the app that is playing.
@@ -256,7 +262,12 @@ final class Content: Flip {
 
     override func layout() {
         super.layout()
-        let w = bounds.width, pad: CGFloat = 16, top = notchH + 2
+        let w = body == .media ? min(bounds.width, mediaCardWidth ?? bounds.width) : bounds.width
+        let pad: CGFloat = 16, top = notchH + 2
+        let lyricsX = mediaCardWidth ?? w
+        // Lay text out at its final width once; the island mask reveals it without reflow.
+        lyricsPane.frame = NSRect(x: lyricsX, y: top, width: lyricsPanelWidth, height: max(0, bounds.height - top - 8))
+        lyricsPane.isHidden = !lyricsVisible
         // wings: the icon tile gets the same margin on the left, top and bottom
         let tile: CGFloat = 24
         let m = max((bandH - tile) / 2, 0)
@@ -276,9 +287,11 @@ final class Content: Flip {
         elapsedL.frame = NSRect(x: pad, y: top + 62, width: 60, height: 14)
         remainL.frame = NSRect(x: w - pad - 60, y: top + 62, width: 60, height: 14)
         let cy = top + 76
+        // Keep the original three transport controls centred; lyrics is a small trailing accessory.
         playB.frame = NSRect(x: w / 2 - 25, y: cy, width: 50, height: 40)
         prevB.frame = NSRect(x: w / 2 - 25 - 70, y: cy, width: 50, height: 40)
         nextB.frame = NSRect(x: w / 2 - 25 + 70, y: cy, width: 50, height: 40)
+        lyricsB.frame = NSRect(x: w - pad - 24, y: cy + 6, width: 24, height: 28)
         // timer
         pauseB.frame = NSRect(x: pad, y: top + 2, width: 44, height: 44)
         cancelB.frame = NSRect(x: pad + 52, y: top + 2, width: 44, height: 44)
@@ -317,10 +330,13 @@ final class Content: Flip {
     /// Cross-fade every element to what the current shape/body/wings need.
     func applyVisibility(expanded: Bool) {
         let b = body
+        lyricsPane.isHidden = !(expanded && b == .media && lyricsVisible)
+        lyricsPane.alphaValue = 1
         let want: [(NSView, Bool)] = [
             (art, expanded && b == .media), (titleL, expanded && b == .media), (artistL, expanded && b == .media),
             (bodyEq, expanded && b == .media), (progress, expanded && b == .media),
             (elapsedL, expanded && b == .media), (remainL, expanded && b == .media),
+            (lyricsB, expanded && b == .media),
             (prevB, expanded && b == .media), (playB, expanded && b == .media), (nextB, expanded && b == .media),
             (pauseB, expanded && b == .timer), (cancelB, expanded && b == .timer),
             (tLabel, expanded && b == .timer), (tTime, expanded && b == .timer),

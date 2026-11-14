@@ -142,7 +142,7 @@ final class EqView: NSView {
     }
 }
 
-final class ProgressBar: NSView {
+final class ProgressBar: FocusableControl {
     private let track = CALayer(), fill = CALayer()
     private static let lineH: CGFloat = 4
     /// Called while the pointer scrubs (final == false) and when it lets go (final == true), with the position 0...1.
@@ -183,16 +183,9 @@ final class ProgressBar: NSView {
     override func accessibilityMaxValue() -> Any? { 1.0 }
     override func accessibilityPerformIncrement() -> Bool { adjust(0.05); return true }
     override func accessibilityPerformDecrement() -> Bool { adjust(-0.05); return true }
-    override var acceptsFirstResponder: Bool { true }
-    override func becomeFirstResponder() -> Bool { needsDisplay = true; return true }
-    override func resignFirstResponder() -> Bool { needsDisplay = true; return true }
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        if window?.isKeyWindow == true && window?.firstResponder === self {
-            NSColor.keyboardFocusIndicatorColor.setStroke()
-            let ring = NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 5, yRadius: 5)
-            ring.lineWidth = 2; ring.stroke()
-        }
+        drawKeyboardFocusRing(inset: 1, radius: 5)
     }
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 123 { adjust(-0.05) }
@@ -272,7 +265,7 @@ final class RingView: NSView {
 
 /// The original HUD's bar: 16 flat cells; while the pointer is over the HUD they melt into a smooth slider with a
 /// knob. Eased fill; click or drag sets the level. The view is tall (easy to hit) but draws thin.
-final class LevelBar: NSView {
+final class LevelBar: FocusableControl {
     private static let count = 16
     private static let knobW: CGFloat = 18, knobH: CGFloat = 14, lineH: CGFloat = 4
     private let seg = CALayer(), slider = CALayer()
@@ -318,16 +311,9 @@ final class LevelBar: NSView {
     override func accessibilityMaxValue() -> Any? { 1.0 }
     override func accessibilityPerformIncrement() -> Bool { adjust(1.0 / 16); return true }
     override func accessibilityPerformDecrement() -> Bool { adjust(-1.0 / 16); return true }
-    override var acceptsFirstResponder: Bool { true }
-    override func becomeFirstResponder() -> Bool { needsDisplay = true; return true }
-    override func resignFirstResponder() -> Bool { needsDisplay = true; return true }
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        if window?.isKeyWindow == true && window?.firstResponder === self {
-            NSColor.keyboardFocusIndicatorColor.setStroke()
-            let ring = NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 5, yRadius: 5)
-            ring.lineWidth = 2; ring.stroke()
-        }
+        drawKeyboardFocusRing(inset: 1, radius: 5)
     }
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 123 { adjust(-1.0 / 16) }
@@ -553,14 +539,31 @@ func makeSymbolButton(_ name: String, _ pt: CGFloat, _ tint: NSColor) -> NSButto
     return b
 }
 
+/// Swaps the glyph in one step: no cross-fade, and no stale glyph left behind in the layer (play drawn over pause).
 func setSymbol(_ b: NSButton, _ name: String, _ pt: CGFloat) {
-    b.image = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+    let key = "\(name)@\(pt)"
+    let feedback = b as? FeedbackButton
+    // unchanged and still showing our glyph: do not touch the image (refreshUI runs very often)
+    if let feedback, feedback.symbolKey == key, feedback.symbolImage != nil, feedback.image === feedback.symbolImage { return }
+    let image = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
         .withSymbolConfiguration(.init(pointSize: pt, weight: .bold))
+    NSAnimationContext.beginGrouping()
+    NSAnimationContext.current.allowsImplicitAnimation = false
+    CATransaction.begin(); CATransaction.setDisableActions(true)
+    b.image = image                                   // no cross-fade; the press animation keeps running
+    b.needsDisplay = true
+    CATransaction.commit()
+    NSAnimationContext.endGrouping()
+    feedback?.symbolKey = key; feedback?.symbolImage = image
 }
 
 
 /// A subtle hover surface and a short press response keep icon-only controls discoverable.
 final class FeedbackButton: NSButton {
+    override var focusRingType: NSFocusRingType { get { .none } set {} }   // the system ring follows the glyph's old shape; we draw our own
+    /// The glyph `setSymbol` last installed; a different image (set elsewhere) invalidates it.
+    fileprivate var symbolKey: String?
+    fileprivate weak var symbolImage: NSImage?
     private var hoverArea: NSTrackingArea?
     private var hovering = false
     override var acceptsFirstResponder: Bool { isEnabled }
@@ -580,11 +583,7 @@ final class FeedbackButton: NSButton {
             NSBezierPath(roundedRect: bounds.insetBy(dx: 2, dy: 2), xRadius: 10, yRadius: 10).fill()
         }
         super.draw(dirtyRect)
-        if window?.isKeyWindow == true && window?.firstResponder === self {
-            NSColor.keyboardFocusIndicatorColor.setStroke()
-            let ring = NSBezierPath(roundedRect: bounds.insetBy(dx: 2, dy: 2), xRadius: 10, yRadius: 10)
-            ring.lineWidth = 2; ring.stroke()
-        }
+        drawKeyboardFocusRing(inset: 2, radius: 10)
     }
     override func highlight(_ flag: Bool) {
         super.highlight(flag); needsDisplay = true
@@ -594,5 +593,26 @@ final class FeedbackButton: NSButton {
         animation.fromValue = flag ? 1 : 0.94; animation.toValue = flag ? 0.94 : 1
         animation.duration = 0.12
         layer?.add(animation, forKey: "buttonPress")
+    }
+}
+
+/// The focus ring appears only after the user starts Tab navigation, not when the island is merely opened with the shortcut.
+enum KeyboardFocus { static var visible = false }       // main thread only, like all the UI that reads it
+
+/// Shared by every focusable control: no system ring (it follows the glyph's old shape), our own ring only after Tab.
+class FocusableControl: NSView {
+    override var focusRingType: NSFocusRingType { get { .none } set {} }
+    override var acceptsFirstResponder: Bool { true }
+    override func becomeFirstResponder() -> Bool { needsDisplay = true; return true }
+    override func resignFirstResponder() -> Bool { needsDisplay = true; return true }
+}
+
+extension NSView {
+    /// Draws the keyboard focus ring when this view is the first responder of the key window and Tab navigation is active.
+    func drawKeyboardFocusRing(inset: CGFloat, radius: CGFloat) {
+        guard KeyboardFocus.visible, window?.isKeyWindow == true, window?.firstResponder === self else { return }
+        NSColor.keyboardFocusIndicatorColor.setStroke()
+        let ring = NSBezierPath(roundedRect: bounds.insetBy(dx: inset, dy: inset), xRadius: radius, yRadius: radius)
+        ring.lineWidth = 2; ring.stroke()
     }
 }

@@ -17,6 +17,8 @@ final class IslandView: FileDragView {
     let dial = DialView()                  // drawn outside the black body, round its lower edge
     private let body = NSView()            // the black island itself (masked to the notch shape); `content` lives in it
     private let shapeMask = CAShapeLayer()
+    var swellInset: CGFloat = 0 { didSet { if abs(swellInset - oldValue) > 0.01 { needsLayout = true } } }   // hover swell: the content keeps its place, centred, while the island grows round it
+    var refHeight: CGFloat = 0 { didSet { if abs(refHeight - oldValue) > 0.01 { needsLayout = true } } }            // un-swollen island height (0: use the real one): the content margins must not move while the island swells
     var earLeft = true { didSet { if earLeft != oldValue { needsLayout = true } } }
     var earRight = true { didSet { if earRight != oldValue { needsLayout = true } } }   // false: the right edge is flush with the notch
     /// Room under the island (the window is taller than the island by this much) for the dial's ticks.
@@ -43,15 +45,17 @@ final class IslandView: FileDragView {
         super.layout()
         body.frame = bodyRect
         let w = body.bounds.width, h = body.bounds.height
-        let t = earRadius(h)
-        let l = earLeft ? t : 0, r = earRight ? t : 0
-        content.frame = NSRect(x: l, y: 0, width: max(0, w - l - r), height: h)
+        let tc = earRadius(refHeight > 0 ? refHeight : h)               // the ear room beside the content uses the un-swollen height
+        let l = earLeft ? tc : 0, r = earRight ? tc : 0
+        content.frame = NSRect(x: l + swellInset, y: 0, width: max(0, w - l - r - 2 * swellInset), height: h)
         CATransaction.begin(); CATransaction.setDisableActions(true)
         shapeMask.frame = body.bounds
         shapeMask.path = notchPath(w, h, earL: earLeft, earR: earRight)
         CATransaction.commit()
         dial.frame = bounds
-        dial.geometry = DialView.Geometry(body: bodyRect)
+        var dialBody = bodyRect
+        if content.body == .media, content.mediaCardWidth != nil { dialBody.size.width = min(dialBody.width, expandedCardWidth) }
+        dial.geometry = DialView.Geometry(body: dialBody)
     }
 
     var onOpenSource: (() -> Void)?
@@ -89,6 +93,7 @@ final class IslandView: FileDragView {
         guard bodyRect.contains(here) || (bottomInset > 0 && strip.contains(here)) else { return nil }
         guard bodyRect.contains(here) else { return dial.hitTest(here) ?? self }
         let p = content.convert(here, from: self)
+        if content.lyricsVisible, p.x >= (content.mediaCardWidth ?? content.bounds.width) { return content.lyricsPane }
         if !content.activityRow.isHidden, content.activityRow.frame.contains(p) {
             return content.activityRow.hitTest(p)
         }

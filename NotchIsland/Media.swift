@@ -25,9 +25,17 @@ struct Media {
     var readAt: Date
     var storeID: String
     var bundleID: String = ""          // the app that is playing (a browser for web video)
-    var elapsedNow: TimeInterval {
-        let e = elapsed + (playing ? Date().timeIntervalSince(readAt) : 0)
+    var album: String = ""
+    var elapsedNow: TimeInterval { elapsed(at: Date()) }
+    func elapsed(at now: Date) -> TimeInterval {
+        let e = elapsed + (playing ? now.timeIntervalSince(readAt) : 0)
         return duration > 0 ? min(e, duration) : e
+    }
+    /// A small presentation lead offsets drawing latency without advancing paused or scrubbed lyrics.
+    func lyricsPosition(at now: Date = Date(), seekFraction: CGFloat? = nil) -> TimeInterval {
+        if let seekFraction { return max(0, min(1, Double(seekFraction))) * max(0, duration) }
+        let position = max(0, elapsed(at: now) + (playing ? 0.06 : 0))
+        return duration > 0 ? min(position, duration) : position
     }
 }
 
@@ -49,15 +57,18 @@ if (req) {
     } catch (e) {}
     if (title) {
       var pos = null;
+      var sampledAt = Date.now() / 1000;
       try { pos = item.metadata.calculatedPlaybackPosition; } catch (e) {}
       out = JSON.stringify({
         title: title,
         artist: g("kMRMediaRemoteNowPlayingInfoArtist") || "",
+        album: g("kMRMediaRemoteNowPlayingInfoAlbum") || "",
         rate: g("kMRMediaRemoteNowPlayingInfoPlaybackRate") || 0,
         duration: g("kMRMediaRemoteNowPlayingInfoDuration") || 0,
         elapsed: (pos !== null && pos !== undefined) ? pos : (g("kMRMediaRemoteNowPlayingInfoElapsedTime") || 0),
         id: String(g("kMRMediaRemoteNowPlayingInfoiTunesStoreIdentifier") || ""),
-        app: appBundle
+        app: appBundle,
+        sampledAt: sampledAt
       });
     }
   }
@@ -89,22 +100,32 @@ func runJXA(_ script: String) -> String {
 enum PollResult { case failed, nothing, media(Media) }
 
 func queryNowPlaying() -> PollResult {
+    let startedAt = Date()
     let s = runJXA(nowPlayingScript)
+    return parseNowPlaying(s, queryStartedAt: startedAt, receivedAt: Date())
+}
+
+func parseNowPlaying(_ s: String, queryStartedAt: Date, receivedAt: Date) -> PollResult {
     if s.isEmpty { return .failed }                  // timed out / crashed: say nothing about the state
     if s == "NONE" { return .nothing }
     guard let d = s.data(using: .utf8),
           let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
           let title = j["title"] as? String else { return .failed }
     func num(_ k: String) -> Double { (j[k] as? NSNumber)?.doubleValue ?? 0 }
+    let timestamp = num("sampledAt")
+    let sampleIsValid = timestamp.isFinite && timestamp >= queryStartedAt.timeIntervalSince1970
+        && timestamp <= receivedAt.timeIntervalSince1970 + 0.05
+    let readAt = sampleIsValid ? Date(timeIntervalSince1970: timestamp) : receivedAt
     return .media(Media(title: title, artist: (j["artist"] as? String) ?? "", playing: num("rate") > 0,
-                        duration: num("duration"), elapsed: num("elapsed"), readAt: Date(), storeID: (j["id"] as? String) ?? "",
-                        bundleID: (j["app"] as? String) ?? ""))
+                        duration: num("duration"), elapsed: num("elapsed"), readAt: readAt, storeID: (j["id"] as? String) ?? "",
+                        bundleID: (j["app"] as? String) ?? "", album: (j["album"] as? String) ?? ""))
 }
 
-/// MediaRemote command ids: 2 toggle play/pause, 4 next, 5 previous.
+/// MediaRemote command ids: 0 play, 1 pause, 2 toggle play/pause, 4 next, 5 previous.
 private let mediaCommandQueue = DispatchQueue(label: "ni.mediacmd", qos: .userInitiated)   // serial: quick taps never run osascript in parallel
-func sendMediaCommand(_ cmd: Int) {
+func sendMediaCommand(_ cmd: Int, completion: (() -> Void)? = nil) {
     mediaCommandQueue.async {
+        defer { if let completion { DispatchQueue.main.async(execute: completion) } }
         _ = runJXA("""
         ObjC.import("Foundation");
         $.NSBundle.bundleWithPath("/System/Library/PrivateFrameworks/MediaRemote.framework/").load;
@@ -128,3 +149,13 @@ func sendMediaSeek(_ seconds: Double) {
     }
 }
 
+
+/// Fallback when MediaRemote does not reach a player: the same play/pause media key the keyboard sends.
+func postPlayPauseKey() {
+    for down in [true, false] {
+        let flags = NSEvent.ModifierFlags(rawValue: down ? 0xA00 : 0xB00)
+        let data1 = (16 << 16) | ((down ? 0xA : 0xB) << 8)       // NX_KEYTYPE_PLAY = 16
+        NSEvent.otherEvent(with: .systemDefined, location: .zero, modifierFlags: flags, timestamp: 0, windowNumber: 0,
+                           context: nil, subtype: 8, data1: data1, data2: -1)?.cgEvent?.post(tap: .cghidEventTap)
+    }
+}
