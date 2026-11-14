@@ -21,7 +21,7 @@ import IOKit.ps
 //   * Expanded media       -> art, title/artist, progress, previous / play-pause / next
 //   * Expanded stopwatch   -> pause + cancel, big orange time
 //   * Ambient light dark   -> a touch-like pop
-//   * Battery events       -> alert (plug in / unplug / 20% / 10% / full)
+//   * Battery events       -> brief connection / 20% / 10% banners; no ongoing battery activity
 
 var threshold = 50.0
 var forceOpen = false

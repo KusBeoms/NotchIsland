@@ -10,6 +10,13 @@ import IOKit.ps
 // /usr/bin/osascript is Apple-signed, so the lookup and the transport commands run inside it (JXA).
 
 struct Media {
+    struct TrackID: Equatable {
+        var title: String
+        var artist: String
+        var storeID: String
+        var bundleID: String
+    }
+    var trackID: TrackID { TrackID(title: title, artist: artist, storeID: storeID, bundleID: bundleID) }
     var title: String
     var artist: String
     var playing: Bool

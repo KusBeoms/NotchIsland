@@ -36,16 +36,20 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var pinned = false
     var hoverUntil = Date.distantPast
     var lux = -1.0
-    var media: Media?
+    var media: Media? {
+        didSet {
+            if oldValue?.trackID != media?.trackID { cancelPendingSeek() }
+        }
+    }
     var lastPlayingAt = Date.distantPast
     var artwork: NSImage?
     var artColor: NSColor = accent
     var artworkFor = ""
     var artCache: [String: (NSImage, NSColor)] = [:]
     var battery: Battery?
+    var batteryNotifications = BatteryNotifications()
     var banner: BannerKind?
     // live activities, oldest first; at most 5 are shown (the oldest are dropped first)
-    var chargeShownUntil = Date.distantPast       // the charging activity shows for 3s after the charger is connected, then goes
     var actOrder: [ActKind] = []
     var selected: ActKind?                     // which activity the expanded card shows
     var pressKind: ActKind?
@@ -87,10 +91,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var lastAudibleVolume: Float = 0.5
     var alertText: String?
     var alertUntil = Date.distantPast
-    var warned20 = false, warned10 = false, notifiedFull = false
     var tick = 0
     var musicBusy = false
-    var fullSince: Date?
     var ambient = -1.0               // slow average of the light while uncovered: the touch threshold follows it
     var nothingPolls = 0             // consecutive 'nothing is playing' answers
     var idleRefreshed = false
@@ -115,8 +117,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         switch k {
         case .media: return media != nil
         case .timer: return timer.started
-        case .charging:   return demoActsN != nil ? demoKinds.contains(k) : (battery?.plugged == true && battery?.charging == true && Date() < chargeShownUntil)   // only the first 3s after plugging in
-        case .lowBattery: return demoActsN != nil ? demoKinds.contains(k) : (battery?.plugged == false && (battery?.level ?? 100) <= 20)
+        case .charging, .lowBattery: return demoActsN != nil && demoKinds.contains(k) // preview only; real battery events use transient banners
         case .airpods:    return demoActsN != nil && demoKinds.contains(k)       // real AirPods only show a banner when they connect
         case .file(let u): return files.contains(u)
         }
@@ -207,10 +208,20 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: seeking (progress bar drag, or sideways scrolling on the music card)
     var seekFraction: CGFloat?                  // where the user has put the playhead, until it is committed
+    var seekTrack: Media.TrackID?
+    var scrubbingTrack: Media.TrackID?           // keep the original drag target until mouse-up, even if the track changes
     var seekHoldUntil = Date.distantPast        // right after a seek the poll still reports the old position: ignore it
     var seekTimer: Timer?
 
+    func cancelPendingSeek() {
+        seekTimer?.invalidate(); seekTimer = nil
+        seekFraction = nil; seekTrack = nil
+        seekHoldUntil = .distantPast
+    }
+
     func scrubBy(_ d: CGFloat, _ m: Media) {
+        guard m.duration > 0, m.trackID == media?.trackID else { return }
+        seekTrack = m.trackID
         let base = seekFraction ?? CGFloat(m.elapsedNow / m.duration)
         seekFraction = min(1, max(0, base + d))
         refreshUI()
@@ -220,18 +231,23 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func scrubbed(_ f: CGFloat, final: Bool) {
-        seekTimer?.invalidate()
+        if !final && scrubbingTrack == nil { scrubbingTrack = media?.trackID }
+        let target = scrubbingTrack ?? media?.trackID
+        if final { scrubbingTrack = nil }
+        guard let target, target == media?.trackID else { cancelPendingSeek(); return }
+        seekTimer?.invalidate(); seekTimer = nil
+        seekTrack = target
         seekFraction = f
         if final { commitSeek() } else { refreshUI() }
     }
 
     func commitSeek() {
-        seekTimer?.invalidate()
-        guard let f = seekFraction, var m = media, m.duration > 0 else { seekFraction = nil; return }
+        guard let f = seekFraction, let target = seekTrack, var m = media,
+              target == m.trackID, m.duration > 0 else { cancelPendingSeek(); return }
+        cancelPendingSeek()
         let pos = Double(f) * m.duration
         sendMediaSeek(pos)
         m.elapsed = pos; m.readAt = Date(); media = m
-        seekFraction = nil
         seekHoldUntil = Date().addingTimeInterval(1.5)
         refreshUI()
     }
@@ -290,8 +306,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var body: Body {
         if hudActive { return .hud }
         if dropping { return .drop }
-        if timer.finished, cardKind == .timer { return .timer }
         if banner != nil { return .banner }
+        if timer.finished, cardKind == .timer { return .timer }
         if alertText != nil { return .alert }
         switch cardKind {
         case .media?: return .media
@@ -454,11 +470,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             pinned = ProcessInfo.processInfo.environment["NI_NOPIN"] == nil     // NI_NOPIN=1: start collapsed (screenshots)
         }
         battery = readBattery()
-        if let b = battery {   // don't fire "full"/"low" alerts for a state that already existed at launch
-            notifiedFull = isFull(b)
-            warned20 = !b.plugged && b.level <= 20
-            warned10 = !b.plugged && b.level <= 10
-        }
+        if let b = battery { _ = batteryNotifications.update(b) }
         NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
             guard let s = self, s.pinned else { return }
             s.pinned = false                         // click anywhere outside the island closes it
@@ -1243,11 +1255,11 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         RunLoop.main.add(kt, forMode: .common); keyTapTimer = kt
     }
 
-    func showBanner(_ k: BannerKind, autoHide: TimeInterval? = nil) {
+    func showBanner(_ k: BannerKind, autoHide: TimeInterval? = nil, feedback: Bool = true) {
         banner = k
         bannerHideAt = Date().addingTimeInterval(autoHide ?? 4)
         pinned = true
-        haptic(.levelChange)
+        if feedback { haptic(.levelChange) }
     }
 
     func showAlert(_ text: String, seconds: TimeInterval = 3.5) {
@@ -1317,7 +1329,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         trackFileDrag(NSEvent.mouseLocation)
         if due(&tFiles, 5) { fileInfo.removeAll(); c.fileShown = nil }
         if due(&tVolume, 2) { pollVolume() }       // safety net only: volume changes normally arrive as events (watchVolume)
-        if due(&tBattery, 5) { pollBattery() }     // safety net + the 'fully charged' timer; plug events arrive from IOKit (watchBattery)
+        if due(&tBattery, 5) { pollBattery() }     // safety net; battery changes normally arrive from IOKit (watchBattery)
         // each lookup spawns osascript: poll faster only while a track is playing or the card is open
         if due(&tMusic, shape == .expanded ? 2 : (media?.playing == true ? 3 : 5)) { pollMusic() }
         if let m = media, !m.playing, !demoMedia, demoActsN == nil, shape != .expanded,
@@ -1328,7 +1340,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         prevTimerStarted = timer.started
         if timer.running && timer.finished {
             timer.toggle() // Keep the completed activity until it is dismissed or restarted.
-            selected = .timer; pinned = true; banner = nil
+            selected = .timer; pinned = true
             NSSound.beep(); haptic(.levelChange); refreshUI()
         }
 
@@ -1344,23 +1356,31 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func pollBattery() {
         guard let b = readBattery() else { return }
-        defer { battery = b }
-        guard let old = battery else { return }
-        if b.plugged != old.plugged {
-            if b.plugged { chargeShownUntil = Date().addingTimeInterval(3) }
-            if !b.plugged { showBanner(.battery(title: "충전 해제", level: b.level, color: .white)) }     // plugging in: the charging activity just appears, quietly
-            notifiedFull = false; fullSince = nil
+        applyBattery(b)
+    }
+
+    func applyBattery(_ b: Battery) {
+        let event = batteryNotifications.update(b)
+        if let old = battery, old.plugged != b.plugged, case .battery? = banner {
+            // Remove a stale charging/low-battery banner when the power source changes.
+            banner = nil
+            bannerHideAt = nil
+            if selected == nil && alertText == nil { pinned = false }
         }
-        if b.plugged {
-            warned20 = false; warned10 = false
-            if isFull(b) {
-                if fullSince == nil { fullSince = Date() }
-                // right after plugging in, `charging` can read false for a moment: only trust "full" once it has held for a while
-                if !notifiedFull, Date().timeIntervalSince(fullSince!) >= 8 { notifiedFull = true; showBanner(.battery(title: "충전 완료", level: b.level, color: bannerGreen)) }
-            } else { fullSince = nil }
-        } else {
-            if b.level <= 10 && !warned10 { warned10 = true; warned20 = true }          // the low-battery activity appears by itself, quietly
-            else if b.level <= 20 && !warned20 { warned20 = true }
+        if event == nil, b.plugged, let old = battery,
+           case .battery(let title, _, _)? = banner, title == old.connectionTitle {
+            // Correct a delayed charging flag without restarting the transient banner.
+            banner = .battery(title: b.connectionTitle, level: b.level, color: bannerGreen)
+        }
+        battery = b
+        switch event {
+        case .connected:
+            showBanner(.battery(title: b.connectionTitle, level: b.level, color: bannerGreen),
+                       autoHide: 3, feedback: false)
+        case .lowBattery:
+            showBanner(.battery(title: "배터리 부족", level: b.level, color: bannerRed), autoHide: 3)
+        case nil:
+            break // Disconnecting, reaching full charge and charge holds stay quiet.
         }
     }
 
@@ -1427,7 +1447,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .media(let m): r = m; nothingPolls = 0
         }
         defer { mediaBaseline = true }
-        if Date() < seekHoldUntil, case .media(let n) = result, media != nil, n.title == media?.title { return }   // stale position right after a seek
+        if Date() < seekHoldUntil, case .media(let n) = result, media != nil, n.trackID == media?.trackID { return }   // stale position right after a seek
         if r.playing { lastPlayingAt = Date() }
         // keep a paused track around for a while so it can be resumed from the island
         // A paused track is only KEPT while it is already showing (so it can be resumed from the island).
@@ -1465,7 +1485,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
                 return
             }
-            let col = averageColor(img)
+            let col = playbackColor(from: img)
             DispatchQueue.main.async {
                 s.artCache[id] = (img, col)
                 if s.artCache.count > 40 { s.artCache.removeValue(forKey: s.artCache.keys.first!) }
@@ -1586,6 +1606,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             c.fRevealB.alphaValue = c.fRevealB.isEnabled ? 1 : 0.35
         }
 
+        // Balance the audio subscription even when the now-playing item disappears entirely.
+        c.bodyEq.setPlaying(media?.playing == true && shape == .expanded && body == .media)
         // media pieces
         if let m = media {
             setText(c.titleL, m.title)
@@ -1597,7 +1619,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             c.progress.fraction = m.duration > 0 ? CGFloat(e / m.duration) : 0
             c.progress.isHidden = m.duration <= 0
             setSymbol(c.playB, m.playing ? "pause.fill" : "play.fill", 30)
-            c.bodyEq.color = artColor; c.bodyEq.setPlaying(m.playing && shape == .expanded && body == .media)    // hidden bars do not animate
+            c.bodyEq.color = artColor
         }
     }
 
@@ -1606,8 +1628,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for (kind, item) in slotItems {
             if case .file(let url) = kind { (item.icon as? FilePreviewView)?.setFile(url) }
         }
-        if let m = media, let it = slotItem(.media), let art = it.icon as? ArtView, let eq = it.detail as? EqView {
-            art.setImage(artwork); eq.color = artColor; eq.setPlaying(m.playing && usedViews.contains(where: { $0 === eq }))
+        if let it = slotItem(.media), let art = it.icon as? ArtView, let eq = it.detail as? EqView {
+            art.setImage(artwork); eq.color = artColor
+            eq.setPlaying(media?.playing == true && usedViews.contains(where: { $0 === eq }))
         }
         if let it = slotItem(.timer), let l = it.detail as? NSTextField {
             setText(l, timer.text())

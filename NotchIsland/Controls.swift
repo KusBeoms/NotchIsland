@@ -45,7 +45,15 @@ final class EqView: NSView {
     private var animating = false, fake = false
     private var timer: Timer?, quietSince: CFAbsoluteTime?
     private var levels: [CGFloat] = [CGFloat](repeating: 0.3, count: 5)
-    var color: NSColor = accent { didSet { bars.forEach { $0.backgroundColor = color.cgColor } } }
+    var color: NSColor = accent {
+        didSet {
+            guard color != oldValue else { return }
+            CATransaction.begin()
+            CATransaction.setAnimationDuration(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : 0.3)
+            bars.forEach { $0.backgroundColor = color.cgColor }
+            CATransaction.commit()
+        }
+    }
     init() {
         super.init(frame: .zero)
         wantsLayer = true
