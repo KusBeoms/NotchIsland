@@ -640,17 +640,35 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// Start every new output at zero volume, and refresh the Bluetooth report when the output changes.
+    private var lastOutDev: AudioObjectID = 0
+    private var outDebounce: Timer?
+
+    /// Every real change of the default output (connect, disconnect, manual switch) starts the new output at zero volume
+    /// (intended behavior, including when headphones are unplugged and the built-in speakers become the output),
+    /// and refreshes the Bluetooth report. Opt out: `defaults write <bundle id> zeroVolumeOnOutputChange -bool NO`.
     func watchOutputDevice() {
+        lastOutDev = SystemLevels.outputDevice() ?? 0
         var a = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
                                            mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
         AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &a, .main) { [weak self] _, _ in
-            SystemLevels.setVolume(0)
-            self?.hudUntil = .distantPast
-            self?.lastVol = nil; self?.lastMute = nil
-            self?.watchVolume()
-            self?.scheduleAirPodsRefresh()
+            guard let s = self else { return }
+            // Debounce: routing churn emits bursts of notifications; act once the output has settled.
+            s.outDebounce?.invalidate()
+            let t = Timer(timeInterval: 0.4, repeats: false) { [weak s] _ in s?.outputDeviceSettled() }
+            RunLoop.main.add(t, forMode: .common); s.outDebounce = t
         }
+    }
+
+    private func outputDeviceSettled() {
+        let dev = SystemLevels.outputDevice() ?? 0
+        guard dev != lastOutDev else { return }          // same device re-announced: nothing to do
+        lastOutDev = dev
+        hudUntil = .distantPast
+        lastVol = nil; lastMute = nil
+        watchVolume()                                    // listen on the new device first, then change its level
+        let enabled = UserDefaults.standard.object(forKey: "zeroVolumeOnOutputChange") as? Bool ?? true
+        if enabled, !(demoVolume || demoBrightness) { SystemLevels.setVolume(0) }
+        scheduleAirPodsRefresh()
     }
 
     /// Asleep or screen off: nothing is visible, so stop the main loop entirely until the Mac wakes.

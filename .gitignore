@@ -16,3 +16,6 @@
 *.log
 *.png
 *.tmp
+
+# Release binaries (distribute via GitHub Releases)
+/NotchIsland/build/*.zip
