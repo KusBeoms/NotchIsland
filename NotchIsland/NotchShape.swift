@@ -33,5 +33,3 @@ func notchPath(_ w: CGFloat, _ h: CGFloat, earL: Bool = true, earR: Bool = true,
 
 /// Width of the expanded media / activity card, shared by the island frame, the content layout and the dial.
 let expandedCardWidth: CGFloat = 332
-/// The lyrics pane never reaches closer than this to the right edge of the screen.
-let lyricsEdgeMargin: CGFloat = 12

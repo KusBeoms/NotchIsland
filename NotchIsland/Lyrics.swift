@@ -1,19 +1,6 @@
 import Foundation
 import SQLite3
 
-/// A short monotonic reveal, independent of the island's spring animation.
-struct LyricsWidthTransition {
-    var from: Double
-    var to: Double
-    var start: TimeInterval
-    let duration: TimeInterval = 0.18
-    func value(at time: TimeInterval) -> Double {
-        let t = min(1, max(0, (time - start) / duration))
-        return from + (to - from) * t * t * (3 - 2 * t)
-    }
-    func finished(at time: TimeInterval) -> Bool { time >= start + duration }
-}
-
 /// A capped follower keeps ordinary line changes animated even when no instrumental gap exists.
 struct LyricsScrollFollower {
     private(set) var position: Double = 0
@@ -41,20 +28,50 @@ struct LyricsWord: Equatable {
     var start: TimeInterval
     var end: TimeInterval
     var range: NSRange
+    /// Neighbour-smoothed span length used for motion amplitude, so adjacent characters never differ abruptly.
+    var spanHint: TimeInterval? = nil
+    private var motionSpan: TimeInterval { max(0.01, spanHint ?? (end - start)) }
     func progress(at time: TimeInterval) -> Double {
         min(1, max(0, (time - start) / max(0.01, end - start)))
     }
-    /// Sung text rises gently and stays raised while its sentence is in focus; font metrics never change.
+    static let liftPeak = 2.5
+    static let maximumRise = 0.9
+    static let fallRatio = 3.0
+    /// Total time after `start` at which the lift has fully settled back to zero.
+    static let maximumLiftSpan = maximumRise * (1 + fallRatio)
+    /// Sung text floats up like a cloud and then sinks back slowly. The rise follows the length of the sung span
+    /// (longer syllables rise longer), and the fall is several times slower than the rise.
     func lift(at time: TimeInterval, emphasis: Double, reduceMotion: Bool, minimumRiseDuration: Double = 0) -> Double {
-        guard !reduceMotion, time > start else { return 0 }
-        let duration = max(0.01, end - start)
-        let riseDuration = max(minimumRiseDuration, min(0.2, duration * 0.6))
-        let t = min(1, max(0, (time - start) / riseDuration))
-        // Seventh-order smoothstep: velocity, acceleration and jerk vanish at both ends.
-        let eased = t * t * t * t * (35 + t * (-84 + t * (70 - 20 * t)))
-        return 1.5 * eased * min(1, max(0, emphasis))
+        // Very quick syllables barely move; the full height is reached from about 0.3s of singing.
+        let quickness = 0.35 + 0.65 * Self.smoothstep((motionSpan - 0.08) / 0.22)
+        return Self.liftPeak * quickness * shape(at: time, emphasis: emphasis, reduceMotion: reduceMotion, minimumRiseDuration: minimumRiseDuration)
     }
-
+    static let swellDelay = 0.08
+    static let swellPeak = 0.09
+    /// Slowly sung characters swell a little (just after they float up) and shrink back at the same unhurried pace.
+    func scale(at time: TimeInterval, emphasis: Double, reduceMotion: Bool, minimumRiseDuration: Double = 0) -> Double {
+        let slowness = Self.smoothstep((motionSpan - 0.3) / 0.5)
+        return 1 + Self.swellPeak * slowness * shape(at: time - Self.swellDelay, emphasis: emphasis, reduceMotion: reduceMotion, minimumRiseDuration: minimumRiseDuration)
+    }
+    static func smoothstep(_ x: Double) -> Double { let t = min(1, max(0, x)); return t * t * (3 - 2 * t) }
+    /// 0...1: rises over a span-dependent time, then falls three times slower. Both halves have zero velocity and
+    /// acceleration at the peak, and the emphasis (scroll focus) is eased so line changes never jerk the motion.
+    private func shape(at time: TimeInterval, emphasis: Double, reduceMotion: Bool, minimumRiseDuration: Double) -> Double {
+        guard !reduceMotion, time > start else { return 0 }
+        let rise = min(Self.maximumRise, max(minimumRiseDuration, motionSpan * 1.6))
+        let fall = rise * Self.fallRatio
+        let elapsed = time - start
+        let value: Double
+        if elapsed < rise {
+            let t = elapsed / rise
+            // Seventh-order smoothstep: velocity, acceleration and jerk vanish at both ends.
+            value = t * t * t * t * (35 + t * (-84 + t * (70 - 20 * t)))
+        } else {
+            let u = min(1, (elapsed - rise) / fall)
+            value = 1 - u * u * u * (u * (u * 6 - 15) + 10)   // smootherstep down
+        }
+        return value * Self.smoothstep(emphasis)
+    }
 }
 
 struct LyricsLine: Equatable {
@@ -68,7 +85,7 @@ struct LyricsLine: Equatable {
         for index in text.indices where !text[index].isWhitespace {
             ranges.append(NSRange(index..<text.index(after: index), in: text))
         }
-        return words.flatMap { word -> [LyricsWord] in
+        let timed = words.flatMap { word -> [LyricsWord] in
             let characters = ranges.filter { NSIntersectionRange($0, word.range).length > 0 }
             guard !characters.isEmpty else { return [] }
             let duration = max(0.01, word.end - word.start) / Double(characters.count)
@@ -76,6 +93,14 @@ struct LyricsLine: Equatable {
                 LyricsWord(start: word.start + Double(offset) * duration,
                            end: word.start + Double(offset + 1) * duration, range: range)
             }
+        }
+        // Average each character's span with its neighbours (1-2-1) so motion amplitude changes gradually along the line.
+        return timed.enumerated().map { index, item in
+            let spans = timed.map { max(0.01, $0.end - $0.start) }
+            let before = spans[max(0, index - 1)], after = spans[min(spans.count - 1, index + 1)]
+            var smoothed = item
+            smoothed.spanHint = 0.25 * before + 0.5 * spans[index] + 0.25 * after
+            return smoothed
         }
     }
 }

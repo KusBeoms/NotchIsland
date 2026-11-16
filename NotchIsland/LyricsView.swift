@@ -24,6 +24,9 @@ final class LyricRowView: NSView {
     private var time: TimeInterval = 0
     private var emphasis: Double = 1
     private let characterRiseDuration: Double = 0.32
+    private static let waveReach = 4          // how many preceding characters still pull a character along
+    private static let waveDelay = 0.05       // seconds of lag per character: the lift spreads like a wave
+    private static let waveDecay = 0.55
     private var gradient: CGGradient?
     private var gradientEmphasis = -1.0
     private var activeWindow: ClosedRange<TimeInterval>?   // outside it, progress and lift cannot change
@@ -37,7 +40,7 @@ final class LyricRowView: NSView {
         guard lyric != line || self.maximumLines != maximumLines else { return }
         lyric = line; timings = line.characterTimings; self.maximumLines = maximumLines; cachedWidth = -1
         wordProgress = []; characterLifts = []; needsDisplay = true; phase = -1
-        activeWindow = timings.isEmpty ? nil : (timings.map(\.start).min()!...(timings.map(\.end).max()! + characterRiseDuration))
+        activeWindow = timings.isEmpty ? nil : (timings.map(\.start).min()!...(timings.map(\.end).max()! + LyricsWord.maximumLiftSpan + Double(Self.waveReach) * Self.waveDelay))
     }
     func advance(to time: TimeInterval, emphasis: Double) {
         // Lines that are not being sung only redraw when their emphasis changes (while the list scrolls).
@@ -46,10 +49,28 @@ final class LyricRowView: NSView {
         phase = newPhase
         let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         let progress = lyric.words.map { $0.progress(at: time) }
-        let lifts = timings.map { $0.lift(at: time, emphasis: emphasis, reduceMotion: reduceMotion, minimumRiseDuration: characterRiseDuration) }
+        let lifts = draggedLifts(for: timings, emphasis: emphasis, at: time, reduceMotion: reduceMotion)
         let changed = progress != wordProgress || lifts != characterLifts || self.emphasis != emphasis
         self.time = time; self.emphasis = emphasis; wordProgress = progress; characterLifts = lifts
         if changed { needsDisplay = true }
+    }
+    /// Every character rises on its own timing; the characters behind it are pulled along with a decaying share,
+    /// so the line moves like a cloud instead of as separate hops.
+    /// Each following character receives the earlier characters' lift a little later and weaker (a stateless wave),
+    /// blended so the total never exceeds the peak and stays continuous in time.
+    private func draggedLifts(for words: [LyricsWord?], emphasis: Double, at time: TimeInterval, reduceMotion: Bool) -> [Double] {
+        let peak = LyricsWord.liftPeak
+        func own(_ index: Int, _ time: TimeInterval) -> Double {
+            words[index]?.lift(at: time, emphasis: emphasis, reduceMotion: reduceMotion, minimumRiseDuration: characterRiseDuration) ?? 0
+        }
+        return words.indices.map { index in
+            var pulled = 0.0
+            for distance in 1...Self.waveReach where index - distance >= 0 {
+                pulled += pow(Self.waveDecay, Double(distance)) * own(index - distance, time - Self.waveDelay * Double(distance))
+            }
+            let own = own(index, time)
+            return own + (1 - min(1, own / peak)) * peak * tanh(pulled / peak)
+        }
     }
     override func layout() { super.layout(); if cachedWidth != bounds.width { needsDisplay = true } }
     private func shapeText() {
@@ -137,7 +158,8 @@ final class LyricRowView: NSView {
                 let matched = timings.filter { NSIntersectionRange($0.range, range).length > 0 }
                 let timing = matched.first.map { first in
                     LyricsWord(start: matched.map(\.start).min() ?? first.start,
-                               end: matched.map(\.end).max() ?? first.end, range: range)
+                               end: matched.map(\.end).max() ?? first.end, range: range,
+                               spanHint: matched.compactMap(\.spanHint).max())
                 }
                 let left = CTLineGetOffsetForStringIndex(lines[lineIndex], range.location, nil)
                 let right = CTLineGetOffsetForStringIndex(lines[lineIndex], NSMaxRange(range), nil)
@@ -157,12 +179,20 @@ final class LyricRowView: NSView {
         }
         let fillColor = NSColor(white: 1, alpha: baseAlpha).cgColor
         let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-        for character in characters {
+        let lifts = draggedLifts(for: characters.map(\.timing), emphasis: emphasis, at: time, reduceMotion: reduceMotion)
+        for (index, character) in characters.enumerated() {
             let progress = character.timing?.progress(at: time) ?? 0
-            let lift = character.timing?.lift(at: time, emphasis: emphasis, reduceMotion: reduceMotion, minimumRiseDuration: characterRiseDuration) ?? 0
+            let lift = lifts[index]
             context.saveGState()
+            context.interpolationQuality = .high
             // One translation applies to the entire character, including both dim and bright portions.
             context.translateBy(x: 0, y: lift)
+            let swell = CGFloat(character.timing?.scale(at: time, emphasis: emphasis, reduceMotion: reduceMotion, minimumRiseDuration: characterRiseDuration) ?? 1)
+            if swell != 1 {
+                context.translateBy(x: character.rect.midX, y: character.rect.minY)   // grow from the bottom centre: no vertical wobble
+                context.scaleBy(x: swell, y: swell)
+                context.translateBy(x: -character.rect.midX, y: -character.rect.minY)
+            }
             context.clip(to: character.rect, mask: character.mask)
             if progress > 0 {
                 let feather = min(8, max(3, character.rect.width * 0.3))
@@ -367,7 +397,8 @@ final class LyricsPanelView: Flip {
         return bounds.contains(convert(point, from: superview)) ? self : nil
     }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-    override func mouseDown(with event: NSEvent) {}
-    override func mouseUp(with event: NSEvent) {}
+    // Presses travel on to the island, so holding the lyrics can toggle them back (a plain tap on them does nothing).
+    override func mouseDown(with event: NSEvent) { nextResponder?.mouseDown(with: event) }
+    override func mouseUp(with event: NSEvent) { nextResponder?.mouseUp(with: event) }
     override func scrollWheel(with event: NSEvent) {}
 }

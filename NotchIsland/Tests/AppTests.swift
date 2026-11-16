@@ -204,17 +204,11 @@ let closedArtwork = lyricsApp.c.art.frame
 let closedProgress = lyricsApp.c.progress.frame
 lyricsApp.lyricsTapped(); layoutLyricsApp()
 let openFrame = lyricsApp.frame(for: .expanded)
-assert(openFrame.minX == closedFrame.minX && openFrame.height == closedFrame.height)
-assert(openFrame.width == closedFrame.width + lyricsApp.lyricsExtensionWidth)
-assert(lyricsApp.c.art.frame == closedArtwork && lyricsApp.c.progress.frame == closedProgress)
+assert(openFrame == closedFrame)                         // the island never changes size: the lyrics replace the card's content
 assert(lyricsApp.lyricsVisible && lyricsApp.locked && lyricsApp.c.lyricsB.image != nil)
-let lyricControls = [lyricsApp.c.prevB, lyricsApp.c.playB, lyricsApp.c.nextB, lyricsApp.c.lyricsB]
-for pair in zip(lyricControls, lyricControls.dropFirst()) { assert(pair.0.frame.maxX < pair.1.frame.minX) }
-assert(lyricsApp.c.lyricsPane.frame.width > 0 && !lyricsApp.c.lyricsPane.isHidden)
-assert(lyricsApp.c.playB.frame.midX == (lyricsApp.c.mediaCardWidth! / 2))
-assert(lyricsApp.c.playB.frame.midX - lyricsApp.c.prevB.frame.midX == 70)
-assert(lyricsApp.c.nextB.frame.midX - lyricsApp.c.playB.frame.midX == 70)
-assert(lyricsApp.c.lyricsB.frame.width == 24)
+assert(lyricsApp.c.lyricsPane.frame.width == lyricsApp.c.mediaCardWidth!)
+assert(lyricsApp.c.lyricsPane.frame.contains(lyricsApp.c.art.frame))     // covers the cover, title and controls
+assert(lyricsApp.c.lyricsB.frame.width == 24 && lyricsApp.c.lyricsB.frame.maxX <= lyricsApp.c.mediaCardWidth!)
 let rows = lyricsApp.c.lyricsPane.subviews.compactMap { $0 as? LyricRowView }.sorted { $0.lineIndex < $1.lineIndex }
 assert(rows.count == 3)
 assert(abs((rows[1].frame.midY - rows[0].frame.midY) - (rows[2].frame.midY - rows[1].frame.midY)) < 0.001)
@@ -224,29 +218,18 @@ let heldPosition = lyricsApp.c.lyricsPane.position
 lyricsApp.c.lyricsPane.advance(to: 7)
 assert(heldPosition == lyricsApp.c.lyricsPane.position) // Paused timing does not drift.
 lyricsApp.c.lyricsPane.advance(to: 6)
-// Intermediate reveal widths must never rewrap lyrics or move music controls.
-let fixedRows = rows.map { $0.frame }
-let fixedTextWidth = lyricsApp.c.lyricsPane.bounds.width
-for width in stride(from: closedFrame.width, through: openFrame.width, by: 30) {
-    lyricsApp.view.setFrameSize(NSSize(width: width, height: openFrame.height))
-    lyricsApp.view.needsLayout = true; lyricsApp.view.layoutSubtreeIfNeeded()
-    lyricsApp.c.needsLayout = true; lyricsApp.c.layoutSubtreeIfNeeded()
-    assert(lyricsApp.c.lyricsPane.bounds.width == fixedTextWidth)
-    assert(lyricsApp.c.art.frame == closedArtwork && lyricsApp.c.progress.frame == closedProgress)
-    assert(rows.map { $0.frame } == fixedRows)
-}
 layoutLyricsApp()
 let lyricPoint = lyricsApp.c.convert(NSPoint(x: lyricsApp.c.lyricsPane.frame.midX, y: lyricsApp.c.lyricsPane.frame.midY), to: lyricsApp.view.superview!)
 assert(lyricsApp.view.hitTest(lyricPoint) === lyricsApp.c.lyricsPane)
-let lyricHeaderPoint = lyricsApp.c.convert(NSPoint(x: lyricsApp.c.lyricsPane.frame.midX, y: 10), to: lyricsApp.view.superview!)
-assert(lyricsApp.view.hitTest(lyricHeaderPoint) === lyricsApp.c.lyricsPane)
+let toggleCenter = NSPoint(x: lyricsApp.c.lyricsB.frame.midX, y: lyricsApp.c.lyricsB.frame.midY)
+assert(lyricsApp.view.hitTest(lyricsApp.c.convert(toggleCenter, to: lyricsApp.view.superview!)) === lyricsApp.c.lyricsB)   // still toggles back
 if let path = ProcessInfo.processInfo.environment["NI_LYRICS_PREVIEW_PATH"] {
     // Freeze cross-fades for an inspectable offscreen snapshot using synthetic text only.
     for element in lyricsApp.c.all { element.layer?.removeAllAnimations() }
     lyricsApp.c.art.alphaValue = 1; lyricsApp.c.titleL.alphaValue = 1; lyricsApp.c.artistL.alphaValue = 1
     lyricsApp.c.bodyEq.alphaValue = 1; lyricsApp.c.progress.alphaValue = 1
     lyricsApp.c.elapsedL.alphaValue = 1; lyricsApp.c.remainL.alphaValue = 1
-    for button in lyricControls { button.alphaValue = 1 }
+    lyricsApp.c.lyricsB.alphaValue = 1
     lyricsApp.c.lyricsPane.alphaValue = 1
     lyricsApp.c.lyricsPane.layoutSubtreeIfNeeded()
     if let bitmap = lyricsApp.view.bitmapImageRepForCachingDisplay(in: lyricsApp.view.bounds) {
@@ -280,15 +263,7 @@ lyricsApp.mainP.x.jump(openFrame.minX); lyricsApp.mainP.h.jump(openFrame.height)
 lyricsApp.mainP.w.jump(openFrame.width); lyricsApp.mainP.active = true; lyricsApp.mainP.visible = true
 lyricsApp.lyricsTapped()
 assert(!lyricsApp.lyricsRequested && lyricsApp.locked)
-if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
-    assert(lyricsApp.lyricsWidthTransition != nil && lyricsApp.c.lyricsVisible && !lyricsApp.c.lyricsPane.isHidden)
-    lyricsApp.lyricsWidthTransition?.start -= 1
-    let displayLink = lyricsApp.screen.displayLink(target: lyricsApp, selector: #selector(App.animTick(_:)))
-    lyricsApp.animTick(displayLink)
-    assert(lyricsApp.lyricsWidthTransition == nil && lyricsApp.mainP.w.cur == closedFrame.width)
-    assert(!lyricsApp.c.lyricsVisible && lyricsApp.c.lyricsPane.isHidden)
-    displayLink.invalidate()
-}
+assert(lyricsApp.mainP.w.cur == closedFrame.width && !lyricsApp.c.lyricsVisible)
 lyricsApp.media = track(bundle: "test.otherplayer")
 lyricsApp.refreshUI()
 assert(!lyricsApp.c.lyricsB.isEnabled && lyricsApp.lyricsTrack == nil)
@@ -373,7 +348,15 @@ func renderRigidCharacter(_ time: Double) -> NSBitmapImageRep {
     row.cacheDisplay(in: row.bounds, to: bitmap)
     return bitmap
 }
-let partialCharacter = renderRigidCharacter(0.5), completedCharacter = renderRigidCharacter(1)
+// The cloud-like lift also changes with time: compare the partial reveal (rising) with a completed one at the same lift (falling).
+let referenceWord = LyricsWord(start: 0, end: 1, range: NSRange(location: 0, length: 1))
+let partialLift = referenceWord.lift(at: 0.5, emphasis: 1, reduceMotion: false)
+var fallLow = 0.9, fallHigh = 1 + LyricsWord.maximumLiftSpan
+for _ in 0..<60 {
+    let mid = (fallLow + fallHigh) / 2
+    if referenceWord.lift(at: mid, emphasis: 1, reduceMotion: false) > partialLift { fallLow = mid } else { fallHigh = mid }
+}
+let partialCharacter = renderRigidCharacter(0.5), completedCharacter = renderRigidCharacter((fallLow + fallHigh) / 2)
 var shapeDifference = 0.0, shapeSamples = 0
 for x in 0..<partialCharacter.pixelsWide {
     let peakA = (0..<partialCharacter.pixelsHigh).map { pixelLight(partialCharacter, x, $0) }.max() ?? 0
@@ -389,7 +372,8 @@ let staggered = LyricRowView(frame: NSRect(x: 0, y: 0, width: 180, height: 44))
 staggered.configure(LyricsLine(start: 0, end: 1, text: "가나다라", words: [LyricsWord(start: 0, end: 1, range: NSRange(location: 0, length: 4))]), maximumLines: 1)
 staggered.advance(to: 0.15, emphasis: 1)
 if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
-    assert(staggered.characterLifts[0] > 0 && staggered.characterLifts.dropFirst().allSatisfy { $0 == 0 })
+    let lifts = staggered.characterLifts
+    assert(lifts[0] > 0 && lifts[1] > 0 && lifts[1] < lifts[0] && lifts[2] < lifts[1]) // followers are pulled along, fading out
 }
 print("Composed-character stagger, rigid glyph geometry, fixed font size and gradient checks passed")
 print("Continuous scroll speed, long-rest countdown and songwriter credit checks passed")
@@ -443,9 +427,9 @@ lockApp.playTapGeneration = 2
 lockApp.playHoldUntil = Date().addingTimeInterval(5)
 lockApp.confirmPlayState(true, retry: true, generation: 1)         // a stale confirmation neither queries nor touches the hold
 assert(lockApp.playHoldUntil > Date())
-let baseWidth = lockApp.expandedBase.w
+let baseWidth = lockApp.expandedSize().w
 _ = lockApp.frame(for: .expanded)
-assert(lockApp.expandedBase.w == baseWidth && baseWidth == expandedCardWidth)   // frame(for:) has no side effects
+assert(lockApp.expandedSize().w == baseWidth && baseWidth == expandedCardWidth)   // frame(for:) has no side effects
 let symbolButton = makeSymbolButton("play.fill", 30, .white)
 setSymbol(symbolButton, "pause.fill", 30)
 let firstImage = symbolButton.image

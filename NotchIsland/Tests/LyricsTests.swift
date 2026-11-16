@@ -14,13 +14,6 @@ private final class FixtureProvider: LyricsProviding {
 @main
 struct LyricsTests {
     static func main() throws {
-        let expanding = LyricsWidthTransition(from: 332, to: 632, start: 10)
-        let shrinking = LyricsWidthTransition(from: 632, to: 332, start: 10)
-        let samples = (0...18).map { expanding.value(at: 10 + Double($0) / 100) }
-        assert(samples.first == 332 && abs(samples.last! - 632) < 0.0001)
-        assert(zip(samples, samples.dropFirst()).allSatisfy { $0 <= $1 })
-        assert((0...18).allSatisfy { (332...632).contains(shrinking.value(at: 10 + Double($0) / 100)) })
-        assert(expanding.finished(at: 10.2))
         let ttml = """
         <tt xmlns="http://www.w3.org/ns/ttml"><head><metadata>Not a lyric</metadata></head><body><div>
         <p begin="00:01.000" end="3s"><span begin="1s" end="2s">First </span><span begin="2s" end="3s">line</span></p>
@@ -39,10 +32,18 @@ struct LyricsTests {
         let liftedWord = document.lines[0].words[0]
         assert(liftedWord.lift(at: 1, emphasis: 1, reduceMotion: false) == 0)
         let risingLift = liftedWord.lift(at: 1.03, emphasis: 1, reduceMotion: false)
-        let spokenLift = liftedWord.lift(at: 1.5, emphasis: 1, reduceMotion: false)
-        assert(risingLift > 0 && risingLift < spokenLift)
-        assert(abs(spokenLift - 1.5) < 0.00001)
-        assert(liftedWord.lift(at: 2.5, emphasis: 1, reduceMotion: false) == spokenLift)
+        let peakLift = liftedWord.lift(at: 1.9, emphasis: 1, reduceMotion: false)   // rise follows span length (1s -> 0.9s cap)
+        assert(risingLift > 0 && risingLift < peakLift)
+        assert(abs(peakLift - LyricsWord.liftPeak) < 0.00001)
+        let sinking = liftedWord.lift(at: 3.0, emphasis: 1, reduceMotion: false)
+        assert(sinking > 0 && sinking < peakLift)                                     // slowly falls back
+        assert(liftedWord.lift(at: 1 + LyricsWord.maximumLiftSpan + 0.1, emphasis: 1, reduceMotion: false) == 0)
+        let shortWord = LyricsWord(start: 0, end: 0.1, range: NSRange(location: 0, length: 1))
+        assert(shortWord.lift(at: 0.4, emphasis: 1, reduceMotion: false) < LyricsWord.liftPeak * 0.3)   // quick syllables barely rise
+assert(shortWord.scale(at: 0.4, emphasis: 1, reduceMotion: false) == 1)
+assert(abs(liftedWord.scale(at: 1.9 + LyricsWord.swellDelay, emphasis: 1, reduceMotion: false) - (1 + LyricsWord.swellPeak)) < 0.00001)         // slow ones swell...
+assert(liftedWord.scale(at: 3.0, emphasis: 1, reduceMotion: false) < 1 + LyricsWord.swellPeak)                         // ...and shrink back slowly
+assert(liftedWord.scale(at: 6, emphasis: 1, reduceMotion: false) == 1)
         assert(liftedWord.lift(at: 1.5, emphasis: 0, reduceMotion: false) == 0)
         assert(liftedWord.lift(at: 1.5, emphasis: 1, reduceMotion: true) == 0)
         let composedText = "가😀e\u{301}"
@@ -56,11 +57,17 @@ struct LyricsTests {
         assert(characters[1].lift(at: 0.15, emphasis: 1, reduceMotion: false, minimumRiseDuration: 0.1) == 0)
         let quickCharacter = LyricsWord(start: 0, end: 0.08, range: NSRange(location: 0, length: 1))
         let gentleRise = quickCharacter.lift(at: 0.08, emphasis: 1, reduceMotion: false, minimumRiseDuration: 0.24)
-        assert(gentleRise > 0 && gentleRise < 0.75) // Short syllables still rise gradually after their timestamp ends.
-        assert(quickCharacter.lift(at: 0.24, emphasis: 1, reduceMotion: false, minimumRiseDuration: 0.24) == 1.5)
-        let softStart = quickCharacter.lift(at: 0.032, emphasis: 1, reduceMotion: false, minimumRiseDuration: 0.32) / 1.5
-        let softEnd = quickCharacter.lift(at: 0.288, emphasis: 1, reduceMotion: false, minimumRiseDuration: 0.32) / 1.5
+        assert(gentleRise > 0 && gentleRise < 0.3) // Short syllables still rise gradually after their timestamp ends.
+        assert(quickCharacter.lift(at: 0.24, emphasis: 1, reduceMotion: false, minimumRiseDuration: 0.24) > 0)
+        let softStart = quickCharacter.lift(at: 0.032, emphasis: 1, reduceMotion: false, minimumRiseDuration: 0.32) / quickCharacter.lift(at: 0.32, emphasis: 1, reduceMotion: false, minimumRiseDuration: 0.32)
+        let softEnd = quickCharacter.lift(at: 0.288, emphasis: 1, reduceMotion: false, minimumRiseDuration: 0.32) / quickCharacter.lift(at: 0.32, emphasis: 1, reduceMotion: false, minimumRiseDuration: 0.32)
         assert(softStart < 0.005 && softEnd > 0.995)
+        // Motion curves are continuous: no step larger than a small bound between 1ms samples.
+        var previousLift = 0.0
+        for step in 0...5000 {
+            let value = liftedWord.lift(at: 1 + Double(step) * 0.001, emphasis: 1, reduceMotion: false)
+            assert(abs(value - previousLift) < 0.01); previousLift = value
+        }
         assert(abs(softStart + softEnd - 1) < 0.00001)
 
 

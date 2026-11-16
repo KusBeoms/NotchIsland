@@ -89,6 +89,18 @@ enum SystemLevels {
         guard let h = ds else { return false }
         return dlsym(h, "DisplayServicesSetBrightness") != nil && brightness() != nil
     }
+    private typealias GetAuto = @convention(c) (UInt32, UnsafeMutablePointer<Bool>) -> Int32
+    private typealias SetAuto = @convention(c) (UInt32, Bool) -> Int32
+    /// macOS "Automatically adjust brightness" (ambient light compensation) of the built-in display.
+    static func autoBrightness() -> Bool? {
+        guard let h = ds, let sym = dlsym(h, "DisplayServicesAmbientLightCompensationEnabled"), let id = builtinDisplay else { return nil }
+        var on = false
+        return unsafeBitCast(sym, to: GetAuto.self)(id, &on) == 0 ? on : nil
+    }
+    @discardableResult static func setAutoBrightness(_ on: Bool) -> Bool {
+        guard let h = ds, let sym = dlsym(h, "DisplayServicesEnableAmbientLightCompensation"), let id = builtinDisplay else { return false }
+        return unsafeBitCast(sym, to: SetAuto.self)(id, on) == 0
+    }
     @discardableResult static func setBrightness(_ v: Float) -> Bool {
         guard let h = ds, let sym = dlsym(h, "DisplayServicesSetBrightness"), let id = builtinDisplay else { return false }
         return unsafeBitCast(sym, to: SetB.self)(id, min(max(v, 0), 1)) == 0

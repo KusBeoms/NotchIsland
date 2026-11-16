@@ -21,6 +21,7 @@ final class AudioLevels {
     private var outputListener: AudioObjectPropertyListenerBlock?
     private(set) var live = false                 // true once audio blocks actually arrive
     private var lastBlock = CFAbsoluteTimeGetCurrent() - 100
+    private var lastSound = CFAbsoluteTimeGetCurrent()          // last block that actually carried signal
     private var tap = AudioObjectID(kAudioObjectUnknown), agg = AudioObjectID(kAudioObjectUnknown)
     private var proc: AudioDeviceIOProcID?
     private let n = 1024
@@ -53,8 +54,11 @@ final class AudioLevels {
         let t = DispatchSource.makeTimerSource(queue: q)
         t.schedule(deadline: .now() + 2, repeating: 1.0, leeway: .milliseconds(500))
         t.setEventHandler { [weak self] in
-            guard let s = self, s.users > 0, !s.failed, CFAbsoluteTimeGetCurrent() - s.lastBlock > 2.0, CFAbsoluteTimeGetCurrent() - s.startedAt > 2.0 else { return }
-            s.restart()
+            guard let s = self, s.users > 0 else { return }
+            let now = CFAbsoluteTimeGetCurrent()
+            if s.failed { if now - s.startedAt > 5 { s.restart() } }                         // setup failed (e.g. right after a device change): try again
+            else if now - s.startedAt > 2, now - s.lastBlock > 2 { s.restart() }              // blocks stopped arriving
+            else if now - s.startedAt > 6, now - s.lastSound > 6 { s.restart() }              // blocks arrive but only silence: a stale tap while sound is playing
         }
         t.resume(); watchdog = t
     }
@@ -74,7 +78,7 @@ final class AudioLevels {
     private func start() {
         nap = ProcessInfo.processInfo.beginActivity(options: [.userInitiatedAllowingIdleSystemSleep], reason: "audio equalizer")
         guard #available(macOS 14.2, *), ProcessInfo.processInfo.environment["NI_NOAUDIO"] == nil else { return }
-        startedAt = CFAbsoluteTimeGetCurrent(); lastBlock = startedAt
+        startedAt = CFAbsoluteTimeGetCurrent(); lastBlock = startedAt; lastSound = startedAt
         failed = false
         let desc = CATapDescription(monoGlobalTapButExcludeProcesses: [])
         desc.uuid = UUID(); desc.muteBehavior = .unmuted; desc.isPrivate = true
@@ -116,14 +120,17 @@ final class AudioLevels {
         guard let b = abl.first, let raw = b.mData else { return }
         let ch = max(1, Int(b.mNumberChannels)), frames = Int(b.mDataByteSize) / (4 * ch)
         let x = raw.assumingMemoryBound(to: Float.self)
+        var peak: Float = 0
         for i in 0..<frames {
             var v: Float = 0
             for c in 0..<ch { v += x[i * ch + c] }
             ring[ringPos] = v / Float(ch); ringPos = (ringPos + 1) % n
+            peak = max(peak, abs(v))
         }
         fill = min(n, fill + frames)
         let now = CFAbsoluteTimeGetCurrent()
         lastBlock = now; live = true
+        if peak > 1e-5 { lastSound = now }
         guard now - lastAnalysis >= 1.0 / 40 else { return }       // the bars only redraw at 30Hz: no need for a FFT per audio block
         lastAnalysis = now
         analyse()

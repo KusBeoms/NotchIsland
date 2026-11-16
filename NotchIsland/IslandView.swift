@@ -60,6 +60,8 @@ final class IslandView: FileDragView {
 
     var onOpenSource: (() -> Void)?
     private var sourceTapActive = false
+    /// The last press landed on the lyrics themselves (a plain tap there does nothing; holding it toggles them back).
+    private(set) var pressOnLyrics = false
     var onDragEnter: (() -> Void)?
     var onDragExit: (() -> Void)?
     var onDrop: (([URL]) -> Void)?
@@ -93,7 +95,10 @@ final class IslandView: FileDragView {
         guard bodyRect.contains(here) || (bottomInset > 0 && strip.contains(here)) else { return nil }
         guard bodyRect.contains(here) else { return dial.hitTest(here) ?? self }
         let p = content.convert(here, from: self)
-        if content.lyricsVisible, p.x >= (content.mediaCardWidth ?? content.bounds.width) { return content.lyricsPane }
+        if content.lyricsVisible {
+            if content.lyricsB.frame.contains(p) { return content.lyricsB }
+            if content.lyricsPane.frame.contains(p) { return content.lyricsPane }
+        }
         if !content.activityRow.isHidden, content.activityRow.frame.contains(p) {
             return content.activityRow.hitTest(p)
         }
@@ -113,6 +118,7 @@ final class IslandView: FileDragView {
         guard bodyRect.contains(convert(event.locationInWindow, from: nil)) else { return }       // the dial is for scrolling only
         downPoint = event.locationInWindow
         sourceTapActive = overSource(event)
+        pressOnLyrics = content.lyricsVisible && content.lyricsPane.frame.contains(content.convert(event.locationInWindow, from: nil))
         if !sourceTapActive { onPress?() }
     }
     override func mouseUp(with event: NSEvent) {

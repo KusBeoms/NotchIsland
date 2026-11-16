@@ -20,6 +20,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var pressing = false                 // finger down on a closed island, long-press not yet fired
     var pressedWhileExpanded = false
     var longPressTimer: Timer?
+    var sensorLyricsPending = false, sensorLyricsFired = false      // light-sensor cover on a music card: close (short) or lyrics (held)
+    var lyricsHoldFired = false          // this press already toggled the lyrics: its release must not also close the island
 
     // spring-driven window size (smooth, interruptible, velocity-preserving)
     var link: CADisplayLink?
@@ -43,10 +45,6 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var pinned = false
     var lockIsland = NSRect.zero
     var expandedSwell: CGFloat = 0       // the open island swells a little when the pointer is on it (more while pressed), and snaps back when it pins
-    /// Resting width of the open island and the extra room for the lyrics pane; the swell scales only the first.
-    var expandedBase: (w: CGFloat, ext: CGFloat) {
-        (expandedSize().w, body == .media && lyricsRequested && supportsLyrics ? lyricsExtensionWidth : 0)
-    }
     var swellSuppressed = false          // after pinning: stay small until the pointer has left
     var lockBorder: NSPanel?; var lockBorderLayer: CAShapeLayer?; var lockBorderTarget: CGFloat = 0
     var lockBorderGeometry: LockBorderGeometry?
@@ -62,7 +60,6 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
     var lyrics = LyricsController()
-    var lyricsWidthTransition: LyricsWidthTransition?
     var lyricsRequested = false {
         didSet { if oldValue && !lyricsRequested { lyrics.suspend() } }
     }
@@ -74,7 +71,6 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     var lyricsPlaybackTime: TimeInterval { media?.lyricsPosition(seekFraction: seekFraction) ?? 0 }
     var lyricsVisible: Bool { lyricsRequested && supportsLyrics && shape == .expanded && body == .media }
-    var lyricsExtensionWidth: CGFloat { min(300, max(0, screen.frame.maxX - lyricsEdgeMargin - (screen.frame.midX + expandedCardWidth / 2))) }
 
     var lastPlayingAt = Date.distantPast
     var artwork: NSImage?
@@ -131,6 +127,16 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var ambient = -1.0               // slow average of the light while uncovered: the touch threshold follows it
     var nothingPolls = 0             // consecutive 'nothing is playing' answers
     var idleRefreshed = false
+    /// Covering the light sensor with a finger makes macOS dim the screen. A sudden dark is a touch, so macOS's automatic
+    /// brightness is paused for it; real darkness (a slow fade is never latched, or a long cover) hands control back.
+    var autoBrightnessHeld = false
+    var lightBase = -1.0                 // slow average of the light: a fade moves it along, a sudden drop does not
+    var dropSince: Date?                 // when the light fell away suddenly (nil = no drop in progress)
+    var recoveredSince: Date?            // light back near its old level (debounces a flickering cover)
+    var lastBrightness: Float?
+    var lastBrightnessRead = Date.distantPast
+    static let realDarkAfter: TimeInterval = 5
+    static let autoBrightnessHeldKey = "autoBrightnessHeld"
     var darkLatched = false          // dark state with hysteresis: set below threshold, cleared above 1.2x
     var sensorMisses = 0
 
@@ -207,7 +213,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         guard shape == .expanded else { return }
-        if lyricsVisible, c.convert(e.locationInWindow, from: nil).x >= (c.mediaCardWidth ?? c.bounds.width) { return }
+        if lyricsVisible, c.lyricsPane.frame.contains(c.convert(e.locationInWindow, from: nil)) { return }
         guard dialShown, e.locationInWindow.y < view.bottomInset + 66 else {           // on the card itself
             if cardKind == .media, let m = media, m.duration > 0 { scrubBy(finger / 450, m) }
             return
@@ -438,9 +444,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .pressed:   return compact(extra: 44, h: n == 0 ? notchH + 6 : compactH)      // idle press: sideways AND a little down
         case .expanded:
             let (w, h) = expandedSize()
-            let extensionWidth = expandedBase.ext
             let k = 1 + expandedSwell                                          // hover / press swell: the whole island scales
-            return r(mid - w * k / 2, w * k + extensionWidth, h * k)
+            return r(mid - w * k / 2, w * k, h * k)
         }
     }
 
@@ -462,7 +467,51 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return 28 + items.reduce(0) { $0 + $1.pillWidth } + 16 * CGFloat(max(items.count - 1, 0))
     }
 
+    func holdAutoBrightness() {
+        guard !autoBrightnessHeld, SystemLevels.autoBrightness() == true else { return }
+        UserDefaults.standard.set(true, forKey: Self.autoBrightnessHeldKey)   // survives a crash: restored at the next launch
+        guard SystemLevels.setAutoBrightness(false) else { UserDefaults.standard.removeObject(forKey: Self.autoBrightnessHeldKey); return }
+        autoBrightnessHeld = true
+        if let keep = lastBrightness, let now = SystemLevels.brightness(), now < keep - 0.01 { SystemLevels.setBrightness(keep) }   // undo any dimming that started before the touch was seen
+    }
+    /// A finger on the sensor makes the light fall to a fraction of its old level within a frame or two (it rarely reads 0:
+    /// 70-100 is common), whereas dusk moves the slow average along with it and is never seen as a drop.
+    func trackSuddenDark(_ lux: Double, _ now: Date) {
+        if lightBase < 0 { lightBase = lux }
+        if let since = dropSince {
+            if lux > lightBase * 0.7 {                                   // light is back: the finger lifted (0.3s debounce for a flickering cover)
+                let from = recoveredSince ?? now; recoveredSince = from
+                if now.timeIntervalSince(from) > 0.3 { dropSince = nil; recoveredSince = nil; releaseAutoBrightness() }
+            } else {
+                recoveredSince = nil
+                if now.timeIntervalSince(since) > Self.realDarkAfter {   // dark for long: it is really dark, let macOS adapt and treat this as the new normal
+                    dropSince = nil; lightBase = lux; releaseAutoBrightness()
+                }
+            }
+            return
+        }
+        if lightBase > 30 && lux < lightBase * 0.4 {                     // sudden dark = a touch: keep macOS from dimming
+            dropSince = now; recoveredSince = nil; holdAutoBrightness()
+            return
+        }
+        lightBase = lightBase * 0.98 + lux * 0.02
+        if now.timeIntervalSince(lastBrightnessRead) > 0.5 { lastBrightnessRead = now; lastBrightness = SystemLevels.brightness() ?? lastBrightness }
+    }
+    func releaseAutoBrightness() {
+        guard autoBrightnessHeld || UserDefaults.standard.bool(forKey: Self.autoBrightnessHeldKey) else { return }
+        autoBrightnessHeld = false
+        if SystemLevels.setAutoBrightness(true) { UserDefaults.standard.removeObject(forKey: Self.autoBrightnessHeldKey) }
+    }
+    func applicationWillTerminate(_ n: Notification) { releaseAutoBrightness() }
+
     func applicationDidFinishLaunching(_ n: Notification) {
+        releaseAutoBrightness()                      // a previous run that died while holding it
+        for sig in [SIGTERM, SIGINT] {
+            signal(sig, SIG_IGN)
+            let src = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+            src.setEventHandler { [weak self] in self?.releaseAutoBrightness(); exit(0) }
+            src.resume(); signalSources.append(src)
+        }
         panel = makePanel(frame(for: .collapsed))
 
         view = IslandView(frame: NSRect(origin: .zero, size: panel.frame.size))
@@ -761,7 +810,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Something is visible, moving, pressed or dragged: needs the full frame rate.
     var stepNeedsFullRate: Bool {
         // a locked island that rests with nothing playing or counting needs no more than the idle rate
-        let restingLocked = locked && shape == .expanded && atRest && lyricsWidthTransition == nil && media?.playing != true && !timer.running
+        let restingLocked = locked && shape == .expanded && atRest && media?.playing != true && !timer.running
         return (shape != .collapsed && !restingLocked) || !atRest || hudActive || pressing || dragActive || dropping || scrollHolding || alertText != nil || banner != nil
     }
 
@@ -1166,7 +1215,22 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func pressBegan() {
         pressKind = kindAtMouse()
         pressedWhileExpanded = (shape == .expanded)
-        if pressedWhileExpanded { return }           // already open: the release (a tap) closes it
+        lyricsHoldFired = false
+        if pressedWhileExpanded {                    // already open: the release (a tap) closes it ...
+            if cardKind == .media && supportsLyrics && body == .media && !overRealNotch {    // ... but holding a music card toggles the lyrics
+                longPressTimer?.invalidate()
+                let t = Timer(timeInterval: 0.45, repeats: false) { [weak self] _ in
+                    guard let s = self, s.pressedWhileExpanded, s.shape == .expanded, s.body == .media, s.supportsLyrics else { return }
+                    guard s.frame(for: s.shape).insetBy(dx: -40, dy: -40).contains(NSEvent.mouseLocation) else { return }   // dragged away
+                    s.lyricsHoldFired = true
+                    haptic(.levelChange)
+                    s.lyricsTapped()
+                }
+                RunLoop.main.add(t, forMode: .common)
+                longPressTimer = t
+            }
+            return
+        }
         if !liveActivity {                           // nothing to show: pop out a little and go straight back in
             popUntil = Date().addingTimeInterval(0.22)
             return
@@ -1193,7 +1257,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             selected = pressKind
             pinned = true
         }
-        if pressedWhileExpanded && inside {
+        let heldForLyrics = lyricsHoldFired
+        lyricsHoldFired = false
+        if pressedWhileExpanded && inside && !heldForLyrics && !view.pressOnLyrics {   // a tap on the lyrics themselves does nothing
             if let kind = pressKind, kind != cardKind {
                 selected = kind; pinned = true; refreshUI(); return
             }
@@ -1211,9 +1277,21 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func sensorTouchBegan() {
         haptic(.alignment)
         if shape == .expanded || pinned {
-            if hudActive { guard dismissIsland(clearHUD: true, keepPinned: true) else { return } }
-            else { guard dismissIsland() else { return } }
-            haptic(.levelChange)
+            if shape == .expanded, cardKind == .media, body == .media, supportsLyrics {
+                // On a music card: a short cover closes it (on release); keeping it covered toggles the lyrics instead.
+                sensorLyricsPending = true; sensorLyricsFired = false
+                longPressTimer?.invalidate()
+                let t = Timer(timeInterval: 0.45, repeats: false) { [weak self] _ in
+                    guard let s = self, s.sensorLyricsPending, s.darkLatched, s.shape == .expanded, s.supportsLyrics else { return }
+                    s.sensorLyricsFired = true
+                    haptic(.levelChange)
+                    s.lyricsTapped()
+                }
+                RunLoop.main.add(t, forMode: .common)
+                longPressTimer = t
+                return
+            }
+            sensorDismiss()
             return
         }
         if !liveActivity { popUntil = Date().addingTimeInterval(0.22); return }
@@ -1234,23 +1312,27 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func sensorTouchEnded() {
         longPressTimer?.invalidate(); longPressTimer = nil
         pressing = false
+        if sensorLyricsPending {
+            sensorLyricsPending = false
+            if !sensorLyricsFired { sensorDismiss() }       // a short cover: the usual "close"
+            sensorLyricsFired = false
+        }
+    }
+    func sensorDismiss() {
+        if hudActive { guard dismissIsland(clearHUD: true, keepPinned: true) else { return } }
+        else { guard dismissIsland() else { return } }
+        haptic(.levelChange)
     }
 
+    /// Toggles the lyrics over the media card itself; the island keeps its size.
     @objc func lyricsTapped() {
         guard supportsLyrics else { return }
-        let animateWidth = shape == .expanded && body == .media && mainP.w.cur > 0
-            && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-        let fromWidth = mainP.w.cur
         lyricsRequested.toggle()
         if lyricsRequested {
             selected = .media; pinned = true
             lyrics.select(lyricsTrack)
             lyrics.requestNow()                      // asked for explicitly: no waiting for a back-off
             lyrics.refreshIfNeeded()
-        }
-        if animateWidth {
-            lyricsWidthTransition = LyricsWidthTransition(from: Double(fromWidth), to: Double(frame(for: .expanded).width), start: hardwareSeconds())
-            mainP.w.vel = 0
         }
         refreshUI(); applyShape()
     }
@@ -1472,9 +1554,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if v >= 0 { lux = v; sensorMisses = 0 }   // raw value, no smoothing; hysteresis below prevents flicker
             else { sensorMisses += 1; if sensorMisses >= 60 { lux = -1 } }   // ~2s of silence: stop trusting old data
             let wasCovered = darkLatched
+            if simLux == nil, lux >= 0 { trackSuddenDark(lux, now) }
             // in a dim room covering the sensor hardly changes the reading: the bar follows the room's own light (but never above `threshold`)
             let thr = max(2, ambient > 0 ? min(threshold, ambient * 0.3) : threshold)
-            if lux >= 0 && lux < thr { darkLatched = true }                  // covered  = finger down
+            if (lux >= 0 && lux < thr) || dropSince != nil { darkLatched = true }   // covered  = finger down (a drop to under 40% of the light counts, even if it reads 80)
             else if lux < 0 || lux > thr * 1.2 { darkLatched = false }       // uncovered = finger up
             if !darkLatched && lux >= 0 { ambient = ambient < 0 ? lux : ambient * 0.98 + lux * 0.02 }
             if darkLatched && !wasCovered { sensorTouchBegan() }
@@ -1686,8 +1769,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let b = body
         c.body = b
         if cardKind != .media && banner == nil && !hudActive && !dropping { lyricsRequested = false }
-        c.lyricsVisible = lyricsVisible || (lyricsWidthTransition != nil && shape == .expanded && b == .media)
-        c.lyricsPanelWidth = lyricsExtensionWidth
+        c.lyricsVisible = lyricsVisible
         c.mediaCardWidth = shape == .expanded && b == .media ? expandedCardWidth - 2 * earRadius(notchH + expandedExtraFor(.media)) : nil
         c.lyricsB.isEnabled = supportsLyrics
         let lyricsTint: NSColor = lyricsRequested ? artColor : .white
@@ -1942,12 +2024,6 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         var wake = false
         let r = frame(for: shape)
-        if var transition = lyricsWidthTransition {
-            if shape != .expanded || body != .media { lyricsWidthTransition = nil; mainP.w.vel = 0 }
-            else if abs(transition.to - Double(r.width)) > 0.01 {      // hover / press swell moved the target: follow it, do not cancel
-                transition.to = Double(r.width); lyricsWidthTransition = transition
-            }
-        }
         // While you scroll, the invisible margin under the island keeps its old extent (the card itself shrinks to fit), so the
         // pointer stays inside the window even when the next card is lower. It is let go a second after the last scroll.
         if !scrollHolding { holdH = 0 }
@@ -1964,36 +2040,22 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let dt = min(max(l.targetTimestamp - l.timestamp, 1.0 / 240), 1.0 / 30)
         let steps = Int((dt * 240).rounded(.up)); let h = dt / CGFloat(steps)
         var allSettled = true
-        var completedLyricsTransition = false
         for p in [mainP!] where p.active || p.visible {
             let isMain = p === mainP
             let k: CGFloat = isMain ? stiffness : 300, cd: CGFloat = isMain ? damping : 28
             if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion { p.snap() }
-            let widthTransition = isMain ? lyricsWidthTransition : nil
             for _ in 0..<steps {
                 p.x.step(h, k, cd)
-                if widthTransition == nil { p.w.step(h, k, cd) }
+                p.w.step(h, k, cd)
                 p.h.step(h, k, cd); p.ty.step(h, k, cd); p.m.step(h, k, cd)
-            }
-            if let transition = widthTransition {
-                let now = hardwareSeconds()
-                p.w.cur = CGFloat(transition.value(at: now)); p.w.vel = 0
-                if transition.finished(at: now) {
-                    p.w.jump(CGFloat(transition.to)); lyricsWidthTransition = nil
-                    completedLyricsTransition = true
-                }
             }
             if isMain {
                 // Momentum from an interrupted move must never uncover the hardware notch.
                 if p.x.cur > notchLeft { p.x.cur = notchLeft; if p.x.vel > 0 { p.x.vel = 0 } }
                 if p.x.cur + p.w.cur < notchRight { p.w.cur = notchRight - p.x.cur; if p.w.vel < 0 { p.w.vel = 0 } }
-                if lyricsVisible && p.x.cur + p.w.cur > screen.frame.maxX - lyricsEdgeMargin {
-                    p.w.cur = max(notchW, screen.frame.maxX - lyricsEdgeMargin - p.x.cur)
-                    if p.w.vel > 0 { p.w.vel = 0 }
-                }
                 if p.h.cur < notchH { p.h.cur = notchH; if p.h.vel < 0 { p.h.vel = 0 } }
             }
-            if p.settled && lyricsWidthTransition == nil { p.snap() } else { allSettled = false }
+            if p.settled { p.snap() } else { allSettled = false }
             if !p.active && p.settled && p.w.cur < 1.5 {          // shrunk away: take the window off screen
                 p.panel.orderOut(nil); p.shadow?.orderOut(nil); p.visible = false; p.w.jump(0)
                 continue
@@ -2002,10 +2064,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let margin = max(p.m.cur, 0)
             let f = NSRect(x: p.x.cur.rounded(), y: screen.frame.maxY - p.ty.cur - p.h.cur, width: max(p.w.cur, 1), height: max(p.h.cur, 1))   // the island
             if isMain {
-                let base = expandedBase
-                let k = base.w > 0 ? max(1, min(1.12, (p.w.cur - base.ext) / base.w)) : 1
+                let baseWidth = expandedSize().w
+                let k = baseWidth > 0 ? max(1, min(1.12, p.w.cur / baseWidth)) : 1
                 view.refHeight = shape == .expanded ? p.h.cur / k : 0
-                view.swellInset = shape == .expanded ? max(-12, min(12, (screen.frame.midX - base.w / 2) - f.minX)) : 0     // pin the content to its resting spot (absolute), whatever the island does round it
+                view.swellInset = shape == .expanded ? max(-12, min(12, (screen.frame.midX - baseWidth / 2) - f.minX)) : 0     // pin the content to its resting spot (absolute), whatever the island does round it
             }
             if isMain { view.bottomInset = margin; if lockIsland != f { lockIsland = f; if locked { updateLockBorder() } } }
             p.panel.setFrame(NSRect(x: f.minX, y: f.minY - margin, width: f.width, height: f.height + margin), display: true)
@@ -2014,8 +2076,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 sh.alphaValue = p.panel.alphaValue
             }
         }
-        if completedLyricsTransition { refreshUI() }
-        atRest = mainP.settled && lyricsWidthTransition == nil
+        atRest = mainP.settled
         if allSettled { l.isPaused = true }
     }
 }
