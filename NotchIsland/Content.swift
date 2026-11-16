@@ -34,12 +34,14 @@ class FileDragView: NSView, NSDraggingSource {
     }
 }
 
-enum Body { case none, hud, banner, alert, media, timer, file, drop }
+/// `.info` is the one generic card of the activities that only report something: an icon, two lines, a value on the right and
+/// optionally a thin progress bar (microphone / camera in use, the next calendar event, a download).
+enum Body { case none, hud, banner, alert, media, timer, file, drop, info }
 enum LevelKind { case volume, brightness }
 
 /// Everything that can be a live activity, in the order they are listed when several run at once.
-enum ActKind: Hashable { case media, timer, charging, lowBattery, airpods, file(URL) }     // every file in the pocket is an activity
-let allKinds: [ActKind] = [.media, .timer, .charging, .airpods, .lowBattery]
+enum ActKind: Hashable { case media, timer, charging, lowBattery, airpods, privacy, calendar, transfer(Int), file(URL) }     // every file in the pocket, and every running transfer, is an activity
+let allKinds: [ActKind] = [.media, .timer, .charging, .airpods, .lowBattery, .privacy, .calendar]
 
 /// The two small views an activity can be drawn with: a 24pt icon, and a detail (time, %, equalizer, ring).
 final class SlotItem {
@@ -186,7 +188,8 @@ final class Content: Flip {
         }
     }
 
-    var lyricsVisible = false { didSet { if lyricsVisible != oldValue { needsLayout = true } } }
+    var lyricsVisible = false { didSet { if lyricsVisible != oldValue { slideSideColumn = true; needsLayout = true } } }
+    private var slideSideColumn = false      // the next layout moves the cover and the level bars instead of jumping
     var mediaCardWidth: CGFloat?
     let lyricsB = makeSymbolButton("quote.bubble", 14, .white)
     let lyricsPane = LyricsPanelView(frame: .zero)
@@ -229,6 +232,14 @@ final class Content: Flip {
     let fSub = makeLabel(12, .regular, NSColor(white: 1, alpha: 0.55))
     let fRevealB = makeSymbolButton("magnifyingglass", 15, .white)
     let fRemoveB = makeSymbolButton("xmark", 14, .white)
+    // info body (see `Body.info`)
+    let iIcon = NSImageView()
+    let iTitle = makeLabel(15, .semibold, .white)
+    let iSub = makeLabel(12, .regular, NSColor(white: 1, alpha: 0.55))
+    let iTrail = makeLabel(18, .semibold, .white, mono: true, align: .right)
+    let iBar = ThinBar()
+    var infoShowsBar = false
+    var iIconName = ""
     // drop body: shown while a file is being dragged towards the notch
     let dropIcon = NSImageView()
     let dropHint = makeLabel(14, .medium, NSColor(white: 1, alpha: 0.75))
@@ -254,17 +265,21 @@ final class Content: Flip {
         [art, titleL, artistL, bodyEq, progress, elapsedL, remainL,
          prevB, playB, nextB, pauseB, cancelB, tLabel, tTime, alertL, bTitle, bPct, bGlyph, bAir, bRing, aTitle, aState, aBattery, hIcon, hBar]
             + [fIcon, fName, fSub, fRevealB, fRemoveB, lyricsPane, lyricsB, dropIcon, dropHint]
+            + [iIcon, iTitle, iSub, iTrail, iBar]
     }
 
     /// Cover + title + artist: tapping it opens the app that is playing.
-    var sourceRect: NSRect { art.frame.union(titleL.frame).union(artistL.frame) }
+    var sourceRect: NSRect { lyricsVisible ? art.frame : art.frame.union(titleL.frame).union(artistL.frame) }
 
     override func layout() {
         super.layout()
         let w = body == .media ? min(bounds.width, mediaCardWidth ?? bounds.width) : bounds.width
         let pad: CGFloat = 16, top = notchH + 2
         // Lyrics replace the media card's content in place, at the card's own size.
-        lyricsPane.frame = NSRect(x: 0, y: top, width: w, height: max(0, bounds.height - top - 8))
+        // The cover and the level bars stay in a column on the left; the lyrics take the rest.
+        let sideW: CGFloat = lyricsVisible ? pad + 48 + 4 : 0
+        let paneH = max(0, bounds.height - top - 8)
+        lyricsPane.frame = NSRect(x: sideW, y: top, width: max(0, w - sideW), height: paneH)
         // wings: the icon tile gets the same margin on the left, top and bottom
         let tile: CGFloat = 24
         let m = max((bandH - tile) / 2, 0)
@@ -275,11 +290,14 @@ final class Content: Flip {
                                   width: rightSize.width, height: rightSize.height)
         activityRow.frame = NSRect(x: 8, y: bandH + 1, width: max(0, w - 16), height: 34)
         // media
-        art.frame = NSRect(x: pad, y: top, width: 48, height: 48)
+        let oldArt = art.frame, oldEq = bodyEq.frame
+        let sideTop = top + max(0, (paneH - 78) / 2)          // cover (48) + gap (10) + bars (20), centred beside the lyrics
+        art.frame = NSRect(x: pad, y: lyricsVisible ? sideTop : top, width: 48, height: 48)
         let tx = pad + 48 + 12, tw = max(0, w - tx - pad - 26)
         titleL.frame = NSRect(x: tx, y: top + 4, width: tw, height: 20)
         artistL.frame = NSRect(x: tx, y: top + 25, width: tw, height: 18)
-        bodyEq.frame = NSRect(x: w - pad - 20, y: top + 6, width: 20, height: 20)
+        bodyEq.frame = lyricsVisible ? NSRect(x: pad + 14, y: sideTop + 58, width: 20, height: 20)
+                                     : NSRect(x: w - pad - 20, y: top + 6, width: 20, height: 20)
         progress.frame = NSRect(x: pad, y: top + 50, width: w - 2 * pad, height: 22)      // a taller hit area around the 4pt line
         elapsedL.frame = NSRect(x: pad, y: top + 62, width: 60, height: 14)
         remainL.frame = NSRect(x: w - pad - 60, y: top + 62, width: 60, height: 14)
@@ -291,6 +309,18 @@ final class Content: Flip {
         // While the lyrics are shown the toggle moves to the card's top corner, where the other controls are hidden.
         lyricsB.frame = lyricsVisible ? NSRect(x: w - pad - 24, y: top - 2, width: 24, height: 28)
                                       : NSRect(x: w - pad - 24, y: cy + 6, width: 24, height: 28)
+        if slideSideColumn {
+            slideSideColumn = false
+            if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion, window != nil {
+                let targets: [(NSView, NSRect, NSRect)] = [(art, art.frame, oldArt), (bodyEq, bodyEq.frame, oldEq)]
+                for (v, _, old) in targets { v.frame = old }           // start from where they were ...
+                NSAnimationContext.runAnimationGroup { ctx in
+                    ctx.duration = 0.22; ctx.allowsImplicitAnimation = true
+                    ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                    for (v, new, _) in targets { v.animator().frame = new }     // ... and glide to the new spot
+                }
+            }
+        }
         // timer
         pauseB.frame = NSRect(x: pad, y: top + 2, width: 44, height: 44)
         cancelB.frame = NSRect(x: pad + 52, y: top + 2, width: 44, height: 44)
@@ -321,6 +351,14 @@ final class Content: Flip {
         fSub.frame = NSRect(x: fx, y: top + 25, width: fw, height: 16)
         fRevealB.frame = NSRect(x: w - pad - 88, y: top + 52, width: 40, height: 40)
         fRemoveB.frame = NSRect(x: w - pad - 40, y: top + 52, width: 40, height: 40)
+        // info
+        // the value sits on the title's line, so the second line can use the whole width
+        let trailW: CGFloat = 72, ix = pad + 32 + 12
+        iIcon.frame = NSRect(x: pad, y: top + 2, width: 32, height: 32)
+        iTitle.frame = NSRect(x: ix, y: top + 1, width: max(0, w - ix - pad - trailW - 4), height: 20)
+        iSub.frame = NSRect(x: ix, y: top + 22, width: max(0, w - ix - pad), height: 16)
+        iTrail.frame = NSRect(x: w - pad - trailW, y: top, width: trailW, height: 22)
+        iBar.frame = NSRect(x: pad, y: top + 46, width: max(0, w - 2 * pad), height: 6)
         // drop hint
         dropIcon.frame = NSRect(x: pad, y: top + 6, width: 36, height: 36)
         dropHint.frame = NSRect(x: pad + 46, y: top + 14, width: max(0, w - pad * 2 - 46), height: 20)
@@ -330,9 +368,10 @@ final class Content: Flip {
     func applyVisibility(expanded: Bool) {
         let b = body
         let card = expanded && b == .media && !lyricsVisible        // the card's own content; lyrics take its place
+        let lyrics = expanded && b == .media && lyricsVisible       // ... except the cover and the level bars, which stay
         let want: [(NSView, Bool)] = [
-            (art, card), (titleL, card), (artistL, card),
-            (bodyEq, card), (progress, card),
+            (art, card || lyrics), (titleL, card), (artistL, card),
+            (bodyEq, card || lyrics), (progress, card),
             (elapsedL, card), (remainL, card),
             (lyricsB, expanded && b == .media), (lyricsPane, expanded && b == .media && lyricsVisible),
             (prevB, card), (playB, card), (nextB, card),
@@ -349,6 +388,8 @@ final class Content: Flip {
             (fIcon, expanded && b == .file), (fName, expanded && b == .file), (fSub, expanded && b == .file),
             (fRevealB, expanded && b == .file), (fRemoveB, expanded && b == .file),
             (dropIcon, expanded && b == .drop), (dropHint, expanded && b == .drop),
+            (iIcon, expanded && b == .info), (iTitle, expanded && b == .info), (iSub, expanded && b == .info),
+            (iTrail, expanded && b == .info), (iBar, expanded && b == .info && infoShowsBar),
         ]
         for (v, on) in want {
             let a: CGFloat = on ? 1 : 0

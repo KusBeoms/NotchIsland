@@ -12,6 +12,10 @@ import IOKit.ps
 //   --demo-alert TEXT   show TEXT as an alert at launch (testing)
 //   --demo-timer        start the stopwatch at launch (testing)
 //   --demo-media        show a fake playing track (testing)
+//   --demo-settings     open the settings window at launch (testing)
+//   --demo-transfer     show a fake 80 MB download that advances by itself (testing)
+//   --demo-calendar     show a fake meeting that starts in 10 minutes (testing)
+//   --demo-privacy L   show a fake microphone / camera state, L = mic, cam or mic,cam (testing)
 //
 // Behaviour
 //   * Hover the notch      -> swells sideways a little
@@ -36,6 +40,10 @@ var demoKinds = Set<ActKind>()
 var demoShelf: [String]? = nil          // --demo-shelf path1,path2: start with these files in the shelf (not saved)
 var demoPick: [String]? = nil          // --demo-kinds media,timer,charging,airpods,lowBattery (any subset)
 var demoBrightness = false
+var demoSettings = false                   // --demo-settings: open the settings window at launch
+var demoTransfer = false                  // --demo-transfer: a fake download that advances by itself
+var demoCalendar = false                  // --demo-calendar: a fake meeting that starts in 10 minutes
+var demoPrivacy: PrivacyState? = nil      // --demo-privacy mic,cam: show a fake microphone / camera state (any subset)
 var argIt = CommandLine.arguments.dropFirst().makeIterator()
 while let a = argIt.next() {
     switch a {
@@ -51,6 +59,12 @@ while let a = argIt.next() {
     case "--demo-shelf": demoShelf = argIt.next()?.split(separator: ",").map(String.init)
     case "--demo-acts": if let v = argIt.next(), let n = Int(v) { demoActsN = min(max(n, 0), 5) }
     case "--demo-brightness": demoBrightness = true
+    case "--demo-calendar": demoCalendar = true
+    case "--demo-transfer": demoTransfer = true
+    case "--demo-settings": demoSettings = true
+    case "--demo-privacy":
+        let parts = argIt.next()?.split(separator: ",").map(String.init) ?? []
+        demoPrivacy = PrivacyState(mic: parts.contains("mic"), camera: parts.contains("cam"), micApps: parts.contains("mic") ? ["Zoom"] : [])
     default: break
     }
 }

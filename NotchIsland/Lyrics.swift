@@ -4,7 +4,8 @@ import SQLite3
 /// A capped follower keeps ordinary line changes animated even when no instrumental gap exists.
 struct LyricsScrollFollower {
     private(set) var position: Double = 0
-    let maximumSpeed: Double = 3 // rows per second (120pt/s at the normal 40pt row pitch)
+    let maximumSpeed: Double // rows per second (120pt/s at the normal 40pt row pitch)
+    init(maximumSpeed: Double = 3) { self.maximumSpeed = maximumSpeed }
     mutating func reset(to value: Double) { position = value }
     mutating func advance(toward target: Double, deltaTime: Double) {
         let dt = min(1.0 / 15, max(0, deltaTime))
@@ -13,6 +14,30 @@ struct LyricsScrollFollower {
         let eased = distance * (1 - exp(-12 * dt))
         let limit = maximumSpeed * dt
         position += min(limit, max(-limit, eased))
+        if abs(target - position) < 0.0000001 { position = target }
+    }
+}
+
+/// Playback holds the lyric highlight still; presentation time lets existing motion come to rest.
+struct LyricsMotionEnvelope {
+    private(set) var gain = 1.0
+    private var target = 1.0
+    private var from = 1.0
+    private var startedAt: Double?
+    private var playing: Bool?
+    var settled: Bool { gain == target }
+    mutating func advance(playing: Bool, frameTime: Double, reset: Bool = false, reduceMotion: Bool = false) {
+        let next = playing && !reduceMotion ? 1.0 : 0.0
+        if self.playing == nil || reset || reduceMotion {
+            gain = next; target = next; from = next; startedAt = frameTime
+        } else if next != target {
+            from = gain; target = next; startedAt = frameTime
+        }
+        self.playing = playing
+        let duration = target == 0 ? 0.9 : 0.25
+        let t = min(1, max(0, (frameTime - (startedAt ?? frameTime)) / duration))
+        let eased = min(1, max(0, t * t * t * (t * (t * 6 - 15) + 10)))
+        gain = t == 1 ? target : from + (target - from) * eased
     }
 }
 
@@ -34,7 +59,7 @@ struct LyricsWord: Equatable {
     func progress(at time: TimeInterval) -> Double {
         min(1, max(0, (time - start) / max(0.01, end - start)))
     }
-    static let liftPeak = 2.5
+    static let liftPeak = 1.25
     static let maximumRise = 0.9
     static let fallRatio = 3.0
     /// Total time after `start` at which the lift has fully settled back to zero.
@@ -95,8 +120,8 @@ struct LyricsLine: Equatable {
             }
         }
         // Average each character's span with its neighbours (1-2-1) so motion amplitude changes gradually along the line.
+        let spans = timed.map { max(0.01, $0.end - $0.start) }
         return timed.enumerated().map { index, item in
-            let spans = timed.map { max(0.01, $0.end - $0.start) }
             let before = spans[max(0, index - 1)], after = spans[min(spans.count - 1, index + 1)]
             var smoothed = item
             smoothed.spanHint = 0.25 * before + 0.5 * spans[index] + 0.25 * after
@@ -115,6 +140,7 @@ struct LyricsDocument: Equatable {
     var lines: [LyricsLine]
     var plainText: String
     var songwriters: [String] = []
+    var hasUntimedLines = false
 
     func index(at time: TimeInterval) -> Int {
         var low = 0, high = lines.count
@@ -241,7 +267,7 @@ enum AppleLyricsParser {
         for i in lines.indices where lines[i].end == nil && i + 1 < lines.count { lines[i].end = lines[i + 1].start }
         let plain = delegate.plain.joined(separator: "\n")
         guard !plain.isEmpty else { return nil }
-        return LyricsDocument(lines: lines, plainText: plain, songwriters: delegate.songwriters)
+        return LyricsDocument(lines: lines, plainText: plain, songwriters: delegate.songwriters, hasUntimedLines: delegate.hasUntimedLines)
     }
 
     private final class Delegate: NSObject, XMLParserDelegate {
@@ -250,7 +276,6 @@ enum AppleLyricsParser {
             var offset: Int
             var start: Double
             var end: Double?
-            var hasTimedChild = false
         }
         struct Word {
             var start: Double
@@ -261,6 +286,7 @@ enum AppleLyricsParser {
         var lines: [LyricsLine] = []
         var plain: [String] = []
         var songwriters: [String] = []
+        var hasUntimedLines = false
         private var writerDepth: Int?
         private var writerText = ""
         private var inBody = false, inLine = false, pendingSpace = false
@@ -283,7 +309,6 @@ enum AppleLyricsParser {
                 end = AppleLyricsParser.time(attributes["end"])
                 if end == nil, let start, let duration = AppleLyricsParser.time(attributes["dur"]) { end = start + duration }
             } else if inLine && name == "span", let t = AppleLyricsParser.time(attributes["begin"]) {
-                if !spans.isEmpty { spans[spans.count - 1].hasTimedChild = true }
                 let spanEnd = AppleLyricsParser.time(attributes["end"])
                     ?? AppleLyricsParser.time(attributes["dur"]).map { t + $0 }
                 spans.append(TimedSpan(depth: depth, offset: (text as NSString).length, start: t, end: spanEnd))
@@ -317,13 +342,32 @@ enum AppleLyricsParser {
             }
             if name == "span", let span = spans.last, span.depth == depth {
                 spans.removeLast()
-                if !span.hasTimedChild {
-                    let raw = (text as NSString).substring(from: span.offset) as NSString
-                    let trimmed = (raw as String).trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !trimmed.isEmpty {
-                        let range = raw.range(of: trimmed)
-                        words.append(Word(start: span.start, end: span.end,
-                                          range: NSRange(location: span.offset + range.location, length: range.length)))
+                let raw = (text as NSString).substring(from: span.offset) as NSString
+                let trimmed = (raw as String).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty {
+                    let local = raw.range(of: trimmed)
+                    let range = NSRange(location: span.offset + local.location, length: local.length)
+                    // Child timings take precedence; retain the parent's uncovered prefix/suffix.
+                    let covered = words.map(\.range).filter { NSIntersectionRange($0, range).length > 0 }
+                        .sorted { $0.location < $1.location }
+                    var cursor = range.location
+                    var gaps: [NSRange] = []
+                    for child in covered {
+                        if child.location > cursor { gaps.append(NSRange(location: cursor, length: child.location - cursor)) }
+                        cursor = max(cursor, NSMaxRange(child))
+                    }
+                    if cursor < NSMaxRange(range) { gaps.append(NSRange(location: cursor, length: NSMaxRange(range) - cursor)) }
+                    for untrimmed in gaps {
+                        let rawGap = (text as NSString).substring(with: untrimmed) as NSString
+                        let trimmedGap = (rawGap as String).trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !trimmedGap.isEmpty else { continue }
+                        let localGap = rawGap.range(of: trimmedGap)
+                        let gap = NSRange(location: untrimmed.location + localGap.location, length: localGap.length)
+                        let fraction = Double(gap.location - range.location) / Double(range.length)
+                        let finish = Double(NSMaxRange(gap) - range.location) / Double(range.length)
+                        let duration = span.end.map { max(0.01, $0 - span.start) }
+                        words.append(Word(start: span.start + (duration ?? 0) * fraction,
+                                          end: duration.map { span.start + $0 * finish }, range: gap))
                     }
                 }
             }
@@ -331,13 +375,14 @@ enum AppleLyricsParser {
                 if !text.isEmpty {
                     plain.append(text)
                     if let start {
+                        words.sort { $0.start == $1.start ? $0.range.location < $1.range.location : $0.start < $1.start }
                         let timedWords = words.enumerated().map { index, word in
                             let next = index + 1 < words.count ? words[index + 1].start : nil
                             let wordEnd = word.end ?? next ?? end ?? (word.start + 0.2)
                             return LyricsWord(start: word.start, end: max(word.start + 0.01, wordEnd), range: word.range)
                         }
                         lines.append(LyricsLine(start: start, end: end.flatMap { $0 > start ? $0 : nil }, text: text, words: timedWords))
-                    }
+                    } else { hasUntimedLines = true }
                 }
                 inLine = false
             }
@@ -480,6 +525,7 @@ final class LyricsController {
     private var nextScan = Date.distantPast
     private var lastScanStart = Date.distantPast
     private var misses = 0
+    private var forceRefresh = false
     /// A missing or unreadable cache is retried with a growing delay instead of every few seconds.
     static let backoff: [TimeInterval] = [10, 30, 60]
     private var cache: [LyricsTrack: LyricsDocument] = [:]
@@ -489,7 +535,7 @@ final class LyricsController {
         guard self.track != track else { return }
         suspend()
         self.track = track
-        misses = 0; nextScan = .distantPast
+        misses = 0; nextScan = .distantPast; forceRefresh = false
         state = track.flatMap { cache[$0] }.map { .document($0) } ?? .idle
     }
     /// Stops the current lookup. The back-off survives, so closing and reopening the pane cannot defeat it.
@@ -498,10 +544,14 @@ final class LyricsController {
         if state == .loading { state = .idle }
     }
     /// The user asked for lyrics: look again at once.
-    func requestNow() { misses = 0; nextScan = .distantPast }
+    func requestNow(force: Bool = false) {
+        if force { suspend(); forceRefresh = true }
+        misses = 0; nextScan = .distantPast
+    }
     func refreshIfNeeded(now: Date = Date()) {
         guard let track, !loading, now >= nextScan else { return }
-        if case .document = state { return }
+        if case .document = state, !forceRefresh { return }
+        forceRefresh = false
         loading = true; lastScanStart = now
         if state == .idle { state = .loading }
         let id = UUID(); requestID = id

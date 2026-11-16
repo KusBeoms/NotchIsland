@@ -90,6 +90,13 @@ assert(liftedWord.scale(at: 6, emphasis: 1, reduceMotion: false) == 1)
         let nested = AppleLyricsParser.parse("<tt><body><p><span begin='1s' end='3s'><span begin='1s' end='2s'>한 </span><span begin='2s' end='3s'>😀글</span></span></p></body></tt>")!
         assert(nested.lines[0].text == "한 😀글" && nested.lines[0].words.count == 2)
         assert(nested.lines[0].words[1].range == NSRange(location: 2, length: 3))
+        let partial = AppleLyricsParser.parse("<tt><body><p begin='0s' end='4s'><span begin='0s' end='4s'>First <span begin='2s' end='4s'>second</span> last</span></p></body></tt>")!
+        let partialWords = partial.lines[0].words
+        assert(partialWords.map { (partial.lines[0].text as NSString).substring(with: $0.range) } == ["First", "second", "last"])
+        assert(partialWords[1].start == 2 && partialWords[1].end == 4) // Preserve the explicit child timing.
+        let mixed = AppleLyricsParser.parse("<tt><body><p begin='0s' end='2s'>Timed</p><p>Untimed</p></body></tt>")!
+        assert(mixed.hasUntimedLines && mixed.plainText == "Timed\nUntimed")
+        assert(!document.hasUntimedLines)
         let cdata = AppleLyricsParser.parse("<tt><body><p begin='1s'><![CDATA[한 줄]]></p></body></tt>")!
         assert(cdata.lines[0].text == "한 줄")
         let sameStart = AppleLyricsParser.parse("<tt><body><p begin='1s'>Voice A</p><p begin='1s'>Voice B</p><p begin='3s'>Next</p></body></tt>")!
@@ -121,6 +128,34 @@ assert(liftedWord.scale(at: 6, emphasis: 1, reduceMotion: false) == 1)
         assert(dotsMiddle[0] > dotsMiddle[1] && dotsMiddle[1] > dotsMiddle[2])
         let intro = LyricsTimeline(document: LyricsDocument(lines: [LyricsLine(start: 10, end: 12, text: "Intro")], plainText: "Intro"))
         assert(intro.slots.first?.kind == .waiting && intro.position(at: 9) == 0)
+
+        // Pausing releases presentation motion without advancing the karaoke clock.
+        var envelope = LyricsMotionEnvelope()
+        envelope.advance(playing: true, frameTime: 0)
+        envelope.advance(playing: false, frameTime: 1)
+        assert(envelope.gain == 1 && !envelope.settled)
+        var lastGain = envelope.gain
+        for frame in 1...120 {
+            envelope.advance(playing: false, frameTime: 1 + Double(frame) / 120)
+            assert(envelope.gain <= lastGain && envelope.gain >= 0)
+            lastGain = envelope.gain
+        }
+        assert(envelope.gain == 0 && envelope.settled)
+        envelope.advance(playing: true, frameTime: 2.1)
+        assert(envelope.gain == 0) // Resume has no instantaneous lift/swell jump.
+        envelope.advance(playing: true, frameTime: 2.225)
+        assert(abs(envelope.gain - 0.5) < 0.00001)
+        let interruptedGain = envelope.gain
+        envelope.advance(playing: false, frameTime: 2.23)
+        assert(envelope.gain == interruptedGain)
+        envelope.advance(playing: false, frameTime: 4)
+        assert(envelope.gain == 0 && envelope.settled)
+        envelope.advance(playing: true, frameTime: 5, reset: true)
+        assert(envelope.gain == 1)
+        envelope.advance(playing: true, frameTime: 5.1, reduceMotion: true)
+        assert(envelope.gain == 0 && envelope.settled)
+        for _ in 0...240 { follower.advance(toward: 1, deltaTime: 1.0 / 120) }
+        assert(follower.position == 1) // Followers stop requesting frames after a finite settling time.
 
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -197,6 +232,10 @@ assert(liftedWord.scale(at: 6, emphasis: 1, reduceMotion: false) == 1)
         assert(controller.state == .document(document)) // Reopening a cached song needs no new I/O.
         controller.refreshIfNeeded(now: now.addingTimeInterval(100))
         assert(!controller.loading && fixture.count == 3)
+        controller.requestNow(force: true)
+        controller.refreshIfNeeded(now: now.addingTimeInterval(101))
+        waitUntil { !controller.loading }
+        assert(fixture.count == 4 && controller.state == .missing) // Explicit reload bypasses a successful cached document.
         controller.select(other)
         let closedRequest = controller.requestID
         controller.suspend()

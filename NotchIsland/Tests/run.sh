@@ -16,9 +16,24 @@ swiftc Media.swift Tests/MediaTests.swift -o "$TEST_DIR/media-tests"
 swiftc Lyrics.swift Tests/LyricsTests.swift -o "$TEST_DIR/lyrics-tests"
 "$TEST_DIR/lyrics-tests"
 
+swiftc TimerModel.swift Tests/TimerTests.swift -o "$TEST_DIR/timer-tests"
+"$TEST_DIR/timer-tests"
+
+swiftc Privacy.swift Tests/PrivacyTests.swift -o "$TEST_DIR/privacy-tests"
+"$TEST_DIR/privacy-tests"
+
+swiftc CalendarModel.swift Tests/CalendarTests.swift -o "$TEST_DIR/calendar-tests"
+"$TEST_DIR/calendar-tests"
+
+swiftc TransferModel.swift TransferMonitor.swift Tests/TransferTests.swift -o "$TEST_DIR/transfer-tests"
+"$TEST_DIR/transfer-tests"
+
+swiftc SensorGesture.swift Tests/SensorGestureTests.swift -o "$TEST_DIR/sensor-tests"
+"$TEST_DIR/sensor-tests"
+
 # Reuse the actual configuration globals while omitting startup and its instance lock.
 sed '/^\/\/ One island at a time:/,$d' main.swift > "$TEST_DIR/main.swift"
-cat Tests/AppTests.swift >> "$TEST_DIR/main.swift"
+cat Tests/AppTests.swift Tests/FeatureTests.swift >> "$TEST_DIR/main.swift"
 SOURCES=()
 for source in ./*.swift; do
     if [ "$source" != "./main.swift" ]; then SOURCES+=("$source"); fi

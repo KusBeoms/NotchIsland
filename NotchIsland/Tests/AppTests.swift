@@ -206,8 +206,8 @@ lyricsApp.lyricsTapped(); layoutLyricsApp()
 let openFrame = lyricsApp.frame(for: .expanded)
 assert(openFrame == closedFrame)                         // the island never changes size: the lyrics replace the card's content
 assert(lyricsApp.lyricsVisible && lyricsApp.locked && lyricsApp.c.lyricsB.image != nil)
-assert(lyricsApp.c.lyricsPane.frame.width == lyricsApp.c.mediaCardWidth!)
-assert(lyricsApp.c.lyricsPane.frame.contains(lyricsApp.c.art.frame))     // covers the cover, title and controls
+assert(lyricsApp.c.lyricsPane.frame.maxX == lyricsApp.c.mediaCardWidth!)
+assert(lyricsApp.c.lyricsPane.frame.minX > lyricsApp.c.art.frame.maxX) // the existing artwork column stays beside the lyrics
 assert(lyricsApp.c.lyricsB.frame.width == 24 && lyricsApp.c.lyricsB.frame.maxX <= lyricsApp.c.mediaCardWidth!)
 let rows = lyricsApp.c.lyricsPane.subviews.compactMap { $0 as? LyricRowView }.sorted { $0.lineIndex < $1.lineIndex }
 assert(rows.count == 3)
@@ -223,6 +223,13 @@ let lyricPoint = lyricsApp.c.convert(NSPoint(x: lyricsApp.c.lyricsPane.frame.mid
 assert(lyricsApp.view.hitTest(lyricPoint) === lyricsApp.c.lyricsPane)
 let toggleCenter = NSPoint(x: lyricsApp.c.lyricsB.frame.midX, y: lyricsApp.c.lyricsB.frame.midY)
 assert(lyricsApp.view.hitTest(lyricsApp.c.convert(toggleCenter, to: lyricsApp.view.superview!)) === lyricsApp.c.lyricsB)   // still toggles back
+let readerButtonPoint = NSPoint(x: lyricsApp.c.lyricsPane.readingButton.frame.midX, y: lyricsApp.c.lyricsPane.readingButton.frame.midY)
+let readerButtonInIsland = lyricsApp.c.lyricsPane.convert(readerButtonPoint, to: lyricsApp.view.superview!)
+assert(lyricsApp.view.hitTest(readerButtonInIsland) === lyricsApp.c.lyricsPane.readingButton)
+lyricsApp.c.lyricsPane.readingButton.performClick(nil)
+let readerBodyInIsland = lyricsApp.c.lyricsPane.convert(NSPoint(x: lyricsApp.c.lyricsPane.bounds.midX, y: 50), to: lyricsApp.view.superview!)
+assert(lyricsApp.view.hitTest(readerBodyInIsland) is NSTextView)
+lyricsApp.c.lyricsPane.readingButton.performClick(nil)
 if let path = ProcessInfo.processInfo.environment["NI_LYRICS_PREVIEW_PATH"] {
     // Freeze cross-fades for an inspectable offscreen snapshot using synthetic text only.
     for element in lyricsApp.c.all { element.layer?.removeAllAnimations() }
@@ -439,3 +446,134 @@ symbolButton.image = NSImage(size: NSSize(width: 4, height: 4))
 setSymbol(symbolButton, "pause.fill", 30)
 assert(symbolButton.image !== firstImage && symbolButton.image?.size != NSSize(width: 4, height: 4))   // an outside change is restored
 print("Lock, dismissal, stale play-tap and symbol cache checks passed")
+
+// Reader mode keeps every untimed/mixed line reachable and routes input to its controls.
+let readerPanel = LyricsPanelView(frame: NSRect(x: 0, y: 0, width: 260, height: 112))
+let readerHost = Flip(frame: readerPanel.frame)
+readerHost.addSubview(readerPanel)
+let fullReaderText = (1...30).map { "가사 전문 줄 \($0)" }.joined(separator: "\n")
+readerPanel.update(.document(LyricsDocument(lines: [], plainText: fullReaderText)), time: 0)
+readerPanel.layoutSubtreeIfNeeded()
+assert(readerPanel.showingFullText && !readerPanel.needsAdvance(at: 0))
+let readerScroll = readerPanel.subviews.compactMap { $0 as? NSScrollView }.first!
+let readerText = readerScroll.documentView as! NSTextView
+assert(readerText.string == fullReaderText && readerText.frame.height > readerScroll.contentSize.height)
+readerText.scrollToEndOfDocument(nil)
+assert(readerScroll.contentView.bounds.minY > 0)
+readerPanel.update(.document(continuousLyrics), time: 0)
+readerPanel.layoutSubtreeIfNeeded()
+assert(!readerPanel.showingFullText)
+readerPanel.readingButton.performClick(nil)
+assert(readerPanel.showingFullText)
+readerPanel.readingButton.performClick(nil)
+assert(!readerPanel.showingFullText)
+let buttonPoint = NSPoint(x: readerPanel.readingButton.frame.midX, y: readerPanel.readingButton.frame.midY)
+assert(readerPanel.hitTest(buttonPoint) === readerPanel.readingButton)
+var reloadCount = 0
+readerPanel.onReload = { reloadCount += 1 }
+readerPanel.reloadButton.performClick(nil)
+assert(reloadCount == 1)
+readerPanel.update(.document(LyricsDocument(lines: continuousLyrics.lines, plainText: fullReaderText, hasUntimedLines: true)), time: 0)
+assert(readerPanel.showingFullText)
+readerPanel.readingButton.performClick(nil)
+assert(readerPanel.showingFullText)
+
+// Every wrapped page is retained, including the final characters, and seeks can go backwards.
+let pagedRow = LyricRowView(frame: NSRect(x: 0, y: 0, width: 100, height: 44))
+let pagedText = "긴 가사가 여러 줄로 이어져도 마지막 문장까지 모두 볼 수 있어야 합니다"
+pagedRow.configure(timedLyricLine(start: 0, end: 20, text: pagedText), maximumLines: 2)
+func renderPagedRow(at time: Double) -> NSBitmapImageRep {
+    pagedRow.advance(to: time, emphasis: 1)
+    let bitmap = pagedRow.bitmapImageRepForCachingDisplay(in: pagedRow.bounds)!
+    pagedRow.cacheDisplay(in: pagedRow.bounds, to: bitmap)
+    return bitmap
+}
+let pageFirst = renderPagedRow(at: 0)
+assert(pagedRow.pageOffsets.count > 1)
+let finalPageStart = pagedRow.pageOffsets.last!.start
+assert(pagedRow.pageOffset(at: finalPageStart, reduceMotion: false) == pagedRow.pageOffsets.last!.offset)
+let pageLast = renderPagedRow(at: 20)
+assert(inkBounds(pageLast).width > 1 && inkBounds(pageLast).height <= 44 * 2)
+assert(pageFirst.representation(using: .png, properties: [:]) != pageLast.representation(using: .png, properties: [:]))
+_ = renderPagedRow(at: 0)
+assert(pagedRow.pageOffset(at: 0, reduceMotion: false) == 0)
+print("Lyrics reader scrolling, reload controls and long-line paging checks passed")
+
+if let path = ProcessInfo.processInfo.environment["NI_LYRICS_PREVIEW_PATH"] {
+    func savePanel(_ panel: NSView, suffix: String) {
+        panel.layoutSubtreeIfNeeded()
+        let bitmap = panel.bitmapImageRepForCachingDisplay(in: panel.bounds)!
+        panel.cacheDisplay(in: panel.bounds, to: bitmap)
+        let output = URL(fileURLWithPath: path).deletingPathExtension().path + suffix + ".png"
+        try! bitmap.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: output))
+    }
+    savePanel(readerPanel, suffix: "-reader")
+    readerPanel.update(.document(continuousLyrics), time: 1.2)
+    savePanel(readerPanel, suffix: "-panel")
+    savePanel(pagedRow, suffix: "-long-first")
+    pagedRow.advance(to: 20, emphasis: 1)
+    savePanel(pagedRow, suffix: "-long-last")
+}
+
+// Frozen playback must hold highlighting, release lift/swell, finish scrolling and stop requesting frames.
+let pausePanel = LyricsPanelView(frame: NSRect(x: 0, y: 0, width: 300, height: 112))
+let pauseDocument = LyricsDocument(lines: [timedLyricLine(start: 0, end: 4, text: "가 나 다 라"),
+                                         timedLyricLine(start: 4, end: 8, text: "마 바 사 아")], plainText: "Pause fixture")
+pausePanel.update(.document(pauseDocument), time: 0.8, frameTime: 100)
+let pauseRow = pausePanel.subviews.compactMap { $0 as? LyricRowView }.first { $0.lineIndex == 0 }!
+let frozenProgress = pauseRow.wordProgress
+let initialLift = pauseRow.characterLifts.reduce(0, +)
+let initialScale = pauseRow.characterScales.max()!
+assert(initialLift > 0 && initialScale > 1)
+assert(pausePanel.needsAdvance(at: 0.8, playing: false))
+pausePanel.advance(to: 0.8, frameTime: 100.01, playing: false)
+let pauseStartLift = pauseRow.characterLifts.reduce(0, +)
+assert(abs(pauseStartLift - initialLift) < 0.00001)
+for frame in 1...30 {
+    pausePanel.advance(to: 0.8, frameTime: 100.01 + Double(frame) / 60, playing: false)
+    assert(pauseRow.wordProgress == frozenProgress)
+}
+assert(pauseRow.characterLifts.reduce(0, +) < initialLift)
+assert(pauseRow.characterScales.max()! < initialScale)
+for frame in 31...180 { pausePanel.advance(to: 0.8, frameTime: 100.01 + Double(frame) / 60, playing: false) }
+assert(pauseRow.characterLifts.allSatisfy { $0 == 0 })
+assert(pauseRow.characterScales.allSatisfy { $0 == 1 })
+assert(pausePanel.settled && !pausePanel.needsAdvance(at: 0.8, playing: false))
+pausePanel.advance(to: 0.8, frameTime: 104, playing: true)
+assert(pauseRow.characterLifts.allSatisfy { $0 == 0 })
+pausePanel.advance(to: 0.85, frameTime: 104.1, playing: true)
+assert(pauseRow.characterLifts.contains { $0 > 0 })
+assert(pauseRow.wordProgress != frozenProgress)
+// A line change interrupted by pause must still finish its presentation scroll.
+pausePanel.advance(to: 3.99, frameTime: 105, playing: true)
+pausePanel.advance(to: 4.01, frameTime: 105.01, playing: true)
+let interruptedPosition = pausePanel.position
+pausePanel.advance(to: 4.01, frameTime: 105.02, playing: false)
+for frame in 1...240 { pausePanel.advance(to: 4.01, frameTime: 105.02 + Double(frame) / 60, playing: false) }
+assert(pausePanel.position > interruptedPosition && pausePanel.position == 1 && pausePanel.settled)
+// Backward seeks reset stale paused motion, and paused-open panels start at rest.
+pausePanel.advance(to: 0.5, frameTime: 110, playing: false)
+assert(pausePanel.position == 0 && pausePanel.settled)
+let pausedOpen = LyricsPanelView(frame: pausePanel.frame)
+pausedOpen.update(.document(pauseDocument), time: 0.8, playing: false, frameTime: 200)
+assert(pausedOpen.subviews.compactMap { $0 as? LyricRowView }.allSatisfy { $0.characterLifts.allSatisfy { $0 == 0 } })
+print("Paused lyrics release, frozen highlights, gentle resume and finite scroll settling checks passed")
+
+// Finish a partially turned long-line page during pause, and do not rewind it on resume.
+let pagePauseRow = LyricRowView(frame: NSRect(x: 0, y: 0, width: 100, height: 44))
+pagePauseRow.configure(timedLyricLine(start: 0, end: 20, text: pagedText), maximumLines: 2)
+pagePauseRow.advance(to: 0, emphasis: 1, frameTime: 300)
+let nextPage = pagePauseRow.pageOffsets[1]
+let pagePauseTime = nextPage.start - 0.1
+pagePauseRow.advance(to: pagePauseTime, emphasis: 1, frameTime: 301, resetMotion: true)
+let partialPage = pagePauseRow.displayedPageOffset
+assert(partialPage > 0 && partialPage < Double(nextPage.offset))
+pagePauseRow.advance(to: pagePauseTime, emphasis: 1, playing: false, frameTime: 301.01)
+for frame in 1...240 { pagePauseRow.advance(to: pagePauseTime, emphasis: 1, playing: false, frameTime: 301.01 + Double(frame) / 60) }
+assert(pagePauseRow.pageSettled && pagePauseRow.displayedPageOffset == Double(nextPage.offset))
+pagePauseRow.advance(to: pagePauseTime, emphasis: 1, playing: true, frameTime: 306)
+pagePauseRow.advance(to: pagePauseTime + 0.05, emphasis: 1, playing: true, frameTime: 306.05)
+assert(pagePauseRow.displayedPageOffset == Double(nextPage.offset))
+pagePauseRow.advance(to: 0, emphasis: 1, playing: false, frameTime: 307, resetMotion: true)
+assert(pagePauseRow.displayedPageOffset == 0)
+print("Paused long-line page completion and forward-only resume checks passed")

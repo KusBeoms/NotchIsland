@@ -263,6 +263,43 @@ final class RingView: NSView {
     }
 }
 
+/// A thin, non-interactive progress bar. With no fraction (the total is unknown) a short block keeps sweeping along it.
+final class ThinBar: NSView {
+    private let fill = CALayer()
+    var color: NSColor = accent { didSet { fill.backgroundColor = color.cgColor } }
+    /// 0...1, or nil when the total is not known.
+    var fraction: Double? { didSet { if fraction != oldValue { refresh() } } }
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor(white: 1, alpha: 0.18).cgColor
+        layer?.masksToBounds = true
+        fill.backgroundColor = color.cgColor
+        layer?.addSublayer(fill)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override func layout() { super.layout(); layer?.cornerRadius = bounds.height / 2; refresh() }
+    private func refresh() {
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        fill.cornerRadius = bounds.height / 2
+        if let f = fraction {
+            fill.removeAnimation(forKey: "sweep")
+            fill.frame = NSRect(x: 0, y: 0, width: bounds.width * CGFloat(min(max(f, 0), 1)), height: bounds.height)
+        } else {
+            let w = bounds.width * 0.3
+            fill.frame = NSRect(x: -w, y: 0, width: w, height: bounds.height)
+            if fill.animation(forKey: "sweep") == nil, bounds.width > 0 {
+                let a = CABasicAnimation(keyPath: "position.x")
+                a.fromValue = -w / 2; a.toValue = bounds.width + w / 2
+                a.duration = 1.3; a.repeatCount = .infinity
+                a.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                fill.add(a, forKey: "sweep")
+            }
+        }
+        CATransaction.commit()
+    }
+}
+
 /// The original HUD's bar: 16 flat cells; while the pointer is over the HUD they melt into a smooth slider with a
 /// knob. Eased fill; click or drag sets the level. The view is tall (easy to hit) but draws thin.
 final class LevelBar: FocusableControl {
@@ -384,13 +421,26 @@ final class TimerRing: NSView {
             CATransaction.commit()
         }
     }
-    var countdown = false {
-        didSet {
-            let name = countdown ? "hourglass" : "stopwatch"
-            guard name != glyphName else { return }
-            glyphName = name
-            glyph.image = NSImage(systemSymbolName: name, accessibilityDescription: nil)?.withSymbolConfiguration(.init(pointSize: 9, weight: .bold))
+    var countdown = false { didSet { refreshStyle() } }
+    /// While a Pomodoro set runs: a work phase and a break each get their own glyph and colour.
+    var pomodoro: PomodoroState.Phase? { didSet { refreshStyle() } }
+
+    private func refreshStyle() {
+        let name: String
+        switch pomodoro {
+        case .work?: name = "brain.head.profile"
+        case .rest?, .longRest?: name = "cup.and.saucer.fill"
+        case nil: name = countdown ? "hourglass" : "stopwatch"
         }
+        let color = (pomodoro == .rest || pomodoro == .longRest) ? bannerGreen : accent
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        track.strokeColor = color.withAlphaComponent(0.25).cgColor
+        prog.strokeColor = color.cgColor
+        CATransaction.commit()
+        glyph.contentTintColor = color
+        guard name != glyphName else { return }
+        glyphName = name
+        glyph.image = NSImage(systemSymbolName: name, accessibilityDescription: nil)?.withSymbolConfiguration(.init(pointSize: 9, weight: .bold))
     }
     init() {
         super.init(frame: .zero)

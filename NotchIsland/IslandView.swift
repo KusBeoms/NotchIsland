@@ -97,7 +97,7 @@ final class IslandView: FileDragView {
         let p = content.convert(here, from: self)
         if content.lyricsVisible {
             if content.lyricsB.frame.contains(p) { return content.lyricsB }
-            if content.lyricsPane.frame.contains(p) { return content.lyricsPane }
+            if content.lyricsPane.frame.contains(p) { return content.lyricsPane.hitTest(p) }
         }
         if !content.activityRow.isHidden, content.activityRow.frame.contains(p) {
             return content.activityRow.hitTest(p)
