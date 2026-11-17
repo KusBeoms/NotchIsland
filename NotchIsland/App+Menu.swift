@@ -74,6 +74,7 @@ extension App {
         add("사용법", #selector(menuGuide))
         add(AXIsProcessTrusted() ? "접근성 권한 허용됨" : "접근성 권한 설정…", #selector(menuAccessibility))
         add("설정…", #selector(menuSettings), key: ",")
+        menu.addItem(updateMenuItem())
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "NotchIsland 종료", action: #selector(menuQuit), keyEquivalent: "q")
         quit.target = self; menu.addItem(quit)
@@ -154,6 +155,7 @@ extension App {
         applyPrivacySetting()
         applyCalendarSetting()
         applyTransferSetting()
+        applyUpdateSetting()
         refreshUI(); applyShape()
     }
     func applyPrivacySetting() {

@@ -31,6 +31,9 @@ swiftc TransferModel.swift TransferMonitor.swift Tests/TransferTests.swift -o "$
 swiftc SensorGesture.swift Tests/SensorGestureTests.swift -o "$TEST_DIR/sensor-tests"
 "$TEST_DIR/sensor-tests"
 
+swiftc Updater.swift Tests/UpdaterTests.swift -o "$TEST_DIR/updater-tests"
+"$TEST_DIR/updater-tests"
+
 # Reuse the actual configuration globals while omitting startup and its instance lock.
 sed '/^\/\/ One island at a time:/,$d' main.swift > "$TEST_DIR/main.swift"
 cat Tests/AppTests.swift Tests/FeatureTests.swift >> "$TEST_DIR/main.swift"

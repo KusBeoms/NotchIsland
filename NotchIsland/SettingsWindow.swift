@@ -9,6 +9,10 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     private var valueLabels: [String: NSTextField] = [:]
     /// A caption shown under a checkbox, keyed by the setting's key (e.g. "calendar access was denied"). nil = none.
     var caption: (String) -> String? = { _ in nil }
+    /// The update line under the auto-update checkbox, and what the "check now" button does.
+    var updateStatus: () -> String = { "" }
+    var onCheckUpdate: () -> Void = {}
+    private var updateStatusLabel: NSTextField?
 
     private static let toggles: [(key: String, title: String)] = [
         (Settings.Key.calendar, "캘린더의 다음 일정 표시"),
@@ -89,9 +93,30 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         stack.addArrangedSubview(gestureGrid())
         stack.addArrangedSubview(note("'두 번 덮기'에 동작을 지정하면, 같은 곳의 '짧게 덮기' 동작은 두 번째 덮기를 기다리느라 0.35초 늦게 실행됩니다.\n기본값은 원래 동작과 같습니다: 닫혀 있을 때 길게 덮기 = 열기, 음악 카드에서 짧게 = 닫기·길게 = 가사, 다른 카드에서 짧게 = 닫기."))
 
+        stack.addArrangedSubview(space(6))
+        stack.addArrangedSubview(header("업데이트"))
+        let auto = NSButton(checkboxWithTitle: "새 버전이 나오면 자동으로 업데이트", target: self, action: #selector(toggled(_:)))
+        auto.identifier = NSUserInterfaceItemIdentifier(Settings.Key.autoUpdate)
+        auto.state = Settings.autoUpdateEnabled ? .on : .off
+        stack.addArrangedSubview(auto)
+        let status = NSTextField(labelWithString: updateStatus())
+        status.font = .systemFont(ofSize: 11); status.textColor = .secondaryLabelColor
+        status.lineBreakMode = .byTruncatingTail
+        status.widthAnchor.constraint(equalToConstant: 250).isActive = true
+        updateStatusLabel = status
+        let check = NSButton(title: "지금 확인", target: self, action: #selector(checkUpdateTapped))
+        check.controlSize = .small
+        let row = NSStackView(views: [status, check])
+        row.orientation = .horizontal; row.spacing = 8
+        stack.addArrangedSubview(row)
+        stack.addArrangedSubview(note("내려받은 새 버전은 앱이 저절로 다시 시작되며 적용됩니다. 타이머·스톱워치를 쓰는 중이면 끝난 뒤로 미룹니다."))
+
         stack.frame.size = stack.fittingSize
         return stack
     }
+
+    /// Called when the updater's state changes while the window is open.
+    func refreshUpdateStatus() { updateStatusLabel?.stringValue = updateStatus() }
 
     private func gestureGrid() -> NSGridView {
         let map = SensorGestureMap(Settings.sensorGestureMap)
@@ -167,5 +192,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         Settings.sensorGestureMap = map.stored
     }
 
-    func windowWillClose(_ notification: Notification) { valueLabels = [:] }
+    @objc private func checkUpdateTapped() { onCheckUpdate() }
+
+    func windowWillClose(_ notification: Notification) { valueLabels = [:]; updateStatusLabel = nil }
 }

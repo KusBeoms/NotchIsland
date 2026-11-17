@@ -105,6 +105,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let keyTap = MediaKeyTap()
     let islandShortcut = IslandShortcut()
     let settingsWindow = SettingsWindowController()
+    let updater = Updater()                            // new releases on GitHub (App+Update.swift)
     let privacyMonitor = PrivacyMonitor()
     let transferMonitor = TransferMonitor()            // downloads and copies other apps publish progress for
     let calendarMonitor = CalendarMonitor()
@@ -336,6 +337,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if demoTransfer { transferMonitor.startDemo() } else { applyTransferSetting() }
         if demoSettings { DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in self?.settingsWindow.show() } }
         settingsWindow.caption = { key in key == Settings.Key.calendar ? CalendarMonitor.statusCaption : nil }
+        setupUpdater()
         NotificationCenter.default.addObserver(self, selector: #selector(settingsChanged), name: Settings.changed, object: nil)
         watchOutputDevice()
         watchSleep()

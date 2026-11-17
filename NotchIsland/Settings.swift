@@ -20,10 +20,11 @@ enum Settings {
         static let pomodoroLongBreak = "pomodoroLongBreakMin"
         static let pomodoroLongEvery = "pomodoroLongEvery"
         static let sensorGestures = "sensorGestureMap"
+        static let autoUpdate = "autoUpdateEnabled"
     }
 
     static let boolDefaults: [String: Bool] = [
-        Key.calendar: true, Key.privacy: true, Key.downloads: true, Key.zeroVolume: true,
+        Key.calendar: true, Key.privacy: true, Key.downloads: true, Key.zeroVolume: true, Key.autoUpdate: true,
     ]
     /// default, allowed range
     static let intDefaults: [String: (value: Int, range: ClosedRange<Int>)] = [
@@ -54,6 +55,7 @@ enum Settings {
     static var privacyEnabled: Bool { bool(Key.privacy) }
     static var downloadsEnabled: Bool { bool(Key.downloads) }
     static var zeroVolumeOnOutputChange: Bool { bool(Key.zeroVolume) }
+    static var autoUpdateEnabled: Bool { bool(Key.autoUpdate) }
 
     static var pomodoro: PomodoroConfig {
         PomodoroConfig(work: int(Key.pomodoroWork), rest: int(Key.pomodoroBreak),
