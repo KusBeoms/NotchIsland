@@ -161,11 +161,65 @@ assert(sensorApp.pinned && sensorApp.selected == .timer && !sensorApp.pressing)
 sensorApp.sensorTouchEnded()
 assert(sensorApp.pinned)                                                                  // letting go does not close it
 
-// defaults, open on a non-music card: covering closes it at once
-assert(sensorApp.sensorContext == .openOther)
-sensorApp.sensorTouchBegan()
-assert(!sensorApp.pinned)
+// defaults, open on a non-music, non-stopwatch card (a countdown): covering closes it at once, the countdown is untouched
+let countApp = makeTestApp()
+countApp.timer.startCountdown(minutes: 5); countApp.syncActivities()
+countApp.selected = .timer; countApp.pinned = true
+assert(countApp.sensorContext == .openOther)
+countApp.sensorTouchBegan()
+assert(!countApp.pinned && countApp.timer.running && countApp.timer.mode == .countdown)
+countApp.sensorTouchEnded()
+sensorSpin(0.5, countApp)
+assert(countApp.timer.running)                                                            // nothing else fired later
+
+// defaults, open on the stopwatch card: short = pause / resume (after the double-cover window), long = close, double = off
+assert(sensorApp.sensorContext == .openStopwatch && sensorApp.timer.running)
+sensorApp.sensorTouchBegan(); assert(sensorApp.pinned && sensorApp.timer.running)         // touching does nothing yet
+sensorApp.sensorTouchEnded(); assert(sensorApp.timer.running)                              // waits for a possible second cover
+sensorSpin(0.5, sensorApp)
+assert(!sensorApp.timer.running && sensorApp.timer.started && sensorApp.pinned && sensorApp.sensorContext == .openStopwatch)   // paused, still a started stopwatch
+sensorApp.syncActivities()
+assert(sensorApp.acts.contains(.timer) && sensorApp.sensorContext == .openStopwatch)       // its card is still there
+let pausedAt = sensorApp.timer.elapsed
+sensorApp.sensorTouchBegan(); sensorApp.sensorTouchEnded()
+sensorSpin(0.5, sensorApp)
+assert(sensorApp.timer.running && sensorApp.timer.elapsed >= pausedAt && sensorApp.pinned)  // resumed
+sensorApp.sensorTouchBegan()                                                              // long cover: closes, does not pause
+sensorSpin(0.7, sensorApp)
+assert(!sensorApp.pinned && sensorApp.timer.running)
 sensorApp.sensorTouchEnded()
+sensorSpin(0.5, sensorApp)
+assert(!sensorApp.pinned && sensorApp.timer.running)                                      // no late pause from the release
+
+let offApp = makeTestApp()
+offApp.timer.startStopwatch(); offApp.syncActivities()
+offApp.selected = .timer; offApp.pinned = true
+offApp.sensorTouchBegan(); offApp.sensorTouchEnded()
+offApp.sensorTouchBegan(); offApp.sensorTouchEnded()                                      // double cover: turned off
+assert(!offApp.timer.started && !offApp.timer.running)
+sensorSpin(0.5, offApp)
+assert(!offApp.timer.started)                                                             // the first cover did not pause / resume it on its own
+offApp.syncActivities()
+assert(!offApp.acts.contains(.timer) && offApp.sensorContext != .openStopwatch)
+
+// a paused stopwatch can be turned off too
+let pausedOff = makeTestApp()
+pausedOff.timer.startStopwatch(); pausedOff.timer.toggle(); pausedOff.syncActivities()
+pausedOff.selected = .timer; pausedOff.pinned = true
+assert(pausedOff.timer.started && !pausedOff.timer.running && pausedOff.sensorContext == .openStopwatch)
+pausedOff.sensorTouchBegan(); pausedOff.sensorTouchEnded()
+pausedOff.sensorTouchBegan(); pausedOff.sensorTouchEnded()
+assert(!pausedOff.timer.started)
+
+// the stopwatch gestures can be changed like any other (here: a short cover closes)
+Settings.sensorGestureMap = [SensorGestureMap.key(.openStopwatch, .tap): SensorAction.closeIsland.rawValue]
+let remapApp = makeTestApp()
+remapApp.timer.startStopwatch(); remapApp.syncActivities()
+remapApp.selected = .timer; remapApp.pinned = true
+remapApp.sensorTouchBegan(); remapApp.sensorTouchEnded()
+sensorSpin(0.5, remapApp)
+assert(!remapApp.pinned && remapApp.timer.running)
+Settings.sensorGestureMap = [:]
 
 // defaults, closed and quick: nothing opens
 let quickApp = makeTestApp()
@@ -189,7 +243,7 @@ assert(tapApp.pinned && tapApp.timer.started && !tapApp.timer.running)          
 // a double cover on an open island runs its action and does not also close it
 Settings.sensorGestureMap = [SensorGestureMap.key(.openOther, .doubleTap): SensorAction.toggleTimer.rawValue]
 let doubleApp = makeTestApp()
-doubleApp.timer.startStopwatch(); doubleApp.syncActivities()
+doubleApp.timer.startCountdown(minutes: 5); doubleApp.syncActivities()
 doubleApp.selected = .timer; doubleApp.pinned = true
 assert(doubleApp.sensorContext == .openOther && doubleApp.timer.running)
 doubleApp.sensorTouchBegan(); doubleApp.sensorTouchEnded()

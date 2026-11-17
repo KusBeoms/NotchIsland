@@ -6,10 +6,11 @@ import Foundation
 enum SensorContext: String, CaseIterable {
     case closed          // collapsed (or only peeking)
     case openMusic       // open, on a music card that has lyrics
+    case openStopwatch   // open, on the stopwatch card (a countdown or Pomodoro is "any other card")
     case openOther       // open, on any other card
 
     var title: String {
-        switch self { case .closed: return "닫혀 있을 때"; case .openMusic: return "음악 카드"; case .openOther: return "다른 카드" }
+        switch self { case .closed: return "닫혀 있을 때"; case .openMusic: return "음악 카드"; case .openStopwatch: return "스톱워치 카드"; case .openOther: return "다른 카드" }
     }
 }
 
@@ -21,7 +22,7 @@ enum SensorGesture: String, CaseIterable {
 }
 
 enum SensorAction: String, CaseIterable {
-    case none, openIsland, closeIsland, lyrics, playPause, nextTrack, previousTrack, toggleTimer, startPomodoro
+    case none, openIsland, closeIsland, lyrics, playPause, nextTrack, previousTrack, toggleTimer, cancelTimer, startPomodoro
 
     var title: String {
         switch self {
@@ -33,6 +34,7 @@ enum SensorAction: String, CaseIterable {
         case .nextTrack: return "다음 곡"
         case .previousTrack: return "이전 곡"
         case .toggleTimer: return "타이머 시작/정지"
+        case .cancelTimer: return "타이머 끄기"
         case .startPomodoro: return "포모도로 시작/정지"
         }
     }
@@ -51,6 +53,9 @@ struct SensorGestureMap: Equatable {
         case (.closed, .hold): return .openIsland
         case (.openMusic, .tap): return .closeIsland
         case (.openMusic, .hold): return .lyrics
+        case (.openStopwatch, .tap): return .toggleTimer          // pause / resume (a stopwatch that has started stays "started" while paused)
+        case (.openStopwatch, .hold): return .closeIsland         // back into the notch
+        case (.openStopwatch, .doubleTap): return .cancelTimer    // turn the stopwatch off
         case (.openOther, .tap): return .closeIsland
         default: return .none
         }
@@ -58,11 +63,11 @@ struct SensorGestureMap: Equatable {
 
     /// What a context can sensibly be given: an open island cannot be opened, a closed one cannot be closed, lyrics need the music card.
     static func allowedActions(_ c: SensorContext) -> [SensorAction] {
-        let common: [SensorAction] = [.playPause, .nextTrack, .previousTrack, .toggleTimer, .startPomodoro]
+        let common: [SensorAction] = [.playPause, .nextTrack, .previousTrack, .toggleTimer, .cancelTimer, .startPomodoro]
         switch c {
         case .closed: return [.none, .openIsland] + common
         case .openMusic: return [.none, .closeIsland, .lyrics] + common
-        case .openOther: return [.none, .closeIsland] + common
+        case .openStopwatch, .openOther: return [.none, .closeIsland] + common
         }
     }
 

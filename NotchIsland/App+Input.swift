@@ -96,11 +96,14 @@ extension App {
     /// Where the island is when the sensor is covered: the gestures can be set per context (see SensorGestureMap).
     var sensorContext: SensorContext {
         guard shape == .expanded || pinned else { return .closed }
-        return shape == .expanded && cardKind == .media && body == .media && supportsLyrics ? .openMusic : .openOther
+        if shape == .expanded && cardKind == .media && body == .media && supportsLyrics { return .openMusic }
+        if cardKind == .timer && body == .timer && timer.mode == .stopwatch { return .openStopwatch }
+        return .openOther
     }
 
     /// Covered. What happens is up to the user's gesture map; the defaults are the original behaviour:
-    /// open island -> shrinks back (on a music card a short cover closes it, a long one toggles the lyrics);
+    /// open island -> shrinks back (on the stopwatch card a short cover pauses / resumes, a long one closes, a double one turns it off;
+    /// on a music card a short cover closes it, a long one toggles the lyrics);
     /// closed and something running -> reacts at once, and keeping it covered 0.3s pops it open and keeps it;
     /// closed and nothing running -> pops out and straight back in.
     func sensorTouchBegan() {
@@ -149,6 +152,10 @@ extension App {
             haptic(.levelChange)
             if timer.started { timer.toggle() } else { timer.startStopwatch() }
             refreshUI()
+        case .cancelTimer:
+            guard timer.started else { return }
+            haptic(.levelChange)
+            timer.reset(); refreshUI()               // same as the card's cancel button; the island closes once nothing is left to show
         case .startPomodoro:
             haptic(.levelChange)
             if timer.pomodoro != nil { timer.toggle() } else { timer.startPomodoro(Settings.pomodoro) }

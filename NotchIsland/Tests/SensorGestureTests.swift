@@ -12,6 +12,10 @@ struct SensorGestureTests {
         assert(map.action(.closed, .hold) == .openIsland && map.action(.closed, .tap) == .none && map.action(.closed, .doubleTap) == .none)
         assert(map.action(.openMusic, .tap) == .closeIsland && map.action(.openMusic, .hold) == .lyrics)
         assert(map.action(.openOther, .tap) == .closeIsland && map.action(.openOther, .hold) == .none)
+        // the stopwatch card: short = pause / resume, long = back into the notch, double = off
+        assert(map.action(.openStopwatch, .tap) == .toggleTimer && map.action(.openStopwatch, .hold) == .closeIsland && map.action(.openStopwatch, .doubleTap) == .cancelTimer)
+        assert(SensorGestureMap.allowedActions(.openStopwatch).contains(.cancelTimer) && !SensorGestureMap.allowedActions(.openStopwatch).contains(.openIsland))
+        assert(SensorGestureMap(["openStopwatch.tap": "openIsland"]).action(.openStopwatch, .tap) == .toggleTimer)   // cannot open an open island
         var m = map
         m.set(.playPause, .openOther, .doubleTap)
         assert(m.action(.openOther, .doubleTap) == .playPause && m.stored["openOther.doubleTap"] == "playPause")
@@ -78,6 +82,21 @@ struct SensorGestureTests {
         r = R()
         assert(r.down(at: 0, context: .openOther, map: d).isEmpty && r.up(at: 0.1).isEmpty)
         assert(r.down(at: 0.2, context: .closed, map: d) == [.init(gesture: .tap, action: .closeIsland, context: .openOther)])
+
+        // stopwatch card defaults: the short cover waits for the double-cover window, the hold closes at once, the double cover turns it off
+        r = R()
+        assert(r.down(at: 0, context: .openStopwatch, map: map).isEmpty && r.up(at: 0.1).isEmpty)
+        assert(r.tick(at: 0.3).isEmpty)
+        assert(r.tick(at: 0.5) == [.init(gesture: .tap, action: .toggleTimer, context: .openStopwatch)])
+        r = R()
+        assert(r.down(at: 0, context: .openStopwatch, map: map).isEmpty && r.tick(at: 0.4).isEmpty)
+        assert(r.tick(at: 0.46) == [.init(gesture: .hold, action: .closeIsland, context: .openStopwatch)])
+        assert(r.up(at: 0.8).isEmpty && r.tick(at: 2).isEmpty)                      // no pause after the hold
+        r = R()
+        assert(r.down(at: 0, context: .openStopwatch, map: map).isEmpty && r.up(at: 0.1).isEmpty)
+        assert(r.down(at: 0.25, context: .openStopwatch, map: map).isEmpty)
+        assert(r.up(at: 0.32) == [.init(gesture: .doubleTap, action: .cancelTimer, context: .openStopwatch)])
+        assert(r.tick(at: 2).isEmpty)                                               // the first cover did not pause on its own
 
         // a tap mapped on a closed island acts on release (a hold is possible there), and a hold still opens it
         var t = map
