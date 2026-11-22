@@ -51,6 +51,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var playTapGeneration = 0           // bumped by every play / pause tap: delayed confirmations of an older tap are ignored
     var locked = false                 // pinned by tapping the expanded island: ignores outside clicks / Esc / sensor until tapped again
     var hoverUntil = Date.distantPast
+    var missionControl = false         // Mission Control is up: the island folds away (even when locked) and comes back after
+    var lockShown: Bool { locked && !missionControl }
     var lux = -1.0
     var media: Media? {
         didSet {
@@ -184,7 +186,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // state of App+Step.swift
     var stepTimer: Timer?, stepBusy = false
-    var tAppearance = 0.0, tFiles = 0.0, tVolume = 0.0, tBattery = 0.0, tMusic = 0.0, tAirPods = 0.0, tCalendar = 0.0
+    var tAppearance = 0.0, tFiles = 0.0, tVolume = 0.0, tBattery = 0.0, tMusic = 0.0, tAirPods = 0.0, tCalendar = 0.0, tMission = 0.0
 
     // state of App+Polling.swift
     var artRetryAt: [String: Date] = [:], artTries: [String: Int] = [:]

@@ -99,6 +99,10 @@ extension App {
         if due(&tMusic, shape == .expanded ? 2 : (media?.playing == true ? 3 : 5)) { pollMusic() }
         if let m = media, !m.playing, !demoMedia, demoActsN == nil, shape != .expanded,
            now.timeIntervalSince(lastPlayingAt) > 4 { media = nil }     // paused for a while: let it go
+        if due(&tMission, 0.15) {
+            let mc = App.missionControlUp(on: screen)
+            if mc != missionControl { missionControl = mc; refreshUI() }
+        }
         if due(&tCalendar, 15) { pollCalendar() }  // an event becomes an activity (or its alert is due) as time passes, with nothing else happening
         if due(&tAirPods, 12) { pollAirPods() }    // system_profiler is heavy; a new output device triggers it sooner (see watchOutputDevice)
 

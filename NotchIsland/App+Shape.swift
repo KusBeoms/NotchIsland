@@ -10,11 +10,22 @@ extension App {
     func desiredShape() -> Shape {
         if pinned && !liveActivity && !forceOpen { pinned = false }   // nothing left to show
         if !pinned { selected = nil; locked = false; lyricsRequested = false }     // so an ended activity also releases the lock
+        if missionControl { return acts.isEmpty ? .collapsed : .activity }   // pinned / locked state is kept, only hidden meanwhile
         if forceOpen || pinned || hudActive || dropping { return .expanded }
         if pressing || Date() < popUntil { return .pressed }
         if Date() < hoverUntil { return .peek }       // hovering only nudges it; a long press opens it
         if !acts.isEmpty { return .activity }
         return .collapsed
+    }
+
+    /// Mission Control shows up as a full-screen window the Dock owns at layer 20.
+    static func missionControlUp(on screen: NSScreen) -> Bool {
+        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else { return false }
+        return list.contains { w in
+            guard (w[kCGWindowOwnerName as String] as? String) == "Dock", (w[kCGWindowLayer as String] as? Int) == 20,
+                  let b = w[kCGWindowBounds as String] as? NSDictionary, let r = CGRect(dictionaryRepresentation: b) else { return false }
+            return r.width >= screen.frame.width - 1 && r.height >= screen.frame.height - 1
+        }
     }
 
     /// The pointer is on the real (hardware) notch.

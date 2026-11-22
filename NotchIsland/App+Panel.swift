@@ -22,7 +22,7 @@ extension App {
     /// Its window is only as tall as the island, and it is taken off screen again once the fade-out has finished.
     func updateLockBorder() {
         if lockBorder == nil {
-            if !locked { return }
+            if !lockShown { return }
             let p = NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
             p.level = NSWindow.Level(rawValue: 399)
             p.backgroundColor = .clear; p.isOpaque = false; p.hasShadow = false
@@ -35,8 +35,8 @@ extension App {
             lockBorder = p; lockBorderLayer = l
         }
         guard let p = lockBorder, let l = lockBorderLayer else { return }
-        if !locked && !p.isVisible { return }
-        if locked {
+        if !lockShown && !p.isVisible { return }
+        if lockShown {
             let f = screen.frame
             let stripH = min(f.height, max(1, f.maxY - lockIsland.minY + 4))
             let strip = NSRect(x: f.minX, y: f.maxY - stripH, width: f.width, height: stripH)
@@ -66,11 +66,11 @@ extension App {
             }
             if !p.isVisible { p.orderFrontRegardless(); makeSticky(p) }      // sticky: stays put while Spaces slide, like the island
         }
-        let target: CGFloat = locked ? 1 : 0
+        let target: CGFloat = lockShown ? 1 : 0
         if p.alphaValue != target && lockBorderTarget != target {
             lockBorderTarget = target
             NSAnimationContext.runAnimationGroup({ $0.duration = 0.15; p.animator().alphaValue = target }, completionHandler: { [weak self] in
-                guard let self, !self.locked, p.alphaValue == 0 else { return }
+                guard let self, !self.lockShown, p.alphaValue == 0 else { return }
                 p.orderOut(nil); self.lockBorderGeometry = nil               // nothing invisible stays in the window list
             })
         }
