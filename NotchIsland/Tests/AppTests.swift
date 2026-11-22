@@ -215,7 +215,11 @@ assert(lyricsApp.c.lyricsPane.frame.minX > lyricsApp.c.art.frame.maxX) // the ex
 assert(lyricsApp.c.lyricsB.frame.width == 24 && lyricsApp.c.lyricsB.frame.maxX <= lyricsApp.c.mediaCardWidth!)
 let rows = lyricsApp.c.lyricsPane.subviews.compactMap { $0 as? LyricRowView }.sorted { $0.lineIndex < $1.lineIndex }
 assert(rows.count == 3)
-assert(abs((rows[1].frame.midY - rows[0].frame.midY) - (rows[2].frame.midY - rows[1].frame.midY)) < 0.001)
+// Rows are spaced by their own heights (each may wrap onto several lines): a fixed gap between the text blocks.
+func lyricRowGap(_ upper: NSView, _ lower: NSView) -> CGFloat {
+    (lower.frame.midY - upper.frame.midY) - (upper.frame.height + lower.frame.height - 48) / 2
+}
+assert(abs(lyricRowGap(rows[0], rows[1]) - lyricRowGap(rows[1], rows[2])) < 0.001)
 assert(rows[1].wordProgress.contains(where: { $0 > 0 && $0 < 1 }))
 lyricsApp.c.lyricsPane.advance(to: 7)
 let heldPosition = lyricsApp.c.lyricsPane.position
@@ -502,6 +506,55 @@ assert(pageFirst.representation(using: .png, properties: [:]) != pageLast.repres
 _ = renderPagedRow(at: 0)
 assert(pagedRow.pageOffset(at: 0, reduceMotion: false) == 0)
 print("Lyrics reader scrolling, reload controls and long-line paging checks passed")
+
+// Long lyrics wrap onto as many lines as the band holds and show all of them at once, without paging.
+let multiPanel = LyricsPanelView(frame: NSRect(x: 0, y: 0, width: 230, height: 112))
+let multiCapacity = multiPanel.lineCapacity
+assert(multiCapacity >= 3)                                    // 3 lines at least must fit the real pane height (112)
+print("Lyric line capacity at pane height 112:", multiCapacity, "line height:", LyricRowView.lineHeight)
+let multiLongText = "긴 가사가 여러 줄로 이어져도 마지막 문장까지 모두 한꺼번에 볼 수 있어야 합니다 정말로"
+let multiShortText = "짧은 줄"
+let multiHugeText = Array(repeating: multiLongText, count: 4).joined(separator: " ")
+let multiDocument = LyricsDocument(lines: [timedLyricLine(start: 0, end: 4, text: multiShortText),
+                                           timedLyricLine(start: 4, end: 12, text: multiLongText),
+                                           timedLyricLine(start: 12, end: 16, text: multiShortText),
+                                           timedLyricLine(start: 16, end: 40, text: multiHugeText)], plainText: "multi")
+multiPanel.update(.document(multiDocument), time: 6, frameTime: 500)
+func multiRow(_ index: Int) -> LyricRowView? { multiPanel.subviews.compactMap { $0 as? LyricRowView }.first { $0.lineIndex == index } }
+multiPanel.advance(to: 6, frameTime: 500.01)                  // rows get their frame in the first pass and shape in the next
+let multiActive = multiRow(1)!
+let multiLines = multiActive.visibleLineCount(forWidth: multiActive.bounds.width)
+assert(multiLines >= 3 && multiLines <= multiCapacity)       // 3+ lines shown together
+assert(multiActive.pageOffsets.count == 1)                    // ... with no paging
+assert(abs(multiActive.frame.height - (CGFloat(multiLines) * LyricRowView.lineHeight + 24)) < 0.001)
+assert(multiActive.frame.height > multiRow(0)!.frame.height)  // rows grow with their line count
+// The active row is centred in the band below the button strip; stacking uses the cumulative heights.
+assert(abs(multiActive.frame.midY - (multiPanel.bounds.height + 24) / 2) < 0.5)
+assert(multiRow(2)!.frame.minY >= multiActive.frame.midY + multiActive.frame.height / 2 - 12)
+// Every character of the active row is drawn (no clipping of a later page): ink spans the full block height.
+let multiBitmap = multiActive.bitmapImageRepForCachingDisplay(in: multiActive.bounds)!
+multiActive.advance(to: 12, emphasis: 1)
+multiActive.cacheDisplay(in: multiActive.bounds, to: multiBitmap)
+assert(inkBounds(multiBitmap).height > CGFloat(multiLines - 1) * LyricRowView.lineHeight)
+// A fractional position stays continuous while rows differ in height.
+var lastMid = multiRow(1)!.frame.midY
+for step in 1...40 {
+    multiPanel.advance(to: 6 + Double(step) * 0.2, frameTime: 500 + Double(step) / 60)
+    let mid = multiRow(1)?.frame.midY ?? lastMid
+    assert(abs(mid - lastMid) < 12)
+    lastMid = mid
+}
+// Only a lyric taller than the band falls back to paging, by `capacity` lines per page.
+multiPanel.update(.document(multiDocument), time: 20, frameTime: 600)
+let hugeRow = multiRow(3)!
+multiPanel.advance(to: 20, frameTime: 600.02)
+assert(hugeRow.visibleLineCount(forWidth: hugeRow.bounds.width) == multiCapacity && hugeRow.pageOffsets.count > 1)
+// Width changes re-wrap once: the same width reuses the shaping cache, a new width recomputes line counts.
+let widthRow = LyricRowView(frame: NSRect(x: 0, y: 0, width: 110, height: 44))
+widthRow.configure(timedLyricLine(start: 0, end: 4, text: multiLongText), maximumLines: 8)
+let narrowLines = widthRow.visibleLineCount(forWidth: 110), narrowAgain = widthRow.visibleLineCount(forWidth: 110)
+assert(narrowLines == narrowAgain && widthRow.visibleLineCount(forWidth: 400) < narrowLines)
+print("Multi-line lyric layout (variable height, no paging within capacity, paging fallback beyond it) checks passed")
 
 if let path = ProcessInfo.processInfo.environment["NI_LYRICS_PREVIEW_PATH"] {
     func savePanel(_ panel: NSView, suffix: String) {

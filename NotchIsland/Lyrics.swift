@@ -18,6 +18,39 @@ struct LyricsScrollFollower {
     }
 }
 
+/// Pure geometry of the lyric list. Rows have a variable number of wrapped lines; their centres follow from the
+/// cumulative heights, and a fractional position interpolates between neighbouring centres so the scroll stays smooth.
+enum LyricsRowLayout {
+    /// Most wrapped lines that fit the visible band (`viewportHeight` minus the `margin` kept free above and below).
+    static func capacity(viewportHeight: Double, lineHeight: Double, margin: Double) -> Int {
+        guard lineHeight > 0 else { return 1 }
+        return max(1, Int(((viewportHeight - 2 * margin) / lineHeight).rounded(.down)))
+    }
+    static func blockHeight(lines: Int, lineHeight: Double) -> Double { Double(max(1, lines)) * lineHeight }
+    /// Row centres, measured downwards from the first row's centre (0). Neighbouring blocks keep `gap` between them,
+    /// so one-line rows are exactly `lineHeight + gap` apart.
+    static func centers(lines: [Int], lineHeight: Double, gap: Double) -> [Double] {
+        var result: [Double] = []
+        var previousHeight = 0.0
+        for count in lines {
+            let height = blockHeight(lines: count, lineHeight: lineHeight)
+            result.append(result.last.map { $0 + (previousHeight + height) / 2 + gap } ?? 0)
+            previousHeight = height
+        }
+        return result
+    }
+    /// Centre at a fractional row position: linear between the two neighbours, extended past either end by the edge pitch.
+    static func center(at position: Double, centers: [Double], pitch: Double) -> Double {
+        guard let first = centers.first, let last = centers.last else { return 0 }
+        if position <= 0 { return first + position * (centers.count > 1 ? centers[1] - first : pitch) }
+        let top = Double(centers.count - 1)
+        if position >= top { return last + (position - top) * (centers.count > 1 ? last - centers[centers.count - 2] : pitch) }
+        let index = Int(position.rounded(.down))
+        let fraction = position - Double(index)
+        return centers[index] + (centers[index + 1] - centers[index]) * fraction
+    }
+}
+
 /// Playback holds the lyric highlight still; presentation time lets existing motion come to rest.
 struct LyricsMotionEnvelope {
     private(set) var gain = 1.0

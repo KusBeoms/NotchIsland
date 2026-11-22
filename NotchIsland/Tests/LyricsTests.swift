@@ -117,6 +117,39 @@ assert(liftedWord.scale(at: 6, emphasis: 1, reduceMotion: false) == 1)
             assert(follower.position > before && follower.position - before <= follower.maximumSpeed / 60 + 0.00001)
         }
         assert(follower.position > 0.999 && follower.position < 1)
+        // Variable row heights: 1, 2 and 5 wrapped lines stacked by cumulative height (line 20, gap 20).
+        func near(_ a: Double, _ b: Double) -> Bool { abs(a - b) < 1e-9 }
+        let stack = LyricsRowLayout.centers(lines: [1, 2, 5, 1], lineHeight: 20, gap: 20)
+        assert(stack.count == 4 && stack[0] == 0)
+        assert(near(stack[1], 30 + 20) && near(stack[2], stack[1] + 70 + 20) && near(stack[3], stack[2] + 60 + 20))
+        let uniform = LyricsRowLayout.centers(lines: [1, 1, 1], lineHeight: 20, gap: 20)
+        assert(uniform == [0, 40, 80])                                   // one-line rows keep the old fixed pitch
+        assert(LyricsRowLayout.centers(lines: [], lineHeight: 20, gap: 20).isEmpty)
+        assert(LyricsRowLayout.centers(lines: [0], lineHeight: 20, gap: 20) == [0])
+        // Fractional positions interpolate linearly between neighbouring centres and are continuous at the integers.
+        assert(near(LyricsRowLayout.center(at: 1, centers: stack, pitch: 40), stack[1]))
+        assert(near(LyricsRowLayout.center(at: 1.5, centers: stack, pitch: 40), (stack[1] + stack[2]) / 2))
+        assert(near(LyricsRowLayout.center(at: 0.25, centers: stack, pitch: 40), stack[1] * 0.25))
+        var previous = LyricsRowLayout.center(at: 0, centers: stack, pitch: 40)
+        for step in 1...300 {                                            // monotonic, bounded steps: no jump when rows change height
+            let value = LyricsRowLayout.center(at: Double(step) / 100, centers: stack, pitch: 40)
+            assert(value >= previous && value - previous <= (stack[2] - stack[1]) / 100 + 1e-9)
+            previous = value
+        }
+        // Boundary indices: clamped to the ends, extended by the edge pitch beyond them.
+        assert(near(LyricsRowLayout.center(at: 3, centers: stack, pitch: 40), stack[3]))
+        assert(near(LyricsRowLayout.center(at: 4, centers: stack, pitch: 40), stack[3] + (stack[3] - stack[2])))
+        assert(near(LyricsRowLayout.center(at: -1, centers: stack, pitch: 40), -stack[1]))
+        assert(LyricsRowLayout.center(at: 2.5, centers: [7], pitch: 40) == 7 + 2.5 * 40)
+        assert(LyricsRowLayout.center(at: 1, centers: [], pitch: 40) == 0)
+        // A width change re-wraps the same lyric: the same positions simply map onto the new heights.
+        let wide = LyricsRowLayout.centers(lines: [2, 1], lineHeight: 20, gap: 20)
+        let narrow = LyricsRowLayout.centers(lines: [4, 1], lineHeight: 20, gap: 20)
+        assert(near(narrow[1] - wide[1], 20) && near(LyricsRowLayout.center(at: 0, centers: narrow, pitch: 40), 0))
+        // Capacity: lines that fit the band; always at least one.
+        assert(LyricsRowLayout.capacity(viewportHeight: 88, lineHeight: 19, margin: 4) == 4)
+        assert(LyricsRowLayout.capacity(viewportHeight: 10, lineHeight: 19, margin: 4) == 1)
+        assert(LyricsRowLayout.capacity(viewportHeight: 100, lineHeight: 0, margin: 4) == 1)
         let longGap = LyricsDocument(lines: [LyricsLine(start: 0, end: 1, text: "A"), LyricsLine(start: 10, end: 11, text: "B")], plainText: "A B", songwriters: ["Writer"])
         let longTimeline = LyricsTimeline(document: longGap)
         assert(longTimeline.slots[1].kind == .waiting)

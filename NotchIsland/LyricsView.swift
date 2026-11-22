@@ -21,7 +21,18 @@ final class LyricRowView: NSView {
     private(set) var pageOffsets: [(start: Double, offset: CGFloat)] = []
     private var cachedWidth: CGFloat = -1
     private var cachedScale: CGFloat = 0
-    private var maximumLines = 2
+    private(set) var maximumLines = 2
+    private var cachedHeight: CGFloat = -1
+    private var measuredWidth: CGFloat = -1
+    private var measuredLines = 1
+    /// Height of one wrapped line at the lyric font (ascent + descent + leading).
+    static let lineHeight: CGFloat = {
+        let font = NSFont.systemFont(ofSize: 16, weight: .semibold) as CTFont
+        return CTFontGetAscent(font) + CTFontGetDescent(font) + CTFontGetLeading(font)
+    }()
+    private var needsShape: Bool {
+        cachedWidth != bounds.width || cachedHeight != bounds.height || cachedScale != (window?.backingScaleFactor ?? 2)
+    }
     private var time: TimeInterval = 0
     private var emphasis: Double = 1
     private var motionGain = 1.0
@@ -45,13 +56,18 @@ final class LyricRowView: NSView {
     required init?(coder: NSCoder) { fatalError() }
     func configure(_ line: LyricsLine, maximumLines: Int) {
         guard lyric != line || self.maximumLines != maximumLines else { return }
-        lyric = line; timings = line.characterTimings; self.maximumLines = maximumLines; cachedWidth = -1
+        lyric = line; timings = line.characterTimings; self.maximumLines = maximumLines; cachedWidth = -1; measuredWidth = -1
         wordProgress = []; characterLifts = []; characterScales = []; pageOffsets = []; needsDisplay = true
         lastMotionFrame = nil; completedPausedPage = nil; pageSettled = true
     }
+    /// The visible band changed: re-wrap on the next frame but keep the highlight and motion state.
+    func setMaximumLines(_ lines: Int) {
+        guard maximumLines != lines else { return }
+        maximumLines = lines; cachedWidth = -1; measuredWidth = -1; needsDisplay = true
+    }
     func advance(to time: TimeInterval, emphasis: Double, motionGain: Double = 1, playing: Bool = true,
                  frameTime: Double? = nil, resetMotion: Bool = false) {
-        if cachedWidth != bounds.width || cachedScale != (window?.backingScaleFactor ?? 2) { shapeText() }
+        if needsShape { shapeText() }
         let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         let previousPage = pageScroll.position
         var targetPage = pageOffset(at: time, reduceMotion: reduceMotion)
@@ -98,22 +114,35 @@ final class LyricRowView: NSView {
             return own + (1 - min(1, own / peak)) * peak * tanh(pulled / peak)
         }
     }
-    override func layout() { super.layout(); if cachedWidth != bounds.width { needsDisplay = true } }
-    private func shapeText() {
-        cachedWidth = bounds.width; cachedScale = window?.backingScaleFactor ?? 2
-        characters = []; pageOffsets = []; completedPausedPage = nil; lastMotionFrame = nil
-        guard bounds.width > 6, !lyric.text.isEmpty else { return }
-        let text = NSAttributedString(string: lyric.text, attributes: [
+    override func layout() { super.layout(); if needsShape { needsDisplay = true } }
+    /// Every wrapped line of `text` for a row of `width`; shaping and line counting share this so they always agree.
+    private static func wrap(_ text: String, width: CGFloat) -> (lines: [CTLine], origins: [CGPoint])? {
+        guard width > 6, !text.isEmpty else { return nil }
+        let attributed = NSAttributedString(string: text, attributes: [
             .font: NSFont.systemFont(ofSize: 16, weight: .semibold), .ligature: 0,
             NSAttributedString.Key(kCTForegroundColorFromContextAttributeName as String): true
         ])
-        let setter = CTFramesetterCreateWithAttributedString(text)
-        let path = CGPath(rect: CGRect(x: 0, y: 0, width: bounds.width - 6, height: CGFloat(lyric.text.utf16.count + 1) * 24), transform: nil)
+        let setter = CTFramesetterCreateWithAttributedString(attributed)
+        let path = CGPath(rect: CGRect(x: 0, y: 0, width: width - 6, height: CGFloat(text.utf16.count + 1) * 24), transform: nil)
         let frame = CTFramesetterCreateFrame(setter, CFRange(location: 0, length: 0), path, nil)
         let lines = CTFrameGetLines(frame) as! [CTLine]
-        guard !lines.isEmpty else { return }
+        guard !lines.isEmpty else { return nil }
         var origins = [CGPoint](repeating: .zero, count: lines.count)
         CTFrameGetLineOrigins(frame, CFRange(location: 0, length: 0), &origins)
+        return (lines, origins)
+    }
+    /// Wrapped lines shown at once for a row of `width`: all of them up to `maximumLines`; beyond that the row pages.
+    func visibleLineCount(forWidth width: CGFloat) -> Int {
+        if measuredWidth != width {
+            measuredWidth = width
+            measuredLines = Self.wrap(lyric.text, width: width)?.lines.count ?? 1
+        }
+        return max(1, min(maximumLines, measuredLines))
+    }
+    private func shapeText() {
+        cachedWidth = bounds.width; cachedHeight = bounds.height; cachedScale = window?.backingScaleFactor ?? 2
+        characters = []; pageOffsets = []; completedPausedPage = nil; lastMotionFrame = nil
+        guard let (lines, origins) = Self.wrap(lyric.text, width: bounds.width) else { return }
         let count = min(maximumLines, lines.count)
         var ascent: CGFloat = 0, descent: CGFloat = 0
         _ = CTLineGetTypographicBounds(lines[0], &ascent, nil, nil)
@@ -200,7 +229,7 @@ final class LyricRowView: NSView {
             }
         }
     }
-    /// Advance through every pair of wrapped lines rather than discarding text after line two.
+    /// Only a lyric taller than `maximumLines` (the visible band) pages; shorter ones show every line at once.
     func pageOffset(at time: Double, reduceMotion: Bool) -> CGFloat {
         var previous: CGFloat = 0
         for page in pageOffsets.dropFirst() {
@@ -217,7 +246,7 @@ final class LyricRowView: NSView {
     }
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        if cachedWidth != bounds.width || cachedScale != (window?.backingScaleFactor ?? 2) { shapeText() }
+        if needsShape { shapeText() }
         guard let context = NSGraphicsContext.current?.cgContext else { return }
         let baseAlpha = lyric.words.isEmpty ? 0.65 + 0.35 * emphasis : 0.7 - 0.35 * emphasis
         if gradient == nil || gradientEmphasis != emphasis {
@@ -468,7 +497,7 @@ final class LyricsPanelView: Flip {
             case .line(let lineIndex):
                 let lyric = LyricRowView(frame: .zero); lyric.lineIndex = index
                 // Every sentence is shaped once at the same font and width, including its off-centre states.
-                lyric.configure(document.lines[lineIndex], maximumLines: 2); row = lyric
+                lyric.configure(document.lines[lineIndex], maximumLines: lineCapacity); row = lyric
             case .waiting: row = LyricsWaitView(frame: .zero)
             case .credits: row = LyricsCreditsView(names: document.songwriters)
             }
@@ -497,12 +526,31 @@ final class LyricsPanelView: Flip {
         }
         lastTime = time; lastFrameTime = frameTime
     }
+    /// Wrapped lines of one lyric that fit the band below the 24pt strip reserved for the lyrics button.
+    /// Longer lyrics fall back to paging by this many lines.
+    var lineCapacity: Int {
+        LyricsRowLayout.capacity(viewportHeight: Double(bounds.height - 24), lineHeight: Double(LyricRowView.lineHeight), margin: 4)
+    }
     private func positionRows() {
+        guard let first = rows.keys.min(), let last = rows.keys.max() else { return }
         CATransaction.begin(); CATransaction.setDisableActions(true)
+        let width = max(0, bounds.width - 36)
+        let capacity = lineCapacity
+        let lineHeight = Double(LyricRowView.lineHeight)
+        // Rows are contiguous: stack them by their own heights and read the centre at the fractional position.
+        let counts = (first...last).map { index -> Int in
+            guard let lyric = rows[index] as? LyricRowView else { return 1 }
+            lyric.setMaximumLines(capacity)
+            return lyric.visibleLineCount(forWidth: width)
+        }
+        let centers = LyricsRowLayout.centers(lines: counts, lineHeight: lineHeight, gap: Double(rowSpacing) - lineHeight)
+        let current = LyricsRowLayout.center(at: position - Double(first), centers: centers, pitch: Double(rowSpacing))
         for (index, row) in rows {
             let creditInset: CGFloat = row is LyricsCreditsView ? 10 : 0
-            let frame = NSRect(x: 18, y: (bounds.height + 24) / 2 + CGFloat(Double(index) - position) * rowSpacing - 22 + creditInset,
-                               width: max(0, bounds.width - 36), height: 44)
+            let height: CGFloat = row is LyricRowView
+                ? CGFloat(LyricsRowLayout.blockHeight(lines: counts[index - first], lineHeight: lineHeight)) + 24 : 44
+            let center = (bounds.height + 24) / 2 + CGFloat(centers[index - first] - current) + creditInset
+            let frame = NSRect(x: 18, y: center - height / 2, width: width, height: height)
             if let lyric = row as? LyricRowView { lyric.topOcclusion = max(0, 24 - frame.minY) }
             if row.frame != frame { row.frame = frame }
             let alpha = 1 - 0.55 * min(1, CGFloat(abs(Double(index) - position)))
