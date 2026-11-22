@@ -11,6 +11,8 @@ final class CalendarMonitor {
     private let store = EKEventStore()
     private var observer: NSObjectProtocol?
     private var started = false
+    private var gate = CalendarRefreshGate()                    // main thread only
+    private let queryQueue = DispatchQueue(label: "NotchIsland.calendar-query", qos: .utility)
 
     /// Explains a refused permission in the settings window; nil when there is nothing to say.
     static var statusCaption: String? {
@@ -45,19 +47,32 @@ final class CalendarMonitor {
     func stop() {
         guard started else { return }
         started = false
+        gate.stop()
         if let observer { NotificationCenter.default.removeObserver(observer) }
         observer = nil
         events = []
     }
 
     func refresh() {
+        dispatchPrecondition(condition: .onQueue(.main))
         guard started, EKEventStore.authorizationStatus(for: .event) == .fullAccess else { return }
-        let now = Date()
-        let predicate = store.predicateForEvents(withStart: now.addingTimeInterval(-3600), end: now.addingTimeInterval(24 * 3600), calendars: nil)
-        let fresh = store.events(matching: predicate).compactMap { Self.convert($0) }
-        guard fresh != events else { return }
-        events = fresh
-        onChange?(fresh)
+        guard let token = gate.begin() else { return }              // a query is running: it will run once more when it ends
+        // The synchronous EventKit query (it can take a while on big calendars) runs off the main thread, predicate included;
+        // only plain CalendarEvent values come back, and they are applied on main unless stop() overtook this query.
+        queryQueue.async { [store] in
+            let now = Date()
+            let predicate = store.predicateForEvents(withStart: now.addingTimeInterval(-3600), end: now.addingTimeInterval(24 * 3600), calendars: nil)
+            let fresh = store.events(matching: predicate).compactMap { Self.convert($0) }
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                let verdict = self.gate.finish(token)
+                if verdict.apply, self.started, fresh != self.events {
+                    self.events = fresh
+                    self.onChange?(fresh)
+                }
+                if verdict.rerun, self.started { self.refresh() }
+            }
+        }
     }
 
     /// Cancelled events and ones you declined are not worth a place on the island.

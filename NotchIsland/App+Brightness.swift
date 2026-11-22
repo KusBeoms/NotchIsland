@@ -34,13 +34,50 @@ extension App {
             dropSince = now; recoveredSince = nil; holdAutoBrightness()
             return
         }
-        lightBase = lightBase * 0.98 + lux * 0.02
+        lightBase = SensorSmoothing.blend(lightBase, lux, dt: sensorDt)
         if now.timeIntervalSince(lastBrightnessRead) > 0.5 { lastBrightnessRead = now; lastBrightness = SystemLevels.brightness() ?? lastBrightness }
+    }
+    /// The light sensor is no longer wanted: forget the cover that was in progress (no gesture runs), the averages, and the
+    /// brightness hold.
+    func resetSensorState() {
+        lux = -1; darkLatched = false
+        dropSince = nil; recoveredSince = nil
+        lightBase = -1; ambient = -1
+        lastSensorSample = 0; lastSensorReading = 0
+        sensorRecognizer.cancel()                  // not `sensorTouchEnded()`: that would turn the lifted finger into a tap
+        pressing = false
+        releaseAutoBrightness()
     }
     func releaseAutoBrightness() {
         guard autoBrightnessHeld || UserDefaults.standard.bool(forKey: Self.autoBrightnessHeldKey) else { return }
         autoBrightnessHeld = false
         if SystemLevels.setAutoBrightness(true) { UserDefaults.standard.removeObject(forKey: Self.autoBrightnessHeldKey) }
     }
-    func applicationWillTerminate(_ n: Notification) { releaseAutoBrightness() }
+    func applicationWillTerminate(_ n: Notification) { releaseAutoBrightness(); saveTimerIfChanged(); unwatchMirroring() }
+
+    // MARK: the timer outlives the app (see TimerSnapshot)
+
+    /// Writes the timer to the preferences when it differs from what is stored. A running timer's snapshot only changes when the
+    /// user acts on it, so this is cheap to call every second.
+    func saveTimerIfChanged() {
+        guard CommandLine.arguments.count == 1 else { return }            // demo / test runs never touch the saved timer
+        let now = timer.snapshot()
+        if let a = now, let b = savedTimer, a.sameState(as: b) { return }
+        if now == nil && savedTimer == nil { return }
+        savedTimer = now
+        TimerSnapshot.save(now, to: Settings.store)
+    }
+
+    /// At launch: a timer that was counting comes back; one that ran out meanwhile comes back finished and says so.
+    func restoreTimer() {
+        guard CommandLine.arguments.count == 1, !demoTimer, let s = TimerSnapshot.load(Settings.store) else { return }
+        savedTimer = s
+        if timer.restore(s) {                          // true only when it ran out while the app was away (once: the stored copy is rewritten as stopped)
+            let what = s.pomodoroPhase != nil ? "포모도로" : "타이머"
+            whenQuiet { [weak self] in
+                guard let s = self, s.timer.finished, !s.timer.running else { return false }
+                s.showAlert("\(what)가 끝났습니다", seconds: 4); return true
+            }
+        }
+    }
 }

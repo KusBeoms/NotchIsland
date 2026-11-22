@@ -283,12 +283,12 @@ final class LyricsWaitView: NSView {
 }
 
 final class LyricsCreditsView: Flip {
-    let label = makeLabel(14, .regular, NSColor(white: 1, alpha: 0.55))
+    let label = makeLabel(14, .regular, NSColor(white: 1, alpha: Tone.secondary))
     init(names: [String]) {
         super.init(frame: .zero)
         let text = names.isEmpty ? "작사 정보 없음" : "작사: " + names.joined(separator: ", ")
         let value = NSMutableAttributedString(string: text, attributes: [.font: NSFont.systemFont(ofSize: 14),
-                                                                        .foregroundColor: NSColor(white: 1, alpha: 0.55)])
+                                                                        .foregroundColor: NSColor(white: 1, alpha: Tone.secondary)])
         if !names.isEmpty { value.addAttribute(.font, value: NSFont.systemFont(ofSize: 14, weight: .semibold), range: NSRange(location: 0, length: 3)) }
         label.attributedStringValue = value
         label.maximumNumberOfLines = 2; label.lineBreakMode = .byWordWrapping; label.cell?.wraps = true
@@ -307,7 +307,7 @@ final class LyricsCreditsView: Flip {
 /// Text stays at a fixed width; only the viewport moves. No NSView frame animations can be cancelled by layout.
 final class LyricsPanelView: Flip {
     private let title = makeLabel(14, .medium, .white)
-    private let detail = makeLabel(12, .medium, NSColor(white: 1, alpha: 0.45))
+    private let detail = makeLabel(12, .medium, NSColor(white: 1, alpha: Tone.secondary))
     private let fullTextScroll = NSScrollView()
     private let fullText = NSTextView()
     let readingButton = NSButton(title: "전문 보기", target: nil, action: nil)

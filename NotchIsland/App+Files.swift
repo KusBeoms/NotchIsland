@@ -54,10 +54,17 @@ extension App {
         if case .file(let u)? = kindAtMouse() { return u }
         return nil
     }
-    func cancelPress() { longPressTimer?.invalidate(); longPressTimer = nil; pressing = false }
+    /// Ends everything a press (pointer or sensor) had under way, so a release afterwards acts on nothing.
+    func cancelPress() {
+        longPressTimer?.invalidate(); longPressTimer = nil
+        pressing = false; pressedWhileExpanded = false; lyricsHoldFired = false
+        popUntil = .distantPast
+        sensorRecognizer.cancel()
+    }
 
     /// Called every frame: is a file drag (from Finder...) in progress, and is it near the notch?
     func trackFileDrag(_ m: NSPoint) {
+        if islandSuppressed { dragActive = false; dragEntered = false; dragNear = false; return }     // no drop target while hidden
         let down = NSEvent.pressedMouseButtons & 1 != 0
         if down && !wasBtn { downChange = NSPasteboard(name: .drag).changeCount; dragActive = false }
         if down, !dragActive {                          // the drag pasteboard is only looked at while the button is held

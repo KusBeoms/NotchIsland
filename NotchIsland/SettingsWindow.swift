@@ -1,4 +1,5 @@
 import AppKit
+import ServiceManagement
 
 // MARK: - Settings window
 
@@ -19,6 +20,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         (Settings.Key.privacy, "마이크·카메라 사용 중 표시"),
         (Settings.Key.downloads, "다운로드 진행률 표시"),
         (Settings.Key.zeroVolume, "출력 장치를 바꾸면 볼륨을 0으로"),
+        (Settings.Key.hideMirroring, "화면 미러링 중에는 섬 숨기기"),
+        (Settings.Key.muteMirroring, "화면 미러링 중에는 알림음 끄기"),
     ]
     private static let steppers: [(key: String, title: String)] = [
         (Settings.Key.pomodoroWork, "집중"),
@@ -109,7 +112,19 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         let row = NSStackView(views: [status, check])
         row.orientation = .horizontal; row.spacing = 8
         stack.addArrangedSubview(row)
-        stack.addArrangedSubview(note("내려받은 새 버전은 앱이 저절로 다시 시작되며 적용됩니다. 타이머·스톱워치를 쓰는 중이면 끝난 뒤로 미룹니다."))
+        stack.addArrangedSubview(note("켜 두면 새 버전을 내려받아, 앱이 쉬는 동안 저절로 다시 시작하며 적용합니다(타이머·스톱워치가 초기화될 때까지 미룹니다).\n꺼 두면 '지금 확인'으로 내려받은 뒤 메뉴에서 직접 다시 시작해야 합니다.\n임시 서명으로 설치한 앱은 서명을 확인할 수 없어 스스로 설치하지 않고, 릴리스 페이지로만 안내합니다."))
+
+        stack.addArrangedSubview(space(6))
+        stack.addArrangedSubview(header("일반"))
+        let login = NSButton(checkboxWithTitle: "로그인할 때 자동으로 실행", target: self, action: #selector(loginToggled(_:)))
+        let look = LoginItemPolicy.checkbox(status: Self.loginStatus, agentPlistExists: Self.installScriptAgentExists)
+        login.state = look.on ? .on : .off
+        login.isEnabled = look.enabled
+        stack.addArrangedSubview(login)
+        if let text = look.note { stack.addArrangedSubview(note(text, indent: true)) }
+        let quit = NSButton(title: "NotchIsland 종료", target: self, action: #selector(quitTapped))
+        quit.controlSize = .small
+        stack.addArrangedSubview(quit)
 
         stack.frame.size = stack.fittingSize
         return stack
@@ -171,6 +186,39 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     }
 
     // MARK: actions
+
+    /// Starts the app at login through the system's own login-item list (visible and removable in System Settings).
+    @objc private func loginToggled(_ sender: NSButton) {
+        func fail(_ detail: String) {
+            sender.state = LoginItemPolicy.registered(Self.loginStatus) ? .on : .off          // show what is really set
+            let alert = NSAlert()
+            alert.messageText = "로그인 항목을 바꾸지 못했습니다"
+            alert.informativeText = detail
+            alert.runModal()
+        }
+        if sender.state == .on {
+            do { try SMAppService.mainApp.register() } catch { fail("앱을 응용 프로그램 폴더로 옮긴 뒤 다시 시도하거나, 시스템 설정 > 일반 > 로그인 항목에서 직접 추가하세요."); return }
+            let status = Self.loginStatus                                                      // success does not mean it is on: ask again
+            if LoginItemPolicy.needsApproval(afterRegister: status) { SMAppService.openSystemSettingsLoginItems() }
+            else if !LoginItemPolicy.registered(status) { fail("시스템이 로그인 항목을 등록하지 않았습니다.") }
+        } else if LoginItemPolicy.shouldUnregister(Self.loginStatus) {
+            do { try SMAppService.mainApp.unregister() } catch { fail("시스템 설정 > 일반 > 로그인 항목에서 직접 끄세요.") }
+        }
+    }
+
+    private static var loginStatus: LoginItemStatus {
+        switch SMAppService.mainApp.status {
+        case .enabled: return .enabled
+        case .requiresApproval: return .requiresApproval
+        case .notFound: return .notFound
+        default: return .notRegistered
+        }
+    }
+    private static var installScriptAgentExists: Bool {
+        FileManager.default.fileExists(atPath: NSHomeDirectory() + "/Library/LaunchAgents/\(UpdateRules.launchdLabel).plist")
+    }
+
+    @objc private func quitTapped() { NSApp.terminate(nil) }
 
     @objc private func toggled(_ sender: NSButton) {
         guard let key = sender.identifier?.rawValue else { return }

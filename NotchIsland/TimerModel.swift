@@ -110,16 +110,105 @@ final class TimerModel {
         return set
     }
 
+    /// nil while nothing is counting (a fresh or reset timer).
+    func snapshot(wallNow: TimeInterval = Date().timeIntervalSince1970) -> TimerSnapshot? {
+        guard started else { return nil }
+        let phase: String? = pomodoro.map { $0.phase == .work ? "work" : $0.phase == .rest ? "rest" : "longRest" }
+        let cfg = pomodoro?.config ?? PomodoroConfig()
+        let sinceStart = running ? max(0, hardwareSeconds() - (startedAt ?? hardwareSeconds())) : 0
+        return TimerSnapshot(isCountdown: mode == .countdown, running: running, target: target, accumulated: accumulated,
+                             startedWall: running ? wallNow - sinceStart : nil, pomodoroPhase: phase,
+                             pomodoroCycle: pomodoro?.cycle ?? 1, pomodoroConfig: [cfg.work, cfg.rest, cfg.longRest, cfg.longEvery])
+    }
+
+    /// Puts a stored timer back. Returns true when it ran out while the app was away (it was running when stored): a countdown that is over
+    /// comes back as a finished one (stopped, showing 00:00), never as a running one, and its Pomodoro set ends.
+    @discardableResult
+    func restore(_ s: TimerSnapshot, wallNow: TimeInterval = Date().timeIntervalSince1970) -> Bool {
+        guard s.isSane(wallNow: wallNow) else { return false }
+        reset()
+        mode = s.isCountdown ? .countdown : .stopwatch
+        target = s.target
+        let elapsed = s.elapsed(at: wallNow)
+        if s.isFinished(at: wallNow) {
+            accumulated = max(elapsed, target); running = false; startedAt = nil
+            return s.running                           // news only when it ran out while away; a copy that was already finished is not announced again
+        }
+        accumulated = elapsed
+        if s.running { running = true; startedAt = hardwareSeconds() } else { running = false; startedAt = nil }
+        if s.isCountdown, let phase = s.pomodoroPhase {
+            let c = s.pomodoroConfig
+            var set = PomodoroState(config: PomodoroConfig(work: c[0], rest: c[1], longRest: c[2], longEvery: c[3]))
+            set.phase = phase == "rest" ? .rest : phase == "longRest" ? .longRest : .work
+            set.cycle = min(max(1, s.pomodoroCycle), c[3])
+            pomodoro = set
+        }
+        return false
+    }
+
     static func format(_ t: TimeInterval, roundUp: Bool) -> String {
-        let s = Int(t.rounded(roundUp ? .up : .down))
+        let s = Int((t.isFinite ? min(max(t, 0), 1e9) : 0).rounded(roundUp ? .up : .down))     // never traps on a huge or NaN value
         return s >= 3600 ? String(format: "%d:%02d:%02d", s / 3600, (s / 60) % 60, s % 60)
                          : String(format: "%02d:%02d", s / 60, s % 60)
     }
     func text() -> String { TimerModel.format(display, roundUp: mode == .countdown) }
 }
 
+// MARK: - Surviving a restart
+
+/// What is written to the preferences so a timer or stopwatch outlives the app (a quit, a crash, an update restart).
+/// The hardware counter restarts with the Mac, so across launches the wall clock is the only reference: a running timer
+/// keeps the wall-clock time it was started at. Pure value type: restoring is tested without clocks or files.
+struct TimerSnapshot: Codable, Equatable {
+    var isCountdown: Bool
+    var running: Bool
+    var target: TimeInterval
+    var accumulated: TimeInterval          // time counted before the current run (all of it while paused)
+    var startedWall: TimeInterval?         // epoch seconds when the current run began (nil while paused)
+    var pomodoroPhase: String?             // "work" / "rest" / "longRest"; nil = no Pomodoro set
+    var pomodoroCycle = 1
+    var pomodoroConfig = [25, 5, 15, 4]    // work, rest, longRest, longEvery
+
+    /// Counted time at `wallNow`. A clock that moved backwards never subtracts time.
+    func elapsed(at wallNow: TimeInterval) -> TimeInterval {
+        min(Self.maxElapsed, accumulated + (running ? max(0, wallNow - (startedWall ?? wallNow)) : 0))
+    }
+    func isFinished(at wallNow: TimeInterval) -> Bool { isCountdown && elapsed(at: wallNow) >= target }
+
+    static let maxTarget: TimeInterval = 100 * 3600                // a countdown of more than 100 hours is not a real one
+    static let maxElapsed: TimeInterval = 100 * 24 * 3600          // nor is a stopwatch that ran for more than 100 days
+
+    /// Values a real timer can hold; anything else in the preferences is ignored. `wallNow` bounds the start time: it
+    /// cannot be older than a year, nor (beyond a clock adjustment) in the future.
+    func isSane(wallNow: TimeInterval = Date().timeIntervalSince1970) -> Bool {
+        guard target.isFinite, accumulated.isFinite, accumulated >= 0, accumulated <= Self.maxElapsed,
+              target > 0, target <= Self.maxTarget,
+              pomodoroConfig.count == 4, pomodoroConfig.allSatisfy({ $0 >= 1 && $0 <= 600 }) else { return false }
+        if let w = startedWall {
+            guard w.isFinite, w >= wallNow - 366 * 24 * 3600, w <= wallNow + 600 else { return false }
+        } else if running { return false }                         // a running timer without a start time cannot be resumed
+        return true
+    }
+
+    /// Equal apart from the start time's float jitter: decides whether the stored copy is out of date.
+    func sameState(as other: TimerSnapshot) -> Bool {
+        var a = self, b = other
+        if let x = a.startedWall, let y = b.startedWall, abs(x - y) < 2 { a.startedWall = y }
+        return a == b
+    }
+
+    static let key = "timerSnapshot"
+    static func load(_ store: UserDefaults) -> TimerSnapshot? {
+        guard let data = store.data(forKey: key), let s = try? JSONDecoder().decode(TimerSnapshot.self, from: data), s.isSane() else { return nil }
+        return s
+    }
+    static func save(_ s: TimerSnapshot?, to store: UserDefaults) {
+        if let s, let data = try? JSONEncoder().encode(s) { store.set(data, forKey: key) } else { store.removeObject(forKey: key) }
+    }
+}
+
 func mmss(_ t: TimeInterval) -> String {
-    let s = max(0, Int(t.rounded(.down)))
+    let s = Int((t.isFinite ? min(max(t, 0), 1e9) : 0).rounded(.down))
     return String(format: "%d:%02d", s / 60, s % 60)
 }
 

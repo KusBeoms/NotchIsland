@@ -11,13 +11,20 @@ import IOKit.ps
 class FileDragView: NSView, NSDraggingSource {
     var fileForDrag: ((NSEvent) -> URL?)?
     var onDragBegan: (() -> Void)?
+    var onPressMoved: (() -> Void)?
     var onDragFinished: ((URL, Bool) -> Void)?
     var downPoint: NSPoint?
     private var draggingURL: URL?
 
+    /// How far the pointer may wander during a press before it counts as a drag, not a tap or a hold.
+    static let dragThreshold: CGFloat = 4
+
     override func mouseDragged(with event: NSEvent) {
-        guard draggingURL == nil, let d = downPoint, hypot(event.locationInWindow.x - d.x, event.locationInWindow.y - d.y) > 4,
-              let u = fileForDrag?(event) else { return }
+        guard draggingURL == nil, let d = downPoint, hypot(event.locationInWindow.x - d.x, event.locationInWindow.y - d.y) > Self.dragThreshold else { return }
+        guard let u = fileForDrag?(event) else {
+            downPoint = nil; onPressMoved?()                  // dragging, but not a file: the press can no longer become a tap or a long press
+            return
+        }
         downPoint = nil; draggingURL = u
         onDragBegan?()
         let item = NSDraggingItem(pasteboardWriter: u as NSURL)
@@ -166,6 +173,15 @@ final class Content: Flip {
     var rightSize = CGSize(width: 24, height: 24)
     var bannerSymbol = ""
     var fileShown: URL?
+    static let dimmedAlpha: CGFloat = 0.35                  // a disabled button that is otherwise shown (file gone: Reveal is off)
+    /// Enables / disables "Reveal in Finder" and keeps its dimming in step with the fade logic below, which would otherwise
+    /// overwrite a dim set directly (the next visibility pass animates the alpha back to 1).
+    func setRevealEnabled(_ enabled: Bool) {
+        fRevealB.isEnabled = enabled
+        let key = ObjectIdentifier(fRevealB)
+        if let shown = lastAlpha[key], shown > 0 { let a = enabled ? 1 : Self.dimmedAlpha; lastAlpha[key] = a; fRevealB.alphaValue = a }
+    }
+    private var lastVisibilityBody: Body?                 // the body the last `applyVisibility` showed
     var leftSize = CGSize(width: 24, height: 24)
     private var lastAlpha: [ObjectIdentifier: CGFloat] = [:]
 
@@ -197,11 +213,11 @@ final class Content: Flip {
     // media body
     let art = ArtView(radius: 10)
     let titleL = makeLabel(15, .semibold, .white)
-    let artistL = makeLabel(14, .regular, NSColor(white: 1, alpha: 0.55))
+    let artistL = makeLabel(14, .regular, NSColor(white: 1, alpha: Tone.secondary))
     let bodyEq = EqView()
     let progress = ProgressBar()
-    let elapsedL = makeLabel(11, .medium, NSColor(white: 1, alpha: 0.5), mono: true)
-    let remainL = makeLabel(11, .medium, NSColor(white: 1, alpha: 0.5), mono: true, align: .right)
+    let elapsedL = makeLabel(11, .medium, NSColor(white: 1, alpha: Tone.secondary), mono: true)
+    let remainL = makeLabel(11, .medium, NSColor(white: 1, alpha: Tone.secondary), mono: true, align: .right)
     let prevB = makeSymbolButton("backward.fill", 24, .white)
     let playB = makeSymbolButton("pause.fill", 30, .white)
     let nextB = makeSymbolButton("forward.fill", 24, .white)
@@ -228,14 +244,14 @@ final class Content: Flip {
     let alertL = makeLabel(15, .semibold, .white, align: .center)
     // file body: the file's icon, name and where it lives; buttons to show it in Finder / let it go
     let fIcon = FilePreviewView()
-    let fName = makeLabel(15, .semibold, .white)
-    let fSub = makeLabel(12, .regular, NSColor(white: 1, alpha: 0.55))
+    let fName: NSTextField = { let l = makeLabel(15, .semibold, .white); l.lineBreakMode = .byTruncatingMiddle; return l }()     // keeps the extension visible
+    let fSub = makeLabel(12, .regular, NSColor(white: 1, alpha: Tone.secondary))
     let fRevealB = makeSymbolButton("magnifyingglass", 15, .white)
     let fRemoveB = makeSymbolButton("xmark", 14, .white)
     // info body (see `Body.info`)
     let iIcon = NSImageView()
     let iTitle = makeLabel(15, .semibold, .white)
-    let iSub = makeLabel(12, .regular, NSColor(white: 1, alpha: 0.55))
+    let iSub = makeLabel(12, .regular, NSColor(white: 1, alpha: Tone.secondary))
     let iTrail = makeLabel(18, .semibold, .white, mono: true, align: .right)
     let iBar = ThinBar()
     var infoShowsBar = false
@@ -391,13 +407,17 @@ final class Content: Flip {
             (iIcon, expanded && b == .info), (iTitle, expanded && b == .info), (iSub, expanded && b == .info),
             (iTrail, expanded && b == .info), (iBar, expanded && b == .info && infoShowsBar),
         ]
+        // When one card replaces another only the incoming views fade in; the outgoing ones leave at once. Fading both at the
+        // same time shows two half-transparent cards over each other, which reads as a flash.
+        let swapping = lastVisibilityBody != nil && lastVisibilityBody != b && want.contains { $0.1 }
+        lastVisibilityBody = b
         for (v, on) in want {
-            let a: CGFloat = on ? 1 : 0
+            let a: CGFloat = on ? (v === fRevealB && !fRevealB.isEnabled ? Self.dimmedAlpha : 1) : 0
             let key = ObjectIdentifier(v)
             if lastAlpha[key] == a { continue }
             lastAlpha[key] = a
             NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : (on ? 0.22 : (ending ? 0.3 : 0.16))
+                ctx.duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : (on ? 0.22 : (swapping ? 0 : (ending ? 0.3 : 0.16)))
                 ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
                 v.animator().alphaValue = a
             }

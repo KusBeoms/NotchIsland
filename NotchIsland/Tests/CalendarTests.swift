@@ -54,6 +54,41 @@ struct CalendarTests {
         alerted.insert("m")
         assert(!CalendarRules.shouldAlert(m, now: now, alerted: alerted))
         assert(CalendarRules.shouldAlert(ev("other", 3, 30), now: now, alerted: alerted))
+        // a queued alert is dropped once the event has started
+        assert(CalendarRules.alertStillUseful(ev("soon", 3, 30), now: now) && !CalendarRules.alertStillUseful(ev("started", -1, 30), now: now))
+
+        // one query at a time: a burst of changes owes exactly one more run
+        var gate = CalendarRefreshGate()
+        let t1 = gate.begin()!
+        assert(gate.begin() == nil && gate.begin() == nil && gate.begin() == nil)       // piled-up change notifications
+        let r1 = gate.finish(t1)
+        assert(r1.apply && r1.rerun)                                                      // the first result is used, one rerun follows
+        let t2 = gate.begin()!
+        let r2 = gate.finish(t2)
+        assert(r2.apply && !r2.rerun && t2 > t1)                                          // nothing arrived meanwhile: done
+        // a result after stop() is dropped, and stop() while idle changes nothing
+        let t3 = gate.begin()!
+        gate.stop()
+        let voided = gate.finish(t3)
+        assert(!voided.apply && !voided.rerun)
+        var idleGate = CalendarRefreshGate(); idleGate.stop()
+        assert(idleGate.begin() != nil)
+        // stop + start while an old query is still out: the old result is void and does not block the new query
+        var g2 = CalendarRefreshGate()
+        let oldTok = g2.begin()!
+        g2.stop()
+        let newTok = g2.begin()!
+        assert(g2.begin() == nil)                                                         // the new query is running; one rerun owed
+        let oldDone = g2.finish(oldTok)
+        assert(!oldDone.apply && !oldDone.rerun)
+        assert(g2.begin() == nil)                                                         // finishing the void query did not free b's slot
+        let newDone = g2.finish(newTok)
+        assert(newDone.apply && newDone.rerun)
+        // results never go backwards
+        var g3 = CalendarRefreshGate()
+        let x = g3.begin()!; _ = g3.finish(x)
+        assert(!g3.finish(x).apply)
+
         print("Calendar event selection, texts and alert rule checks passed")
     }
 }

@@ -268,3 +268,163 @@ assert(!noMediaApp.pinned)                                                      
 Settings.sensorGestureMap = [:]
 
 print("Sensor gesture app wiring checks passed")
+
+// A system-started alert waits while the user is busy, then shows; a finished timer does not pop the card open under the user's hands
+let quietApp = makeTestApp()
+var shown = 0
+quietApp.inputIdleSeconds = { 0.4 }
+quietApp.whenQuiet { shown += 1; return true }
+quietApp.runDeferredAlerts()
+assert(shown == 0 && quietApp.deferredAlerts.count == 1)
+quietApp.inputIdleSeconds = { 5 }
+quietApp.runDeferredAlerts()
+assert(shown == 1 && quietApp.deferredAlerts.isEmpty)
+quietApp.whenQuiet { shown += 1; return true }
+assert(shown == 2)                                                     // idle already: at once
+let busyTimerApp = makeTestApp()
+busyTimerApp.inputIdleSeconds = { 0.2 }
+busyTimerApp.timer.startCountdown(minutes: 1); busyTimerApp.timer.target = 0
+busyTimerApp.syncActivities()
+busyTimerApp.step()
+assert(busyTimerApp.timer.finished && !busyTimerApp.timer.running && !busyTimerApp.pinned && busyTimerApp.deferredAlerts.count == 1)
+busyTimerApp.inputIdleSeconds = { 9 }
+busyTimerApp.step()
+assert(busyTimerApp.pinned && busyTimerApp.selected == .timer)
+print("Deferred alert checks passed")
+
+// Dragging the pointer past the threshold while pressing ends the long-press: it does not open the island half a second later
+let dragApp = makeTestApp()
+dragApp.timer.startStopwatch(); dragApp.syncActivities()
+dragApp.pressBegan()
+assert(dragApp.pressing && dragApp.longPressTimer != nil)
+dragApp.view.onPressMoved = { [weak dragApp] in dragApp?.pressMoved() }
+dragApp.view.onPressMoved?()
+assert(!dragApp.pressing && dragApp.longPressTimer == nil)
+dragApp.pressEnded(inside: true)
+assert(!dragApp.pinned)                                                // not a tap either
+assert(FileDragView.dragThreshold == 4)
+print("Press drag threshold checks passed")
+
+// A4: switching every gesture off and on again leaves no stale cover behind (no phantom hold, no tap)
+Settings.sensorGestureMap = [:]
+let resetApp = makeTestApp()
+resetApp.lightBase = 400; resetApp.ambient = 400; resetApp.darkLatched = true; resetApp.lux = 1; resetApp.dropSince = Date()
+_ = resetApp.sensorRecognizer.down(at: hardwareSeconds(), context: .closed, map: SensorGestureMap())
+resetApp.pressing = true
+resetApp.resetSensorState()
+assert(!resetApp.darkLatched && resetApp.lux == -1 && resetApp.dropSince == nil && resetApp.recoveredSince == nil)
+assert(resetApp.lightBase == -1 && resetApp.ambient == -1 && resetApp.sensorRecognizer.isIdle && !resetApp.pressing)
+resetApp.timer.startStopwatch(); resetApp.syncActivities()
+sensorSpin(0.6, resetApp)
+assert(!resetApp.pinned)                                                                  // the cancelled cover never matures into an open
+
+// A5: queued alerts re-check the state, run one at a time and in order
+let queueApp = makeTestApp()
+var order: [Int] = []
+queueApp.inputIdleSeconds = { 0 }
+queueApp.whenQuiet { order.append(1); return true }
+queueApp.whenQuiet { order.append(2); return true }
+queueApp.whenQuiet { order.append(3); return false }                                       // stale: dropped without showing
+queueApp.whenQuiet { order.append(4); return true }
+assert(order.isEmpty && queueApp.deferredAlerts.count == 4)
+queueApp.inputIdleSeconds = { 10 }
+queueApp.runDeferredAlerts()
+assert(order == [1] && queueApp.deferredAlerts.count == 3)                                  // one per pass
+queueApp.alertText = "on screen"; queueApp.alertUntil = Date().addingTimeInterval(5)
+queueApp.runDeferredAlerts()
+assert(order == [1])                                                                       // waits while an alert is showing
+queueApp.alertText = nil
+queueApp.runDeferredAlerts()
+assert(order == [1, 2] && queueApp.deferredAlerts.count == 2)
+queueApp.runDeferredAlerts()
+assert(order == [1, 2, 3, 4] && queueApp.deferredAlerts.isEmpty)                            // the stale one is skipped on the spot
+// a finished timer that was restarted before its turn is not announced
+let staleApp = makeTestApp()
+staleApp.inputIdleSeconds = { 0 }
+staleApp.timer.startCountdown(minutes: 1); staleApp.timer.target = 0
+staleApp.syncActivities(); staleApp.step()
+assert(staleApp.deferredAlerts.count == 1 && staleApp.timer.finished)
+staleApp.timer.reset()                                                                     // cancelled meanwhile
+staleApp.inputIdleSeconds = { 10 }
+staleApp.step()
+assert(staleApp.deferredAlerts.isEmpty && !staleApp.pinned && staleApp.selected == nil)
+// A9: cancelling a press also drops the sensor's pending touch and the pop-out
+let cancelApp = makeTestApp()
+cancelApp.timer.startStopwatch(); cancelApp.syncActivities()
+_ = cancelApp.sensorRecognizer.down(at: hardwareSeconds(), context: .closed, map: SensorGestureMap())
+cancelApp.popUntil = Date().addingTimeInterval(5); cancelApp.lyricsHoldFired = true
+cancelApp.cancelPress()
+assert(cancelApp.sensorRecognizer.isIdle && cancelApp.popUntil <= Date() && !cancelApp.lyricsHoldFired)
+print("Sensor reset, queued alert and press cancel checks passed")
+
+// B: mirroring the built-in display takes the island off screen and back; its state keeps running and nothing shows meanwhile
+Settings.sensorGestureMap = [:]
+let mirroredList = [DisplayMirrorInfo(id: 1, isBuiltin: true, inMirrorSet: true, mirrorsDisplay: 0), DisplayMirrorInfo(id: 2, isBuiltin: false, inMirrorSet: true, mirrorsDisplay: 1)]
+let plainList = [DisplayMirrorInfo(id: 1, isBuiltin: true, inMirrorSet: false, mirrorsDisplay: 0)]
+let mirrorApp = makeTestApp()
+mirrorApp.timer.startStopwatch(); mirrorApp.syncActivities()
+mirrorApp.selected = .timer; mirrorApp.pinned = true; mirrorApp.shape = .expanded
+mirrorApp.mirrorInfo = { mirroredList }
+mirrorApp.pressing = true; mirrorApp.dragActive = true; mirrorApp.hudUntil = Date().addingTimeInterval(5)
+mirrorApp.applyMirroring()
+assert(mirrorApp.mirrorHidden && mirrorApp.windowsHidden && !mirrorApp.panel.isVisible)
+assert(!mirrorApp.pressing && !mirrorApp.dragActive && mirrorApp.hudUntil <= Date())
+assert(mirrorApp.desiredShape() == .collapsed && mirrorApp.pinned)                         // nothing is drawn, the pinned card is remembered
+assert(!mirrorApp.stepNeedsFullRate)                                                       // no 60 Hz loop for an invisible island
+assert(!mirrorApp.handleMediaKey(0, true, false))                                           // volume keys go to the system (and its HUD)
+mirrorApp.showBanner(.battery(title: "x", level: 80, color: .white)); assert(mirrorApp.banner == nil)
+mirrorApp.trackFileDrag(NSPoint(x: 0, y: 0)); assert(!mirrorApp.dragActive && !mirrorApp.dragNear)
+mirrorApp.showAlert("hidden", seconds: 3)
+assert(mirrorApp.alertText == nil)                                                          // no alert for an invisible island
+mirrorApp.inputIdleSeconds = { 0 }
+mirrorApp.whenQuiet { true }
+assert(mirrorApp.deferredAlerts.count == 1)                                                 // queued until it is back
+mirrorApp.deferredAlerts[0].since = .distantPast
+mirrorApp.runDeferredAlerts()
+assert(mirrorApp.deferredAlerts.count == 1 && mirrorApp.timer.running)                      // the timer itself keeps running
+// a list that cannot be read keeps the state (no flash of the island)
+mirrorApp.mirrorInfo = { nil }; mirrorApp.applyMirroring()
+assert(mirrorApp.mirrorHidden && mirrorApp.windowsHidden)
+mirrorApp.mirrorInfo = { [] }; mirrorApp.applyMirroring()
+assert(mirrorApp.mirrorHidden)
+// switching the setting off brings it back at once, through settingsChanged
+mirrorApp.mirrorInfo = { mirroredList }
+Settings.setBool(Settings.Key.hideMirroring, false)
+mirrorApp.settingsChanged()
+assert(!mirrorApp.mirrorHidden && !mirrorApp.windowsHidden)
+assert(mirrorApp.deferredAlerts[0].since > Date().addingTimeInterval(-5))                   // the wait starts when it is visible again
+mirrorApp.runDeferredAlerts()
+assert(mirrorApp.deferredAlerts.count == 1)                                                 // the user is typing: not shown the instant it returns
+mirrorApp.inputIdleSeconds = { 10 }
+mirrorApp.runDeferredAlerts()
+assert(mirrorApp.deferredAlerts.isEmpty)
+Settings.setBool(Settings.Key.hideMirroring, true)
+mirrorApp.mirrorInfo = { plainList }
+mirrorApp.applyMirroring()
+assert(!mirrorApp.mirrorHidden)
+// the lock state is asked from the session, not from the notice; a locked screen hides the windows too
+let screenLockApp = makeTestApp()
+screenLockApp.lockProbe = { true }
+screenLockApp.applyLockState()
+assert(screenLockApp.screenLocked && screenLockApp.windowsHidden && screenLockApp.islandSuppressed)
+screenLockApp.lockProbe = { false }
+screenLockApp.applyLockState()
+assert(!screenLockApp.screenLocked && !screenLockApp.windowsHidden)
+// queued alerts are capped
+let alertCapApp = makeTestApp()
+alertCapApp.inputIdleSeconds = { 0 }
+for _ in 0..<9 { alertCapApp.whenQuiet { true } }
+assert(alertCapApp.deferredAlerts.count == 5)
+// every gesture off (or the island hidden): the sensor is dropped, even with the test light value in place
+Settings.sensorGestureMap = [:]
+let sensorOffApp = makeTestApp()
+sensorOffApp.step()
+assert(sensorOffApp.sensorWasOn && sensorOffApp.lux == 1000)
+var allOff: [String: String] = [:]
+for c in SensorContext.allCases { for g in SensorGesture.allCases { allOff[SensorGestureMap.key(c, g)] = SensorAction.none.rawValue } }
+Settings.sensorGestureMap = allOff
+sensorOffApp.tSensorConfig = 0
+sensorOffApp.step()
+assert(!sensorOffApp.sensorWasOn && sensorOffApp.lux == -1 && !sensorOffApp.darkLatched)
+Settings.sensorGestureMap = [:]
+print("Mirroring checks passed")

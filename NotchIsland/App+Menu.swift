@@ -82,7 +82,7 @@ extension App {
 
     func activityName(_ kind: ActKind) -> String {
         switch kind {
-        case .media: return "미디어: \(media?.title ?? "재생 중")"
+        case .media: return "미디어: \(TextClip.tail(media?.title ?? "재생 중", limit: 40))"
         case .timer:
             if let set = timer.pomodoro { return "포모도로 \(set.label): \(timer.text())" }
             return timer.finished ? "타이머 완료" : "타이머: \(timer.text())"
@@ -92,15 +92,16 @@ extension App {
         case .privacy: return privacy.subtitle.isEmpty ? privacy.title : "\(privacy.title): \(privacy.subtitle)"
         case .transfer(let id):
             guard let t = transferMonitor.transfers.first(where: { $0.id == id }) else { return "전송" }
-            return "\(TransferRules.operationLabel(t.operation)): \(t.name) \(TransferRules.percentText(t.fraction))"
+            return "\(TransferRules.operationLabel(t.operation)): \(TextClip.middle(t.name, limit: 36)) \(TransferRules.percentText(t.fraction))"
         case .calendar:
             guard let e = featuredEvent else { return "일정" }
-            return "일정: \(e.title) (\(CalendarRules.trail(e, now: Date())))"
-        case .file(let url): return "파일: \(url.lastPathComponent)"
+            return "일정: \(TextClip.tail(e.title, limit: 40)) (\(CalendarRules.trail(e, now: Date())))"
+        case .file(let url): return "파일: \(TextClip.middle(url.lastPathComponent, limit: 36))"
         }
     }
 
     @objc func menuToggleIsland() {
+        guard !islandSuppressed else { return }
         if pinned || hudActive {
             guard dismissIsland(clearHUD: true) else { return }      // locked: Cmd+. does not close it
             selected = nil
@@ -152,6 +153,7 @@ extension App {
 
     /// Starts or stops what a setting switched on or off. Called at launch and after every change in the settings window.
     @objc func settingsChanged() {
+        applyMirroring()                              // "hide while mirroring" takes effect at once
         applyPrivacySetting()
         applyCalendarSetting()
         applyTransferSetting()

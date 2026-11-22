@@ -11,19 +11,36 @@ extension App {
 
     /// Display plugged / unplugged, resolution or arrangement changed: follow the notch screen and rebuild what is tied to it.
     func watchScreens() {
+        // The session lock: while it is on, the island stays quiet; whatever was queued is shown (if still true) after unlocking.
+        let dnc = DistributedNotificationCenter.default()
+        // The notices are only a hint (any process can post them): the state itself is asked from the session, right away and
+        // once more shortly after (the session dictionary can lag behind the notice).
+        for n in ["com.apple.screenIsLocked", "com.apple.screenIsUnlocked"] {
+            dnc.addObserver(forName: NSNotification.Name(n), object: nil, queue: .main) { [weak self] _ in
+                self?.applyLockState()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self?.applyLockState() }
+            }
+        }
+        // A volume that comes or goes (an ejected disk or stick): the file cards re-check whether their file is still there.
+        for n in [NSWorkspace.didMountNotification, NSWorkspace.didUnmountNotification] {
+            NSWorkspace.shared.notificationCenter.addObserver(forName: n, object: nil, queue: .main) { [weak self] _ in
+                guard let s = self else { return }
+                s.fileInfo.removeAll(); s.c.fileShown = nil; s.refreshUI()
+            }
+        }
+        // Entering / leaving Mission Control switches the active space: look at once instead of waiting for the next poll.
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.checkMissionControl(forced: true)
+        }
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
             guard let s = self else { return }
-            let ns = App.pickScreen()
-            s.screen = ns
-            s.view.content.notchH = s.notchH
-            s.link?.invalidate()
-            s.link = ns.displayLink(target: s, selector: #selector(App.animTick(_:)))
-            s.link?.add(to: .main, forMode: .common)
-            s.link?.isPaused = false
-            let r = s.frame(for: s.shape)
-            s.mainP.x.jump(r.minX); s.mainP.w.jump(r.width); s.mainP.h.jump(r.height)
-            s.mainP.x.tgt = r.minX; s.mainP.w.tgt = r.width; s.mainP.h.tgt = r.height
-            s.atRest = false
+            // The screen under the island changed: whatever the pointer or a drag was doing there is void, and the lock outline
+            // (drawn for the old geometry) is rebuilt for the new one.
+            s.cancelPress(); s.dragActive = false; s.dragEntered = false; s.dragNear = false
+            s.lockBorderGeometry = nil
+            s.followScreen()
+            s.applyMirroring()
+            s.updateLockBorder()
             s.refreshUI()
         }
     }
@@ -32,7 +49,7 @@ extension App {
 
     func watchEscape() {
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
-            guard let s = self, NSApp.modalWindow == nil else { return e }
+            guard let s = self, NSApp.modalWindow == nil, !s.islandSuppressed else { return e }
             if e.keyCode == 53 && (s.pinned || s.hudActive), s.dismissIsland(clearHUD: true) {
                 s.releaseKeyboardFocus(); return nil
             }

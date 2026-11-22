@@ -10,7 +10,7 @@ extension App {
         updater.onChange = { [weak self] in self?.settingsWindow.refreshUpdateStatus() }
         updater.onManualResult = { [weak self] state in self?.announceCheckResult(state) }
         settingsWindow.updateStatus = { [weak self] in self?.updater.statusText ?? "" }
-        settingsWindow.onCheckUpdate = { [weak self] in self?.updater.check(manual: true) }
+        settingsWindow.onCheckUpdate = { [weak self] in self?.menuCheckUpdate() }        // same guard as the menu item
         updater.cleanupStaging()
         applyUpdateSetting()
         announceUpdateIfNew()
@@ -67,7 +67,8 @@ extension App {
     func announceCheckResult(_ state: Updater.State) {
         switch state {
         case .upToDate: showAlert("최신 버전입니다 (v\(updater.currentVersion))", seconds: 3)
-        case .ready(let v): showAlert("v\(v) 준비됨 · 메뉴에서 다시 시작하세요", seconds: 4)
+        case .ready(let v):
+            showAlert(updater.autoApply ? "v\(v) 준비됨 · 앱이 쉴 때 자동으로 다시 시작합니다" : "v\(v) 준비됨 · 메뉴에서 다시 시작하세요", seconds: 4)
         case .available(let v): showAlert("새 버전 v\(v)이 있습니다 · 메뉴에서 받을 수 있습니다", seconds: 4)
         case .failed(let message): showAlert("업데이트 확인 실패 · \(message)", seconds: 4)
         case .idle, .checking, .downloading: break

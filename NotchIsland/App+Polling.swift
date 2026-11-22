@@ -46,7 +46,11 @@ extension App {
         let now = Date()
         if Settings.calendarEnabled, let e = featuredEvent, CalendarRules.shouldAlert(e, now: now, alerted: calendarAlerted) {
             calendarAlerted.insert(e.id)
-            showAlert(CalendarRules.alertText(e, now: now), seconds: 5)
+            let id = e.id
+            whenQuiet { [weak self] in                 // the wording ("in 5 minutes") is made when it is shown, from the event as it is then
+                guard let s = self, let e = s.featuredEvent, e.id == id, CalendarRules.alertStillUseful(e, now: Date()) else { return false }
+                s.showAlert(CalendarRules.alertText(e, now: Date()), seconds: 5); return true
+            }
         }
         // an idle, empty island does not redraw by itself: refresh when the activity appears or disappears
         if isActive(.calendar) != actOrder.contains(.calendar) { refreshUI(); applyShape() }

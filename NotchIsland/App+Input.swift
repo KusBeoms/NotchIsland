@@ -70,6 +70,10 @@ extension App {
         longPressTimer = t
     }
 
+    /// The pointer travelled past the drag threshold while pressed: that is a drag, so the long press must not fire later and
+    /// a release afterwards is no tap either. (A file drag starts through `onDragBegan`, which also ends here.)
+    func pressMoved() { cancelPress() }
+
     func pressEnded(inside: Bool) {
         longPressTimer?.invalidate(); longPressTimer = nil
         let wasPressing = pressing

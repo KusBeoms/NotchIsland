@@ -32,11 +32,59 @@ enum UpdateRules {
     static let launchdLabel = "com.kusbeoms.notchisland"            // install.sh's login item
     static let checkInterval: TimeInterval = 6 * 3600
     static let maxDownloadBytes: Int64 = 200_000_000
+    static let maxExtractedBytes: Int64 = 600_000_000               // the unpacked bundle, all files together (zip-bomb guard)
+    static let maxArchiveEntries = 20_000                           // files + folders in the zip (checked before anything is unpacked)
+
+    /// Hosts a request may be redirected to: GitHub itself and the CDN hosts its release downloads are served from.
+    static let allowedRedirectHosts: Set<String> = [
+        "github.com", "api.github.com", "objects.githubusercontent.com",
+        "release-assets.githubusercontent.com", "github-releases.githubusercontent.com",
+    ]
+
+    /// GitHub serves release downloads from changing CDN hosts: exactly one label below one of these domains ("x.githubusercontent.com").
+    static let allowedRedirectDomainSuffixes: [String] = ["githubusercontent.com"]
+    /// Hosts below those domains that serve what users upload (anyone can put a file there): never a release download.
+    static let userContentLabels: Set<String> = ["raw", "gist", "user-images", "private-user-images", "avatars", "camo", "cloud", "media", "repository-images", "uploads"]
+
+    /// Matched label by label: plain ASCII letters, digits and inner hyphens, none empty, so a look-alike made of unusual
+    /// characters, an empty label ("..") or an extra level cannot pass.
+    static func isAllowedHost(_ host: String) -> Bool {
+        if allowedRedirectHosts.contains(host) { return true }
+        let labels = host.split(separator: ".", omittingEmptySubsequences: false).map(String.init)
+        guard labels.count >= 3, !labels.contains(where: { !isPlainLabel($0) }) else { return false }
+        return allowedRedirectDomainSuffixes.contains { domain in
+            let domainLabels = domain.split(separator: ".").map(String.init)
+            return labels.count == domainLabels.count + 1 && Array(labels.suffix(domainLabels.count)) == domainLabels
+                && !userContentLabels.contains(labels[0])
+        }
+    }
+
+    private static func isPlainLabel(_ label: String) -> Bool {
+        !label.isEmpty && label.count <= 63 && !label.hasPrefix("-") && !label.hasSuffix("-") && !label.hasPrefix("xn--")     // no punycode look-alikes
+            && label.utf8.allSatisfy { ($0 >= 0x61 && $0 <= 0x7a) || ($0 >= 0x30 && $0 <= 0x39) || $0 == 0x2d }
+    }
+
+    /// https on the default port, no credentials in the URL.
+    static func isPlainHTTPS(_ url: URL) -> Bool {
+        url.scheme == "https" && (url.port == nil || url.port == 443) && url.user == nil && url.password == nil
+    }
+
+    /// A redirect is followed only over plain HTTPS (default port, no userinfo) to the project host's own hosts
+    /// (`allowedRedirectHosts` and the CDN domains below `allowedRedirectDomainSuffixes`; the main site only matches exactly).
+    static func isAllowedRedirect(_ url: URL?) -> Bool {
+        guard let url, isPlainHTTPS(url), let host = url.host?.lowercased() else { return false }
+        return isAllowedHost(host)
+    }
+
+    /// A 3xx answer reaches the caller as the final response when `UpdateRedirectGuard` refuses the redirect (no error is raised).
+    static func isRefusedRedirect(status: Int?) -> Bool { status.map { (300..<400).contains($0) } ?? false }
+    static let redirectRefusedMessage = "허용되지 않은 주소로 이동하려 했습니다"
 
     static var latestReleaseURL: URL { URL(string: "https://api.github.com/repos/\(repo)/releases/latest")! }
     static var releasesPageURL: URL { URL(string: "https://github.com/\(repo)/releases/latest")! }
 
-    /// "v2.0" / "2.0.1" -> [2, 0, 1]. nil for anything that is not a plain dotted number, so a tag such as
+    /// "v2.0" / "2.0.1" -> [2, 0, 1]. Same shape as build.sh's VERSION rule (no leading zeros; build.sh also wants at least two parts).
+    /// nil for anything that is not a plain dotted number, so a tag such as
     /// "2.0-beta" or "nightly" never counts as an update.
     static func components(_ version: String) -> [Int]? {
         var text = version.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -45,7 +93,7 @@ enum UpdateRules {
         guard (1...4).contains(parts.count) else { return nil }
         var numbers: [Int] = []
         for part in parts {
-            guard !part.isEmpty, part.allSatisfy({ $0.isASCII && $0.isNumber }), let n = Int(part) else { return nil }
+            guard !part.isEmpty, part.allSatisfy({ $0.isASCII && $0.isNumber }), part == "0" || !part.hasPrefix("0"), let n = Int(part) else { return nil }
             numbers.append(n)
         }
         return numbers
@@ -61,7 +109,15 @@ enum UpdateRules {
 
     /// Only the project's own release downloads over HTTPS (GitHub then redirects to its CDN).
     static func isTrustedDownload(_ url: URL) -> Bool {
-        url.scheme == "https" && url.host == "github.com" && url.path.hasPrefix("/\(repo)/releases/download/")
+        // Compared on the raw (still percent-encoded) parts: nothing is decoded behind the check's back, so "%2e%2e", "%2F" or an
+        // encoded host cannot slip past it, and dot segments are refused rather than resolved.
+        guard isPlainHTTPS(url), let parts = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              parts.percentEncodedHost == "github.com" else { return false }
+        let path = parts.percentEncodedPath
+        guard !path.contains("%"), !path.contains("\\") else { return false }
+        let segments = path.split(separator: "/", omittingEmptySubsequences: false)
+        guard !segments.contains(".."), !segments.contains(".") else { return false }
+        return path.hasPrefix("/\(repo)/releases/download/")
     }
 
     /// The release the GitHub API describes, or nil when it is a draft / pre-release, has no plain version tag, or has no usable asset.
@@ -79,6 +135,50 @@ enum UpdateRules {
             if hex.count == 64, hex.allSatisfy({ $0.isHexDigit }) { sha = hex }
         }
         return UpdateRelease(version: numbers.map(String.init).joined(separator: "."), url: url, sha256: sha)
+    }
+}
+
+// MARK: - The zip's table of contents, read before unpacking (pure: takes `zipinfo -l` output). A pre-filter on the zip's claims, not a guarantee.
+
+enum ZipListing {
+    static let maxListingBytes = 16 << 20
+
+    /// Throws unless the listing parses completely and describes a harmless archive: few entries, a small unpacked size,
+    /// no links or special files, no absolute or `..` paths. Anything it cannot read is refused (fail closed).
+    @discardableResult
+    static func validate(_ text: String, maxBytes: Int64 = UpdateRules.maxExtractedBytes, maxEntries: Int = UpdateRules.maxArchiveEntries) throws -> Int64 {
+        let unreadable = UpdateError("압축을 풀 수 없습니다")
+        var declared: Int?
+        var entries = 0
+        var total: Int64 = 0
+        for rawLine in text.split(separator: "\n", omittingEmptySubsequences: true) {
+            let line = String(rawLine)
+            if line.hasPrefix("Archive:") { continue }
+            if line.hasPrefix("Zip file size:") {
+                guard let r = line.range(of: "number of entries: "), let n = Int(line[r.upperBound...].trimmingCharacters(in: .whitespaces)) else { throw unreadable }
+                declared = n
+                if n > maxEntries { throw UpdateError("압축 파일에 항목이 너무 많습니다") }
+                continue
+            }
+            if line.range(of: #"^\d+ files?, "#, options: .regularExpression) != nil { continue }     // the summary line
+            // perms version os size text compressed method date time name...  (the name may hold spaces)
+            let parts = line.split(separator: " ", maxSplits: 9, omittingEmptySubsequences: true)
+            guard parts.count == 10, parts[0].count >= 7, let size = Int64(parts[3]), size >= 0 else { throw unreadable }
+            let kind = parts[0].first!
+            if kind == "l" { throw UpdateError("릴리스에 심볼릭 링크가 들어 있습니다") }
+            guard kind == "-" || kind == "d" else { throw UpdateError("릴리스에 허용되지 않는 항목이 들어 있습니다") }
+            let name = String(parts[9])
+            if name.hasPrefix("/") || name.hasPrefix("\\") || name.contains("\0")
+                || name.split(whereSeparator: { $0 == "/" || $0 == "\\" }).contains("..") {
+                throw UpdateError("릴리스에 허용되지 않는 경로가 들어 있습니다")
+            }
+            entries += 1
+            if entries > maxEntries { throw UpdateError("압축 파일에 항목이 너무 많습니다") }
+            total += size
+            if total > maxBytes { throw UpdateError("압축을 푼 크기가 너무 큽니다") }
+        }
+        guard let declared, declared == entries, entries > 0 else { throw unreadable }
+        return total
     }
 }
 
@@ -144,6 +244,121 @@ enum UpdateInstaller {
         }
     }
 
+    /// Throws when the unpacked tree holds a symbolic link or is larger than `maxBytes` in total.
+    ///
+    /// Symbolic links are refused outright, not just ones that point outside the bundle: a link could be swapped for a
+    /// different target after this check, and `replaceItemAt` / the signature check would then follow it. This app ships
+    /// none. A future `.framework` bundle normally relies on links (Versions/Current, top-level aliases); it would have to
+    /// be shipped with the links resolved, or this rule relaxed to links that stay inside the bundle with a test for each.
+    ///
+    /// Sizes count resource forks (`totalFileSizeKey`), and a hard-linked file only once.
+    static func validateExtracted(_ dir: URL, maxBytes: Int64 = UpdateRules.maxExtractedBytes) throws {
+        let keys: [URLResourceKey] = [.isSymbolicLinkKey, .totalFileSizeKey, .fileResourceIdentifierKey, .isRegularFileKey]
+        var failed = false
+        guard let walker = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: keys, options: [], errorHandler: { _, _ in failed = true; return false }) else {
+            throw UpdateError("압축을 풀 수 없습니다")
+        }
+        var total: Int64 = 0
+        var seen = Set<AnyHashable>()
+        for case let item as URL in walker {
+            guard let values = try? item.resourceValues(forKeys: Set(keys)) else { throw UpdateError("압축을 풀 수 없습니다") }
+            if values.isSymbolicLink == true { throw UpdateError("릴리스에 심볼릭 링크가 들어 있습니다") }
+            if values.isRegularFile == true, let id = values.fileResourceIdentifier as? AnyHashable, !seen.insert(id).inserted { continue }   // hard link: counted once
+            total += Int64(values.totalFileSize ?? 0)
+            if total > maxBytes { throw UpdateError("압축을 푼 크기가 너무 큽니다") }
+        }
+        if failed { throw UpdateError("압축을 풀 수 없습니다") }
+    }
+
+    /// A pre-filter on what the zip's central directory CLAIMS (nothing is unpacked): it turns away an honest but hostile archive
+    /// (too big, too many entries, links, odd paths) before any byte is written. It is not a defence by itself: a forged directory
+    /// passes, and the real protection is `ditto` run under `extract`'s watch plus the checks on the result afterwards
+    /// (`ensureContained`, `validateExtracted`, then the signature). Returns the total size the listing claims.
+    @discardableResult
+    static func inspectArchive(_ zip: URL, maxBytes: Int64 = UpdateRules.maxExtractedBytes, timeout: TimeInterval = 30) throws -> Int64 {
+        let p = Process(), out = Pipe()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/zipinfo")
+        p.arguments = ["-l", zip.path]
+        p.standardOutput = out; p.standardError = FileHandle.nullDevice
+        p.environment = ["LC_ALL": "C"]
+        do { try p.run() } catch { throw UpdateError("압축을 풀 수 없습니다") }
+        var timedOut = false
+        let killer = DispatchWorkItem { timedOut = true; p.terminate() }
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: killer)
+        var data = Data()
+        var tooLong = false
+        while let chunk = try? out.fileHandleForReading.read(upToCount: 1 << 16), !chunk.isEmpty {
+            data.append(chunk)
+            if data.count > ZipListing.maxListingBytes { tooLong = true; p.terminate(); break }
+        }
+        p.waitUntilExit()
+        killer.cancel()
+        if tooLong { throw UpdateError("압축 파일에 항목이 너무 많습니다") }
+        guard !timedOut, p.terminationStatus == 0, let text = String(data: data, encoding: .utf8) else { throw UpdateError("압축을 풀 수 없습니다") }
+        return try ZipListing.validate(text, maxBytes: maxBytes)
+    }
+
+    /// Total bytes below `dir` (resource forks included), stopping as soon as it passes `limit`.
+    static func treeBytes(_ dir: URL, limit: Int64) -> Int64 {
+        let keys: [URLResourceKey] = [.totalFileSizeKey]
+        guard let walker = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: keys, options: [], errorHandler: { _, _ in true }) else { return 0 }
+        var total: Int64 = 0
+        for case let item as URL in walker {
+            total += Int64((try? item.resourceValues(forKeys: Set(keys)))?.totalFileSize ?? 0)
+            if total > limit { return total }
+        }
+        return total
+    }
+
+    /// Unpacks with `ditto` while watching what actually lands on disk: the zip's own size fields can lie, the written bytes cannot.
+    /// The unpacking is stopped (and refused) as soon as the tree passes `maxBytes`, or when it runs longer than `timeout`.
+    ///
+    /// Limit of this defence: it samples, so up to one polling interval of writing (a few MB at disk speed) can land beyond
+    /// `maxBytes` before the process is stopped; the polling gets finer once the tree passes 3/4 of the limit. The real defence is
+    /// the pair of this watch and `validateExtracted` after it (and the disk is only ever the staging folder, removed on failure).
+    /// A truly bounded alternative would unpack entry by entry in-process with a byte budget; that is a bigger change, left as a proposal.
+    /// `expectedBytes` (what the listing claims) lets it refuse early when the disk cannot hold the result.
+    static func extract(_ zip: URL, to dir: URL, maxBytes: Int64 = UpdateRules.maxExtractedBytes,
+                        timeout: TimeInterval = 120, pollInterval: TimeInterval = 0.02, expectedBytes: Int64 = 0) throws {
+        if expectedBytes > 0,
+           let free = (try? dir.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?.volumeAvailableCapacityForImportantUsage,
+           free < expectedBytes + expectedBytes / 10 + 20_000_000 {
+            throw UpdateError("디스크 공간이 부족합니다")
+        }
+        let ditto = Process()
+        ditto.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+        ditto.arguments = ["-x", "-k", zip.path, dir.path]
+        ditto.standardOutput = FileHandle.nullDevice; ditto.standardError = FileHandle.nullDevice
+        do { try ditto.run() } catch { throw UpdateError("압축을 풀 수 없습니다") }
+        let started = Date()
+        var verdict: UpdateError?
+        var near = false
+        repeat {
+            let size = treeBytes(dir, limit: maxBytes)                    // looked at once, then after every pause
+            if size > maxBytes / 4 * 3 { near = true }
+            if size > maxBytes { verdict = UpdateError("압축을 푼 크기가 너무 큽니다") }
+            else if Date().timeIntervalSince(started) > timeout { verdict = UpdateError("압축을 푸는 데 너무 오래 걸립니다") }
+            if verdict != nil { ditto.terminate(); break }
+            Thread.sleep(forTimeInterval: near ? pollInterval / 4 : pollInterval)
+        } while ditto.isRunning
+        ditto.waitUntilExit()
+        if let verdict { throw verdict }
+        guard ditto.terminationStatus == 0 else { throw UpdateError("압축을 풀 수 없습니다") }
+        if treeBytes(dir, limit: maxBytes) > maxBytes { throw UpdateError("압축을 푼 크기가 너무 큽니다") }     // it finished between two polls
+    }
+
+    /// Every item that was unpacked lies inside `extracted/NotchIsland.app`, also after resolving links.
+    static func ensureContained(_ extracted: URL) throws {
+        let base = extracted.resolvingSymlinksInPath().appendingPathComponent(UpdateRules.appName).path
+        guard let walker = FileManager.default.enumerator(at: extracted, includingPropertiesForKeys: nil, options: [], errorHandler: { _, _ in true }) else {
+            throw UpdateError("압축을 풀 수 없습니다")
+        }
+        for case let item as URL in walker {
+            let path = item.resolvingSymlinksInPath().path
+            if path != base && !path.hasPrefix(base + "/") { throw UpdateError("릴리스에 허용되지 않는 경로가 들어 있습니다") }
+        }
+    }
+
     /// Moves the downloaded zip into a fresh `root`, checks and unpacks it, and returns the verified new bundle.
     /// `root` is wiped first and again on failure; nothing in it is ever executed.
     static func stage(downloaded: URL, release: UpdateRelease, currentApp: URL, currentVersion: String, root: URL) throws -> URL {
@@ -157,15 +372,13 @@ enum UpdateInstaller {
             guard size > 0, size <= UpdateRules.maxDownloadBytes else { throw UpdateError("내려받은 파일 크기가 올바르지 않습니다") }
             if let expected = release.sha256, try sha256Hex(of: zip) != expected { throw UpdateError("내려받은 파일이 손상되었습니다") }
 
+            let claimed = try inspectArchive(zip)                     // a pre-filter on the zip's own claims
             let extracted = root.appendingPathComponent("extracted")
             try fm.createDirectory(at: extracted, withIntermediateDirectories: true)
-            let ditto = Process()
-            ditto.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
-            ditto.arguments = ["-x", "-k", zip.path, extracted.path]
-            ditto.standardOutput = FileHandle.nullDevice; ditto.standardError = FileHandle.nullDevice
-            try ditto.run(); ditto.waitUntilExit()
-            guard ditto.terminationStatus == 0 else { throw UpdateError("압축을 풀 수 없습니다") }
+            try extract(zip, to: extracted, expectedBytes: claimed)   // watched while it writes
             guard try fm.contentsOfDirectory(atPath: extracted.path) == [UpdateRules.appName] else { throw UpdateError("릴리스 구성이 올바르지 않습니다") }
+            try ensureContained(extracted)
+            try validateExtracted(extracted)
 
             let app = extracted.appendingPathComponent(UpdateRules.appName)
             try verify(newApp: app, currentApp: currentApp, expectedVersion: release.version, currentVersion: currentVersion)
@@ -195,6 +408,16 @@ enum UpdateInstaller {
         }
         process.standardOutput = FileHandle.nullDevice; process.standardError = FileHandle.nullDevice
         try? process.run()
+    }
+}
+
+/// Refuses redirects that leave the project host's own hosts (or downgrade to HTTP, use another port or carry credentials).
+/// `completionHandler(nil)` is not an error: the task keeps the 3xx response and delivers it as the final response
+/// (the redirect is not followed). The callers then reject it because its status is not 200 (see `UpdateRules.isRefusedRedirect`).
+final class UpdateRedirectGuard: NSObject, URLSessionTaskDelegate {
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(UpdateRules.isAllowedRedirect(request.url) ? request : nil)
     }
 }
 
@@ -231,6 +454,7 @@ final class Updater {
     let appURL: URL
     let currentVersion: String
     private let session: URLSession
+    private let ownsSession: Bool                   // only a session created here is invalidated here
     private var stagedApp: URL?
     private var checkTimer: Timer?, applyTimer: Timer?
     private var manualPending = false
@@ -238,11 +462,14 @@ final class Updater {
 
     init(appURL: URL = Bundle.main.bundleURL,
          currentVersion: String = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0",
-         session: URLSession = .shared) {
+         session: URLSession? = nil) {
         self.appURL = appURL
         self.currentVersion = currentVersion
-        self.session = session
+        self.session = session ?? URLSession(configuration: .default, delegate: UpdateRedirectGuard(), delegateQueue: nil)
+        ownsSession = session == nil
     }
+
+    deinit { if ownsSession { session.finishTasksAndInvalidate() } }
 
     var statusText: String {
         switch state {
@@ -320,7 +547,8 @@ final class Updater {
     private func received(data: Data?, response: URLResponse?, error: Error?) {
         let status = (response as? HTTPURLResponse)?.statusCode
         guard error == nil, status == 200, let data else {
-            settle(.failed(status == 403 || status == 429 ? "GitHub 요청 한도에 걸렸습니다" : "네트워크에 연결할 수 없습니다"))
+            settle(.failed(status == 403 || status == 429 ? "GitHub 요청 한도에 걸렸습니다"
+                           : UpdateRules.isRefusedRedirect(status: status) ? UpdateRules.redirectRefusedMessage : "네트워크에 연결할 수 없습니다"))
             return
         }
         guard let release = UpdateRules.parseRelease(data) else { settle(.failed("릴리스에서 \(UpdateRules.assetName)를 찾을 수 없습니다")); return }
@@ -339,7 +567,8 @@ final class Updater {
                 do { result = .success(try UpdateInstaller.stage(downloaded: file, release: release, currentApp: app, currentVersion: version, root: root)) }
                 catch { result = .failure((error as? UpdateError) ?? UpdateError("파일을 처리할 수 없습니다")) }
             } else {
-                result = .failure(UpdateError("내려받지 못했습니다"))
+                let status = (response as? HTTPURLResponse)?.statusCode
+                result = .failure(UpdateError(UpdateRules.isRefusedRedirect(status: status) ? UpdateRules.redirectRefusedMessage : "내려받지 못했습니다"))
             }
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -358,6 +587,7 @@ final class Updater {
     func applyAndRelaunch() {
         guard case .ready(let version) = state, let staged = stagedApp else { return }
         do {
+            try UpdateInstaller.validateExtracted(staged.deletingLastPathComponent())      // the tree is still what was checked at staging
             try UpdateInstaller.verify(newApp: staged, currentApp: appURL, expectedVersion: version, currentVersion: currentVersion)
             try UpdateInstaller.swap(staged: staged, over: appURL)
         } catch {

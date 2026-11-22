@@ -155,8 +155,7 @@ extension App {
             c.fIcon.setFile(u)
             setText(c.fName, u.lastPathComponent)
             setText(c.fSub, fileSubtitle(u))
-            c.fRevealB.isEnabled = FileManager.default.fileExists(atPath: u.path)
-            c.fRevealB.alphaValue = c.fRevealB.isEnabled ? 1 : 0.35
+            c.setRevealEnabled(FileManager.default.fileExists(atPath: u.path))
         }
 
         // info card (microphone / camera, ...)

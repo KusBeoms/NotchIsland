@@ -10,6 +10,7 @@ extension App {
     func desiredShape() -> Shape {
         if pinned && !liveActivity && !forceOpen { pinned = false }   // nothing left to show
         if !pinned { selected = nil; locked = false; lyricsRequested = false }     // so an ended activity also releases the lock
+        if mirrorHidden { return .collapsed }                          // nothing to draw: state is kept, the loop rests
         if missionControl { return acts.isEmpty ? .collapsed : .activity }   // pinned / locked state is kept, only hidden meanwhile
         if forceOpen || pinned || hudActive || dropping { return .expanded }
         if pressing || Date() < popUntil { return .pressed }

@@ -8,6 +8,13 @@ import IOKit.ps
 
 class Flip: NSView { override var isFlipped: Bool { true } }
 
+/// Shared white levels, so every bar track and every secondary text reads the same. The track must stay clearly below the
+/// secondary text (0.3 vs 0.55) and clearly below the fill (0.9+), also for tinted fills.
+enum Tone {
+    static let track: CGFloat = 0.3
+    static let secondary: CGFloat = 0.55
+}
+
 /// Rounded album-art tile; shows a music-note placeholder until an image arrives.
 final class ArtView: NSView {
     private let note = NSImageView()
@@ -20,7 +27,7 @@ final class ArtView: NSView {
         layer?.backgroundColor = NSColor(white: 0.22, alpha: 1).cgColor
         note.image = NSImage(systemSymbolName: "music.note", accessibilityDescription: nil)?
             .withSymbolConfiguration(.init(pointSize: 14, weight: .semibold))
-        note.contentTintColor = NSColor(white: 1, alpha: 0.55)
+        note.contentTintColor = NSColor(white: 1, alpha: Tone.secondary)
         addSubview(note)
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -161,7 +168,7 @@ final class ProgressBar: FocusableControl {
     init() {
         super.init(frame: .zero)
         wantsLayer = true
-        track.backgroundColor = NSColor(white: 1, alpha: 0.2).cgColor
+        track.backgroundColor = NSColor(white: 1, alpha: Tone.track).cgColor
         track.cornerRadius = ProgressBar.lineH / 2
         fill.backgroundColor = NSColor(white: 1, alpha: 0.9).cgColor
         fill.cornerRadius = ProgressBar.lineH / 2
@@ -272,7 +279,7 @@ final class ThinBar: NSView {
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
-        layer?.backgroundColor = NSColor(white: 1, alpha: 0.18).cgColor
+        layer?.backgroundColor = NSColor(white: 1, alpha: Tone.track).cgColor
         layer?.masksToBounds = true
         fill.backgroundColor = color.cgColor
         layer?.addSublayer(fill)
@@ -329,11 +336,11 @@ final class LevelBar: FocusableControl {
         wantsLayer = true
         layer?.addSublayer(seg); layer?.addSublayer(slider)
         for _ in 0..<LevelBar.count {
-            let t = CALayer(); t.backgroundColor = NSColor(white: 1, alpha: 0.25).cgColor; t.cornerRadius = 1.5; t.masksToBounds = true
+            let t = CALayer(); t.backgroundColor = NSColor(white: 1, alpha: Tone.track).cgColor; t.cornerRadius = 1.5; t.masksToBounds = true
             let f = CALayer(); f.backgroundColor = NSColor(white: 1, alpha: 0.95).cgColor
             t.addSublayer(f); seg.addSublayer(t); track.append(t); fill.append(f)
         }
-        sTrack.backgroundColor = NSColor(white: 1, alpha: 0.25).cgColor; sTrack.cornerRadius = LevelBar.lineH / 2
+        sTrack.backgroundColor = NSColor(white: 1, alpha: Tone.track).cgColor; sTrack.cornerRadius = LevelBar.lineH / 2
         sFill.backgroundColor = NSColor(white: 1, alpha: 0.95).cgColor;  sFill.cornerRadius = LevelBar.lineH / 2
         knob.backgroundColor = NSColor.white.cgColor; knob.cornerRadius = LevelBar.knobH / 2
         knob.shadowColor = NSColor.black.cgColor; knob.shadowOpacity = 0.35; knob.shadowRadius = 2; knob.shadowOffset = .zero
@@ -639,9 +646,18 @@ final class FeedbackButton: NSButton {
         super.highlight(flag); needsDisplay = true
         guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
         wantsLayer = true
-        let animation = CABasicAnimation(keyPath: "transform.scale")
-        animation.fromValue = flag ? 1 : 0.94; animation.toValue = flag ? 0.94 : 1
+        // A layer-backed view's layer keeps its anchor point at the corner, so a plain scale would shrink towards the corner:
+        // scale about the centre by wrapping it in translations. The end state is held (fill) so a long press stays pressed.
+        func about(_ scale: CGFloat) -> CATransform3D {
+            let c = CGPoint(x: bounds.midX, y: bounds.midY)
+            var t = CATransform3DMakeTranslation(c.x, c.y, 0)
+            t = CATransform3DScale(t, scale, scale, 1)
+            return CATransform3DTranslate(t, -c.x, -c.y, 0)
+        }
+        let animation = CABasicAnimation(keyPath: "transform")
+        animation.fromValue = NSValue(caTransform3D: about(flag ? 1 : 0.94)); animation.toValue = NSValue(caTransform3D: about(flag ? 0.94 : 1))
         animation.duration = 0.12
+        animation.fillMode = .both; animation.isRemovedOnCompletion = false
         layer?.add(animation, forKey: "buttonPress")
     }
 }

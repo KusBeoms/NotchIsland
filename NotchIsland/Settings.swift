@@ -21,10 +21,12 @@ enum Settings {
         static let pomodoroLongEvery = "pomodoroLongEvery"
         static let sensorGestures = "sensorGestureMap"
         static let autoUpdate = "autoUpdateEnabled"
+        static let hideMirroring = "hideWhenMirroring"
+        static let muteMirroring = "muteWhenMirroring"
     }
 
     static let boolDefaults: [String: Bool] = [
-        Key.calendar: true, Key.privacy: true, Key.downloads: true, Key.zeroVolume: true, Key.autoUpdate: true,
+        Key.calendar: true, Key.privacy: true, Key.downloads: true, Key.zeroVolume: true, Key.autoUpdate: true, Key.hideMirroring: true,
     ]
     /// default, allowed range
     static let intDefaults: [String: (value: Int, range: ClosedRange<Int>)] = [
@@ -56,6 +58,8 @@ enum Settings {
     static var downloadsEnabled: Bool { bool(Key.downloads) }
     static var zeroVolumeOnOutputChange: Bool { bool(Key.zeroVolume) }
     static var autoUpdateEnabled: Bool { bool(Key.autoUpdate) }
+    static var hideWhenMirroring: Bool { bool(Key.hideMirroring) }
+    static var muteWhenMirroring: Bool { bool(Key.muteMirroring) }          // off by default: the timer's sound is kept
 
     static var pomodoro: PomodoroConfig {
         PomodoroConfig(work: int(Key.pomodoroWork), rest: int(Key.pomodoroBreak),

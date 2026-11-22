@@ -52,7 +52,17 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var locked = false                 // pinned by tapping the expanded island: ignores outside clicks / Esc / sensor until tapped again
     var hoverUntil = Date.distantPast
     var missionControl = false         // Mission Control is up: the island folds away (even when locked) and comes back after
-    var lockShown: Bool { locked && !missionControl }
+    var windowsHidden = false          // the island's windows are off screen (mirroring or a locked screen)
+    var mirrorCallbackRegistered = false
+    var hoverLeftAt: Date?
+    var tLockCheck = 0.0
+    var lockProbe: () -> Bool = App.sessionScreenLocked                     // tests replace it
+    var screenLocked = false           // the Mac's screen is locked: no peek, sensor gestures or new alerts meanwhile
+    var hoverEnteredAt: Date?          // when the pointer reached the island (the peek waits `HoverDwell.dwell`)
+    var islandSuppressed: Bool { mirrorHidden || screenLocked }
+    var mirrorHidden = false           // the built-in display is mirrored: the island's windows are off screen (see Mirroring.swift)
+    var mirrorInfo: () -> [DisplayMirrorInfo]? = MirrorPolicy.current        // tests replace it
+    var lockShown: Bool { locked && !missionControl && !mirrorHidden }
     var lux = -1.0
     var media: Media? {
         didSet {
@@ -148,7 +158,6 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     static let realDarkAfter: TimeInterval = 5
     static let autoBrightnessHeldKey = "autoBrightnessHeld"
     var darkLatched = false          // dark state with hysteresis: set below threshold, cleared above 1.2x
-    var sensorMisses = 0
 
     var notchW: CGFloat {
         if let l = screen.auxiliaryTopLeftArea, let r = screen.auxiliaryTopRightArea {
@@ -185,7 +194,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var outDebounce: Timer?
 
     // state of App+Step.swift
-    var stepTimer: Timer?, stepBusy = false
+    var stepTimer: Timer?, stepBusy = false, stepDeep = false
+    var sensorWasOn = false, sensorDt = 0.0, lastSensorSample = 0.0, lastSensorReading = 0.0
+    var sensorEnabled = true, tSensorConfig = 0.0, sensorActiveAt = 0.0     // sensorActiveAt: CFAbsoluteTime of the last finger-like reading
+    var tTimerSave = 0.0, savedTimer: TimerSnapshot?
+    /// Seconds since the user last touched the keyboard, mouse or trackpad (anywhere in the session); tests replace it.
+    var inputIdleSeconds: () -> TimeInterval = { CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: CGEventType(rawValue: ~0)!) }
+    var deferredAlerts: [(since: Date, run: () -> Bool)] = []       // see whenQuiet
     var tAppearance = 0.0, tFiles = 0.0, tVolume = 0.0, tBattery = 0.0, tMusic = 0.0, tAirPods = 0.0, tCalendar = 0.0, tMission = 0.0
 
     // state of App+Polling.swift
@@ -197,7 +212,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for sig in [SIGTERM, SIGINT] {
             signal(sig, SIG_IGN)
             let src = DispatchSource.makeSignalSource(signal: sig, queue: .main)
-            src.setEventHandler { [weak self] in self?.releaseAutoBrightness(); exit(0) }
+            src.setEventHandler { [weak self] in self?.releaseAutoBrightness(); self?.saveTimerIfChanged(); exit(0) }
             src.resume(); signalSources.append(src)
         }
         panel = makePanel(frame(for: .collapsed))
@@ -288,6 +303,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if ProcessInfo.processInfo.environment["NI_NOSENSOR"] != nil { simLux = 1000 }     // test hook: ignore the real light sensor
         fileLoad()
+        restoreTimer()
         view.onDragEnter = { [weak self] in self?.dragEntered = true }
         view.onDragExit = { [weak self] in self?.dragEntered = false }
         let dropped: ([URL]) -> Void = { [weak self] urls in
@@ -300,6 +316,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for v in [view as FileDragView, rowView as FileDragView] {   // dragging a file out of the island
             v.fileForDrag = { [weak self] e in self?.fileForDrag(e) }
             v.onDragBegan = { [weak self] in self?.cancelPress() }
+            v.onPressMoved = { [weak self] in self?.pressMoved() }
             v.onDragFinished = { [weak self] u, taken in if taken { self?.fileRemove(u) } }   // taken out: it leaves the pocket
         }
         c.fRevealB.target = self; c.fRevealB.action = #selector(revealFileTapped)
@@ -347,6 +364,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         watchBattery()
         watchMusicApps()
         watchScreens()
+        watchMirroring()
         watchEscape()
         islandShortcut.onToggle = { [weak self] in
             guard NSApp.modalWindow == nil else { return }

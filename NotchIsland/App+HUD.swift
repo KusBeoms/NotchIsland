@@ -27,6 +27,7 @@ extension App {
 
     /// Media keys, once the Accessibility permission has been granted. Returns true when the key was handled.
     func handleMediaKey(_ code: Int, _ down: Bool, _ fine: Bool) -> Bool {
+        guard !islandSuppressed else { return false }                          // nobody could see our HUD: the system shows its own
         let step: Float = fine ? 1.0 / 64 : 1.0 / 16
         func snap(_ v: Float) -> Float { (v / step).rounded() * step }
         switch code {
@@ -107,12 +108,21 @@ extension App {
             }
         }
         tryInstall()
-        let kt = Timer(timeInterval: 5, repeats: true) { _ in tryInstall() }   // picks up a later grant
-        kt.tolerance = 2
+        // The system announces every change of the Accessibility list: install the moment the permission is granted. The slow
+        // timer is only a safety net (the notification can be missed, and a tap the system switched off is installed again).
+        var installScheduled = false                       // one pending attempt is enough: a burst of notices does not queue more
+        DistributedNotificationCenter.default().addObserver(forName: NSNotification.Name("com.apple.accessibility.api"), object: nil, queue: .main) { _ in
+            guard !installScheduled else { return }
+            installScheduled = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { installScheduled = false; tryInstall() }       // the trust flag settles a moment after the notice
+        }
+        let kt = Timer(timeInterval: 10, repeats: true) { _ in tryInstall() }       // also puts back a tap the system switched off
+        kt.tolerance = 3
         RunLoop.main.add(kt, forMode: .common); keyTapTimer = kt
     }
 
     func showBanner(_ k: BannerKind, autoHide: TimeInterval? = nil, feedback: Bool = true) {
+        guard !islandSuppressed else { return }
         banner = k
         bannerHideAt = Date().addingTimeInterval(autoHide ?? 4)
         pinned = true
@@ -120,6 +130,7 @@ extension App {
     }
 
     func showAlert(_ text: String, seconds: TimeInterval = 3.5) {
+        guard !islandSuppressed else { return }      // nobody sees the island while the screen is mirrored or locked; sounds are unaffected
         if let cur = alertText, Date() < alertUntil, cur != text { alertText = cur + "  ·  " + text }   // merge simultaneous alerts
         else { alertText = text }
         alertUntil = Date().addingTimeInterval(seconds)

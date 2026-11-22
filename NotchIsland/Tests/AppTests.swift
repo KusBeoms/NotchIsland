@@ -1,5 +1,7 @@
 // App globals from main.swift are prepended by run.sh; no application lifecycle is started.
 let testApplication = NSApplication.shared
+// Settings written by the tests go to a throwaway suite, never to the real preferences.
+Settings.store = UserDefaults(suiteName: "ni-app-tests-\(getpid())")!
 
 func makeTestApp() -> App {
     let app = App()
@@ -9,6 +11,8 @@ func makeTestApp() -> App {
     app.mainP = Piece(panel: app.panel)
     app.makeSlotItems()
     app.simLux = 1000
+    app.inputIdleSeconds = { 1000 }
+    app.lockProbe = { false }; app.mirrorInfo = { nil }                  // no real session / display queries              // the real session's input must not decide what a test sees
     // Keep step() from querying real hardware or launching background helpers.
     let later = CFAbsoluteTimeGetCurrent() + 3600
     app.tAppearance = later; app.tFiles = later; app.tVolume = later
